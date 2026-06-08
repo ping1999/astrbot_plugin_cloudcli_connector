@@ -1,0 +1,88 @@
+{
+  "cloudcli_base_url": {
+    "description": "CloudCLI self-host base URL",
+    "type": "string",
+    "default": "http://127.0.0.1:3001",
+    "hint": "The URL where CloudCLI UI is running, for example http://127.0.0.1:3001."
+  },
+  "cloudcli_jwt_token": {
+    "description": "CloudCLI JWT token",
+    "type": "string",
+    "default": "",
+    "hint": "Optional. If empty, the plugin will try username/password login."
+  },
+  "cloudcli_username": {
+    "description": "CloudCLI username",
+    "type": "string",
+    "default": "",
+    "hint": "Optional. Used to login to /api/auth/login when cloudcli_jwt_token is empty."
+  },
+  "cloudcli_password": {
+    "description": "CloudCLI password",
+    "type": "string",
+    "default": "",
+    "hint": "Optional. Used to login to /api/auth/login when cloudcli_jwt_token is empty."
+  },
+  "cloudcli_api_key": {
+    "description": "CloudCLI global API key",
+    "type": "string",
+    "default": "",
+    "hint": "Optional. Required only if CloudCLI server was started with API_KEY."
+  },
+  "allow_unauthenticated_ws": {
+    "description": "Allow unauthenticated WebSocket",
+    "type": "bool",
+    "default": false,
+    "hint": "Only enable when CloudCLI is in a trusted platform mode that does not require WS tokens."
+  },
+  "auto_connect": {
+    "description": "Auto connect on plugin load",
+    "type": "bool",
+    "default": true
+  },
+  "request_timeout_seconds": {
+    "description": "CloudCLI request timeout",
+    "type": "int",
+    "default": 8
+  },
+  "max_bindings_per_user": {
+    "description": "Max bound sessions per user",
+    "type": "int",
+    "default": 20
+  },
+  "recent_sessions_limit": {
+    "description": "Max recent sessions shown by /cloudcli session",
+    "type": "int",
+    "default": 20
+  },
+  "chat_messages_limit": {
+    "description": "Default recent messages shown by /cloudcli chat",
+    "type": "int",
+    "default": 12
+  },
+  "max_run_message_length": {
+    "description": "Max task length accepted by /cloudcli run",
+    "type": "int",
+    "default": 4000
+  },
+  "run_status_interval_seconds": {
+    "description": "Minimum seconds between background run status pushes",
+    "type": "int",
+    "default": 20
+  },
+  "max_run_status_pushes": {
+    "description": "Max status push messages for one /cloudcli run task",
+    "type": "int",
+    "default": 10
+  },
+  "max_pending_display": {
+    "description": "Max pending approvals shown",
+    "type": "int",
+    "default": 30
+  },
+  "max_push_text_length": {
+    "description": "Max pushed approval text length",
+    "type": "int",
+    "default": 1800
+  }
+}

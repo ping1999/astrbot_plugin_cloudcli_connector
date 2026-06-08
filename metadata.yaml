@@ -1,0 +1,28 @@
+name: astrbot_plugin_cloudcli_connector
+display_name: CloudCLI Connector
+author: Codex
+desc: Connect AstrBot commands to CloudCLI sessions, messages, agent tasks, and permission approvals.
+short_desc: Control CloudCLI sessions, tasks, and approvals from AstrBot.
+version: 0.2.0
+repo: "https://github.com/ping1999/astrbot_plugin_cloudcli_connector"
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+  - telegram
+  - wecom
+  - wecom_ai_bot
+  - lark
+  - dingtalk
+  - discord
+  - slack
+  - kook
+  - vocechat
+  - weixin_official_account
+  - weixin_oc
+  - satori
+  - misskey
+  - line
+  - matrix
+  - mattermost
