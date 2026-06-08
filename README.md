@@ -65,7 +65,7 @@
 
 ## 真实 CloudCLI 集成测试
 
-仓库内提供了一个不依赖 AstrBot 主程序的真实环境测试脚本：`tests/real_cloudcli_command_test.py`。它会注入假的 AstrBot 上下文，加载插件类，然后连接真实 CloudCLI 测试命令流。
+仓库内提供了一个不依赖 AstrBot 主程序的真实环境测试脚本：`integration_tests/real_cloudcli_command_test.py`。它会注入假的 AstrBot 上下文，加载插件类，然后连接真实 CloudCLI 测试命令流。
 
 PowerShell 示例：
 
@@ -73,7 +73,7 @@ PowerShell 示例：
 $env:CLOUDCLI_TEST_BASE_URL = "http://127.0.0.1:13002"
 $env:CLOUDCLI_TEST_USERNAME = "你的 CloudCLI 用户名"
 $env:CLOUDCLI_TEST_PASSWORD = "你的 CloudCLI 密码"
-python tests/real_cloudcli_command_test.py
+python integration_tests/real_cloudcli_command_test.py
 ```
 
 如果已经有 JWT，也可以用：
@@ -100,5 +100,5 @@ $env:CLOUDCLI_TEST_API_KEY = "CloudCLI UI 生成的 API Key"
 $env:CLOUDCLI_TEST_RUN_ENABLED = "1"
 $env:CLOUDCLI_TEST_RUN_PROJECT = "F:\work\repo"
 $env:CLOUDCLI_TEST_RUN_PROVIDER = "claude"
-python tests/real_cloudcli_command_test.py
+python integration_tests/real_cloudcli_command_test.py
 ```
