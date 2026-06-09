@@ -75,10 +75,32 @@
     "type": "int",
     "default": 10
   },
+  "run_list_limit": {
+    "description": "Default task count shown by /cloudcli run list",
+    "type": "int",
+    "default": 10
+  },
   "max_pending_display": {
     "description": "Max pending approvals shown",
     "type": "int",
     "default": 30
+  },
+  "approval_allowed_user_keys": {
+    "description": "Comma-separated AstrBot user keys allowed to approve permissions",
+    "type": "string",
+    "default": "",
+    "hint": "Leave empty to allow any user who can see the bound session approval. Use /cloudcli whoami to get the key."
+  },
+  "approval_timeout_seconds": {
+    "description": "Seconds before pending approval timeout action; 0 disables it",
+    "type": "int",
+    "default": 300
+  },
+  "approval_timeout_action": {
+    "description": "Approval timeout action",
+    "type": "string",
+    "default": "remind",
+    "hint": "Supported values: remind or deny. deny will automatically reject the request after timeout."
   },
   "max_push_text_length": {
     "description": "Max pushed approval text length",

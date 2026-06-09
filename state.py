@@ -11,6 +11,12 @@ from typing import Any
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+RUN_ID_RE = re.compile(r"^[0-9]{1,12}$")
+
+MAX_SESSION_INDEX_ITEMS = 100
+MAX_RUN_LOG_ITEMS = 80
+MAX_AUDIT_ITEMS = 500
+MAX_STORED_TEXT = 1200
 
 
 @dataclass(frozen=True)
@@ -52,9 +58,12 @@ class PluginState:
         self.path = path
         self._lock = asyncio.Lock()
         self._data: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "users": {},
             "pending": {},
+            "runs": {},
+            "audit": [],
+            "next_run_id": 1,
         }
 
     async def load(self) -> None:
@@ -66,15 +75,29 @@ class PluginState:
             try:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
+                    self._data["version"] = 2
                     self._data["users"] = _read_dict(loaded.get("users"))
                     self._data["pending"] = _read_dict(loaded.get("pending"))
+                    self._data["runs"] = _read_dict(loaded.get("runs"))
+                    self._data["audit"] = _read_dict_list(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
+                    self._data["next_run_id"] = _read_positive_int(
+                        loaded.get("next_run_id"),
+                        self._guess_next_run_id(self._data["runs"]),
+                    )
             except (OSError, json.JSONDecodeError):
                 backup = self.path.with_suffix(f".bad-{int(time.time())}.json")
                 try:
                     self.path.replace(backup)
                 except OSError:
                     pass
-                self._data = {"version": 1, "users": {}, "pending": {}}
+                self._data = {
+                    "version": 2,
+                    "users": {},
+                    "pending": {},
+                    "runs": {},
+                    "audit": [],
+                    "next_run_id": 1,
+                }
                 await self._save_locked()
 
     async def remember_user(self, user: UserRef) -> None:
@@ -143,6 +166,76 @@ class PluginState:
             entry = self._user_entry(user.user_key)
             return sorted(_read_list(entry.get("bindings")))
 
+    async def remember_session_index(
+        self,
+        user: UserRef,
+        sessions: list[dict[str, Any]],
+        max_items: int = MAX_SESSION_INDEX_ITEMS,
+    ) -> None:
+        async with self._lock:
+            entry = self._user_entry(user.user_key)
+            seen: set[str] = set()
+            normalized: list[dict[str, str]] = []
+            for item in sessions:
+                if not isinstance(item, dict):
+                    continue
+                session_id = _read_str(
+                    item.get("id") or item.get("sessionId") or item.get("session_id")
+                ).strip()
+                if not is_valid_session_id(session_id) or session_id in seen:
+                    continue
+                seen.add(session_id)
+                normalized.append(
+                    {
+                        "id": session_id,
+                        "provider": _safe_text(item.get("provider"), 60),
+                        "projectName": _safe_text(item.get("projectName"), 160),
+                        "projectPath": _safe_text(item.get("projectPath"), 500),
+                        "summary": _safe_text(item.get("summary"), 240),
+                        "lastActivity": _safe_text(item.get("lastActivity"), 80),
+                    }
+                )
+                if len(normalized) >= max(1, min(max_items, MAX_SESSION_INDEX_ITEMS)):
+                    break
+            entry["session_index"] = normalized
+            entry["session_index_at"] = time.time()
+            await self._save_locked()
+
+    async def resolve_session_ref(
+        self,
+        user: UserRef,
+        ref: str,
+    ) -> tuple[dict[str, str] | None, str | None]:
+        ref = ref.strip()
+        if not ref:
+            return None, "sessionId 不能为空。"
+        if ref.lower() in {"last", "latest"}:
+            index = 1
+        elif ref.isdigit():
+            index = int(ref)
+        else:
+            if not is_valid_session_id(ref):
+                return None, "sessionId 格式不合法，只允许字母、数字、点、下划线、冒号和短横线。"
+            return {"id": ref, "provider": ""}, None
+
+        async with self._lock:
+            entry = self._user_entry(user.user_key)
+            cached = _read_dict_list(entry.get("session_index"))
+            if not cached:
+                return None, "没有可用的 session 序号缓存，请先执行 /cloudcli session。"
+            if index < 1 or index > len(cached):
+                return None, f"session 序号无效，请输入 1-{len(cached)}。"
+            item = cached[index - 1]
+            session_id = _read_str(item.get("id"))
+            if not is_valid_session_id(session_id):
+                return None, "缓存中的 sessionId 格式不合法，请重新执行 /cloudcli session。"
+            return {
+                "id": session_id,
+                "provider": _read_str(item.get("provider")),
+                "projectName": _read_str(item.get("projectName")),
+                "projectPath": _read_str(item.get("projectPath")),
+            }, None
+
     async def users_bound_to_session(self, session_id: str) -> list[dict[str, Any]]:
         async with self._lock:
             users = _read_dict(self._data.get("users"))
@@ -181,6 +274,23 @@ class PluginState:
             pending.pop(request_id, None)
             self._data["pending"] = pending
             await self._save_locked()
+
+    async def get_pending(self, request_id: str) -> PendingApproval | None:
+        async with self._lock:
+            item = _read_dict(self._data.get("pending")).get(request_id)
+            if not isinstance(item, dict) or item.get("resolved") is True:
+                return None
+            session_id = _read_str(item.get("session_id"))
+            if not is_valid_session_id(session_id):
+                return None
+            return PendingApproval(
+                request_id=_read_str(item.get("request_id")) or request_id,
+                session_id=session_id,
+                tool_name=_read_str(item.get("tool_name")) or "UnknownTool",
+                input_data=item.get("input_data"),
+                provider=_read_str(item.get("provider")) or "claude",
+                received_at=float(item.get("received_at") or 0),
+            )
 
     async def merge_pending(self, approvals: list[PendingApproval]) -> None:
         async with self._lock:
@@ -250,17 +360,170 @@ class PluginState:
             return None, f"序号无效，请输入 1-{len(visible)}。"
         return visible[request_no - 1], None
 
+    async def create_run_task(
+        self,
+        user: UserRef,
+        payload: dict[str, Any],
+        display_target: str,
+    ) -> str:
+        async with self._lock:
+            run_id = str(_read_positive_int(self._data.get("next_run_id"), 1))
+            self._data["next_run_id"] = int(run_id) + 1
+            runs = _read_dict(self._data.get("runs"))
+            now = time.time()
+            runs[run_id] = {
+                "id": run_id,
+                "user_key": user.user_key,
+                "display_name": user.display_name,
+                "origin": user.unified_msg_origin,
+                "status": "running",
+                "provider": _safe_text(payload.get("provider"), 60) or "claude",
+                "session_id": _safe_text(payload.get("sessionId"), 200),
+                "project_path": _safe_text(payload.get("projectPath"), 500),
+                "github_url": _safe_text(payload.get("githubUrl"), 500),
+                "target": _safe_text(display_target, 500),
+                "message": _safe_text(payload.get("message"), MAX_STORED_TEXT),
+                "started_at": now,
+                "updated_at": now,
+                "finished_at": 0,
+                "log": [],
+                "summary": {},
+            }
+            self._data["runs"] = runs
+            await self._save_locked()
+            return run_id
+
+    async def update_run_task(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        event: str | None = None,
+        session_id: str | None = None,
+        summary: dict[str, Any] | None = None,
+        error: str | None = None,
+        finished: bool = False,
+    ) -> None:
+        if not RUN_ID_RE.fullmatch(run_id):
+            return
+        async with self._lock:
+            runs = _read_dict(self._data.get("runs"))
+            item = runs.get(run_id)
+            if not isinstance(item, dict):
+                return
+            now = time.time()
+            if status:
+                item["status"] = _safe_text(status, 40)
+            if session_id and is_valid_session_id(session_id):
+                item["session_id"] = session_id
+            if summary is not None:
+                item["summary"] = _safe_json_value(summary)
+            if error:
+                item["error"] = _safe_text(error, MAX_STORED_TEXT)
+            if event:
+                log = _read_dict_list(item.get("log"))
+                log.append({"ts": now, "text": _safe_text(event, MAX_STORED_TEXT)})
+                item["log"] = log[-MAX_RUN_LOG_ITEMS:]
+            if finished:
+                item["finished_at"] = now
+            item["updated_at"] = now
+            runs[run_id] = item
+            self._data["runs"] = runs
+            await self._save_locked()
+
+    async def list_run_tasks(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
+        async with self._lock:
+            runs = _read_dict(self._data.get("runs"))
+            items = [
+                dict(item)
+                for item in runs.values()
+                if isinstance(item, dict) and item.get("user_key") == user.user_key
+            ]
+            items.sort(key=lambda item: float(item.get("started_at") or 0), reverse=True)
+            return items[: max(1, min(limit, 50))]
+
+    async def get_run_task(self, user: UserRef, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        if not RUN_ID_RE.fullmatch(run_id):
+            return None, "任务编号格式不合法。"
+        async with self._lock:
+            item = _read_dict(self._data.get("runs")).get(run_id)
+            if not isinstance(item, dict):
+                return None, f"没有找到任务 #{run_id}。"
+            if item.get("user_key") != user.user_key:
+                return None, "只能查看或操作自己发起的 CloudCLI 任务。"
+            return dict(item), None
+
+    async def append_audit(
+        self,
+        *,
+        user: UserRef | None,
+        action: str,
+        approval: PendingApproval,
+        reason: str = "",
+        result: str = "sent",
+    ) -> None:
+        async with self._lock:
+            audit = _read_dict_list(self._data.get("audit"))
+            audit.append(
+                {
+                    "ts": time.time(),
+                    "user_key": user.user_key if user else "system",
+                    "display_name": user.display_name if user else "system",
+                    "action": _safe_text(action, 40),
+                    "result": _safe_text(result, 80),
+                    "request_id": approval.request_id,
+                    "session_id": approval.session_id,
+                    "tool_name": approval.tool_name,
+                    "provider": approval.provider,
+                    "reason": _safe_text(reason, 500),
+                    "input_summary": _safe_text(_compact_json(approval.input_data), 500),
+                }
+            )
+            self._data["audit"] = audit[-MAX_AUDIT_ITEMS:]
+            await self._save_locked()
+
+    async def list_audit(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
+        async with self._lock:
+            bindings = set(_read_list(self._user_entry(user.user_key).get("bindings")))
+            audit = _read_dict_list(self._data.get("audit"))
+            items = [
+                dict(item)
+                for item in audit
+                if item.get("user_key") == user.user_key
+                or (bindings and item.get("session_id") in bindings)
+            ]
+            items.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
+            return items[: max(1, min(limit, 50))]
+
     def _user_entry(self, user_key: str) -> dict[str, Any]:
         users = _read_dict(self._data.get("users"))
         self._data["users"] = users
         entry = users.setdefault(
             user_key,
-            {"display_name": "", "origins": [], "bindings": [], "last_seen_at": 0},
+            {
+                "display_name": "",
+                "origins": [],
+                "bindings": [],
+                "last_seen_at": 0,
+                "session_index": [],
+                "session_index_at": 0,
+            },
         )
         if not isinstance(entry, dict):
-            entry = {"display_name": "", "origins": [], "bindings": [], "last_seen_at": 0}
+            entry = {
+                "display_name": "",
+                "origins": [],
+                "bindings": [],
+                "last_seen_at": 0,
+                "session_index": [],
+                "session_index_at": 0,
+            }
             users[user_key] = entry
         return entry
+
+    def _guess_next_run_id(self, runs: dict[str, Any]) -> int:
+        ids = [int(key) for key in runs if isinstance(key, str) and RUN_ID_RE.fullmatch(key)]
+        return max(ids, default=0) + 1
 
     async def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,6 +568,49 @@ def _read_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str)]
+
+
+def _read_dict_list(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _read_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _safe_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")
+    if len(text) > limit:
+        return text[: max(0, limit - 20)] + "...[truncated]"
+    return text
+
+
+def _safe_json_value(value: Any) -> Any:
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except TypeError:
+        return _safe_text(value)
+
+
+def _compact_json(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return str(value)
 
 
 def _parse_timestamp(value: Any) -> float:

@@ -11,16 +11,23 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 HELP_TEXT = """CloudCLI Connector 指令：
 /cloudcli help：列出插件支持的指令
+/cloudcli status：检查 CloudCLI 连接、认证、REST、WebSocket 和 agent 配置
 /cloudcli session：列出 CloudCLI 正在运行和最近可绑定的 session
 /cloudcli bind list：列出当前用户绑定的 session
-/cloudcli bind <sessionId>：绑定 session
+/cloudcli bind <sessionId|序号|last>：绑定 session
 /cloudcli unbind <sessionId>：解绑 session
 /cloudcli unbind all：解绑全部 session
 /cloudcli chat [sessionId] [limit]：查看 session 最近消息；单绑定时可省略 sessionId
 /cloudcli run [选项] <任务>：发起 CloudCLI agent 任务并推送状态
+/cloudcli run list [数量]：列出当前用户发起的 CloudCLI 任务
+/cloudcli run log <任务编号>：查看任务日志
+/cloudcli run cancel <任务编号>：取消任务，并尽量中止关联 session
+/cloudcli stop <sessionId|序号|last> [provider]：中止正在执行的 CloudCLI session
 /cloudcli pending：列出已绑定 session 的待审批权限
 /cloudcli allow [序号]：允许权限；只有一条时可省略序号
 /cloudcli deny [序号] <原因>：拒绝权限；只有一条时可省略序号
+/cloudcli audit [数量]：查看审批审计记录
+/cloudcli whoami：查看当前 AstrBot 用户标识，用于配置审批白名单
 
 run 选项：--project <path>、--github <url>、--session <sessionId>、--provider <claude|cursor|codex|gemini>、--model <model>、--branch <name>、--pr、--no-cleanup
 """
@@ -78,7 +85,25 @@ def format_session_overview(
             rendered = _render_recent_session(item)
             lines.append(f"{index}. {rendered}")
     lines.append("")
-    lines.append("绑定示例：/cloudcli bind <sessionId>")
+    lines.append("绑定示例：/cloudcli bind 1、/cloudcli bind last 或 /cloudcli bind <sessionId>")
+    return "\n".join(lines)
+
+
+def format_health_report(report: dict[str, Any]) -> str:
+    lines = [f"CloudCLI 状态：{report.get('base_url') or '(未配置)'}"]
+    for key, label in (
+        ("auth", "认证"),
+        ("websocket", "WebSocket"),
+        ("rest", "REST"),
+        ("agent", "Agent API"),
+    ):
+        item = report.get(key)
+        if not isinstance(item, dict):
+            lines.append(f"- {label}: 未知")
+            continue
+        mark = "OK" if item.get("ok") else "FAIL"
+        message = _read_str(item.get("message")) or "无详情"
+        lines.append(f"- {label}: {mark} - {message}")
     return "\n".join(lines)
 
 
@@ -112,10 +137,12 @@ def format_chat_messages(session_id: str, payload: dict[str, Any], limit: int, t
     return clip_text("\n".join(lines), text_limit)
 
 
-def format_agent_start_message(payload: dict[str, Any]) -> str:
+def format_agent_start_message(payload: dict[str, Any], run_id: str = "") -> str:
     target = payload.get("projectPath") or payload.get("githubUrl") or payload.get("sessionId") or "(unknown)"
     provider = payload.get("provider") or "claude"
     extras = []
+    if run_id:
+        extras.append(f"task=#{run_id}")
     if payload.get("branchName"):
         extras.append(f"branch={payload['branchName']}")
     elif payload.get("createBranch"):
@@ -167,6 +194,66 @@ def format_agent_final(summary: dict[str, Any], text_limit: int) -> str:
     else:
         lines.append("未捕获到文本回复，可在 CloudCLI Web UI 查看完整输出。")
     return clip_text("\n".join(lines), text_limit)
+
+
+def format_run_tasks(tasks: list[dict[str, Any]], limit: int) -> str:
+    if not tasks:
+        return "当前用户还没有 CloudCLI 任务。"
+    lines = ["CloudCLI 任务："]
+    for item in tasks[: max(1, limit)]:
+        run_id = item.get("id") or "?"
+        status = item.get("status") or "unknown"
+        provider = item.get("provider") or "claude"
+        target = item.get("target") or item.get("project_path") or item.get("github_url") or item.get("session_id") or "(unknown)"
+        session_id = item.get("session_id") or ""
+        suffix = f" session={session_id}" if session_id else ""
+        lines.append(f"#{run_id} [{status}] {provider} -> {target}{suffix}")
+    lines.append("查看日志：/cloudcli run log <任务编号>；取消：/cloudcli run cancel <任务编号>")
+    return "\n".join(lines)
+
+
+def format_run_log(task: dict[str, Any], text_limit: int) -> str:
+    run_id = task.get("id") or "?"
+    status = task.get("status") or "unknown"
+    lines = [f"CloudCLI 任务 #{run_id} 日志："]
+    lines.append(f"status: {status}")
+    lines.append(f"provider: {task.get('provider') or 'claude'}")
+    target = task.get("target") or task.get("project_path") or task.get("github_url") or task.get("session_id") or ""
+    if target:
+        lines.append(f"target: {target}")
+    if task.get("session_id"):
+        lines.append(f"session: {task['session_id']}")
+    if task.get("error"):
+        lines.append(f"error: {task['error']}")
+    log_items = task.get("log")
+    lines.append("")
+    if isinstance(log_items, list) and log_items:
+        for item in log_items[-20:]:
+            if isinstance(item, dict):
+                text = _read_str(item.get("text"))
+                if text:
+                    lines.append(f"- {clip_text(text, 300)}")
+    else:
+        lines.append("暂无日志。")
+    return clip_text("\n".join(lines), text_limit)
+
+
+def format_audit(items: list[dict[str, Any]], limit: int) -> str:
+    if not items:
+        return "当前没有可见的审批审计记录。"
+    lines = ["审批审计记录："]
+    for item in items[: max(1, limit)]:
+        action = item.get("action") or "unknown"
+        result = item.get("result") or ""
+        user = item.get("display_name") or item.get("user_key") or "unknown"
+        tool = item.get("tool_name") or "UnknownTool"
+        session_id = item.get("session_id") or ""
+        reason = item.get("reason") or ""
+        line = f"- {action} [{result}] {tool} session={session_id} by {user}"
+        if reason:
+            line += f" reason={clip_text(str(reason), 160)}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def format_pending(approvals: list[PendingApproval], limit: int) -> str:

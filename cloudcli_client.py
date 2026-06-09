@@ -84,6 +84,54 @@ class CloudCLIClient:
         )
         return response
 
+    async def health_check(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "base_url": self.config.base_url.rstrip("/"),
+            "auth": {"ok": False, "message": ""},
+            "websocket": {"ok": False, "message": ""},
+            "rest": {"ok": False, "message": ""},
+            "agent": {"ok": bool(self.config.api_key), "message": ""},
+        }
+
+        try:
+            await self._ensure_http_session()
+            token = await self._get_token()
+            if token:
+                result["auth"] = {"ok": True, "message": "JWT 已可用。"}
+            elif self.config.allow_unauthenticated_ws:
+                result["auth"] = {"ok": True, "message": "已启用未认证 WebSocket。"}
+            else:
+                result["auth"] = {"ok": True, "message": "未返回 token，但配置允许继续尝试。"}
+        except CloudCLIError as exc:
+            result["auth"] = {"ok": False, "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            result["auth"] = {"ok": False, "message": f"认证检查失败：{exc}"}
+
+        try:
+            await self.ensure_connected()
+            result["websocket"] = {"ok": True, "message": "WebSocket 已连接。"}
+        except CloudCLIError as exc:
+            result["websocket"] = {"ok": False, "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            result["websocket"] = {"ok": False, "message": f"WebSocket 检查失败：{exc}"}
+
+        try:
+            sessions = await self.get_recent_sessions(1)
+            result["rest"] = {
+                "ok": True,
+                "message": f"REST 已可用，最近 session 返回 {len(sessions)} 条。",
+            }
+        except CloudCLIError as exc:
+            result["rest"] = {"ok": False, "message": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            result["rest"] = {"ok": False, "message": f"REST 检查失败：{exc}"}
+
+        if self.config.api_key:
+            result["agent"]["message"] = "已配置 cloudcli_api_key；为避免启动真实任务，未主动调用 /api/agent。"
+        else:
+            result["agent"]["message"] = "未配置 cloudcli_api_key；/cloudcli run 可能会被 CloudCLI 拒绝。"
+        return result
+
     async def get_recent_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
         await self._ensure_http_session()
         token = await self._get_token()
@@ -212,6 +260,16 @@ class CloudCLIClient:
         }
         if message:
             payload["message"] = message
+        await self._send_json(payload)
+
+    async def abort_session(self, session_id: str, provider: str = "") -> None:
+        await self.ensure_connected()
+        payload: dict[str, Any] = {
+            "type": "abort-session",
+            "sessionId": session_id,
+        }
+        if provider:
+            payload["provider"] = provider
         await self._send_json(payload)
 
     async def _connect_locked(self) -> None:
