@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,9 @@ try:
     from .state import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from state import PendingApproval
+
+
+logger = logging.getLogger(__name__)
 
 
 class CloudCLIError(RuntimeError):
@@ -32,6 +36,7 @@ class CloudCLIConfig:
     api_key: str = ""
     allow_unauthenticated_ws: bool = False
     timeout_seconds: int = 8
+    agent_idle_timeout_seconds: int = 120
 
 
 WaiterPredicate = Callable[[dict[str, Any]], bool]
@@ -192,6 +197,7 @@ class CloudCLIClient:
         timeout = aiohttp.ClientTimeout(
             total=None,
             sock_connect=max(3, self.config.timeout_seconds),
+            sock_read=max(10, self.config.agent_idle_timeout_seconds),
         )
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -226,14 +232,11 @@ class CloudCLIClient:
 
     async def get_pending_permissions(self, session_id: str) -> list[PendingApproval]:
         await self.ensure_connected()
-        try:
-            response = await self._request(
-                {"type": "get-pending-permissions", "sessionId": session_id},
-                lambda item: item.get("type") == "pending-permissions-response"
-                and item.get("sessionId") == session_id,
-            )
-        except CloudCLITimeout:
-            return []
+        response = await self._request(
+            {"type": "get-pending-permissions", "sessionId": session_id},
+            lambda item: item.get("type") == "pending-permissions-response"
+            and item.get("sessionId") == session_id,
+        )
 
         raw_items = response.get("data")
         if not isinstance(raw_items, list):
@@ -285,6 +288,21 @@ class CloudCLIClient:
                 heartbeat=25,
             )
         except Exception as exc:  # noqa: BLE001
+            if token and not self.config.jwt_token.strip() and self.config.username and self.config.password:
+                await self._clear_cached_token()
+                try:
+                    token = await self._get_token()
+                    self._ws = await self._session.ws_connect(
+                        self._ws_url(token),
+                        heartbeat=25,
+                    )
+                except Exception as retry_exc:  # noqa: BLE001
+                    raise CloudCLIError(
+                        f"无法连接 CloudCLI WebSocket，重新登录后仍失败：{retry_exc}"
+                    ) from retry_exc
+                else:
+                    self._reader_task = asyncio.create_task(self._reader_loop())
+                    return
             raise CloudCLIError(f"无法连接 CloudCLI WebSocket：{exc}") from exc
 
         self._reader_task = asyncio.create_task(self._reader_loop())
@@ -450,7 +468,12 @@ class CloudCLIClient:
         try:
             async for message in self._ws:
                 if message.type == aiohttp.WSMsgType.TEXT:
-                    await self._handle_message(json.loads(message.data))
+                    try:
+                        data = json.loads(message.data)
+                    except json.JSONDecodeError:
+                        logger.warning("Ignored invalid CloudCLI WS JSON message.")
+                        continue
+                    await self._handle_message(data)
                 elif message.type in {
                     aiohttp.WSMsgType.CLOSED,
                     aiohttp.WSMsgType.ERROR,
@@ -490,7 +513,10 @@ class CloudCLIClient:
 
         approval = self._extract_permission_request(data)
         if approval:
-            await self._on_permission_request(approval)
+            try:
+                await self._on_permission_request(approval)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to handle CloudCLI permission request: %s", exc)
 
     def _extract_permission_request(self, data: dict[str, Any]) -> PendingApproval | None:
         message_type = str(data.get("type") or data.get("kind") or "")

@@ -56,7 +56,8 @@
 - `/cloudcli run` 使用 CloudCLI 的外部 agent API，需要在 `cloudcli_api_key` 填写 CloudCLI UI 中 Settings → API & Tokens 生成的 API Key。
 - 如果 CloudCLI 启动时设置了全局 `API_KEY`，受保护接口也需要配置 `cloudcli_api_key`。
 - 用户只会收到自己已绑定 session 的主动审批推送。
-- `approval_allowed_user_keys` 为空时，能看到绑定 session 待审批的用户都可以审批；配置后只有白名单用户可以 `/cloudcli allow` 或 `/cloudcli deny`。
+- 默认只有 AstrBot 管理员或 `approval_allowed_user_keys` 白名单用户可以查看、接收和处理审批请求。
+- `/cloudcli pending` 会按 CloudCLI 当前返回结果刷新本地待审批缓存，已不存在的审批会从本地清理。
 - 审批超时默认只提醒，不会自动允许。只有把 `approval_timeout_action` 设置为 `deny` 时才会自动拒绝。
 
 ## CloudCLI 配置
@@ -70,9 +71,12 @@
 - `recent_sessions_limit`：`/cloudcli session` 展示的最近会话数量
 - `chat_messages_limit`：`/cloudcli chat` 默认展示的最近消息数量
 - `max_run_message_length`：`/cloudcli run` 接受的任务文本长度上限
+- `agent_idle_timeout_seconds`：`/cloudcli run` 流式响应空闲超时
+- `agent_max_duration_seconds`：单个 `/cloudcli run` 最大等待时间，`0` 表示关闭
 - `run_list_limit`：`/cloudcli run list` 默认展示的任务数量
 - `run_status_interval_seconds` / `max_run_status_pushes`：控制长任务状态推送频率
 - `approval_allowed_user_keys`：审批白名单，多个用户标识用英文逗号分隔；用 `/cloudcli whoami` 获取当前用户标识
+- `approval_require_admin`：开启后要求审批用户是 AstrBot 管理员，白名单用户除外
 - `approval_timeout_seconds`：审批超时时间，`0` 表示关闭超时处理
 - `approval_timeout_action`：超时动作，支持 `remind` 或 `deny`
 

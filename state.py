@@ -17,6 +17,8 @@ MAX_SESSION_INDEX_ITEMS = 100
 MAX_RUN_LOG_ITEMS = 80
 MAX_AUDIT_ITEMS = 500
 MAX_STORED_TEXT = 1200
+MAX_STORED_JSON_ITEMS = 60
+MAX_STORED_JSON_DEPTH = 6
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,7 @@ class UserRef:
     user_key: str
     display_name: str
     unified_msg_origin: str
+    is_admin: bool = False
 
 
 @dataclass
@@ -47,7 +50,7 @@ class PendingApproval:
             request_id=request_id,
             session_id=session_id,
             tool_name=_read_str(payload.get("toolName") or payload.get("tool_name")) or "UnknownTool",
-            input_data=payload.get("input"),
+            input_data=_safe_json_value(payload.get("input")),
             provider=_read_str(payload.get("provider")) or "claude",
             received_at=_parse_timestamp(payload.get("receivedAt")) or time.time(),
         )
@@ -104,6 +107,7 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
+            entry["is_admin"] = bool(user.is_admin)
             origins = _read_list(entry.get("origins"))
             if user.unified_msg_origin not in origins:
                 origins.append(user.unified_msg_origin)
@@ -124,6 +128,7 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
+            entry["is_admin"] = bool(user.is_admin)
             origins = _read_list(entry.get("origins"))
             if user.unified_msg_origin not in origins:
                 origins.append(user.unified_msg_origin)
@@ -248,6 +253,7 @@ class PluginState:
                         {
                             "user_key": user_key,
                             "display_name": _read_str(entry.get("display_name")),
+                            "is_admin": bool(entry.get("is_admin")),
                             "origins": _read_list(entry.get("origins")),
                         }
                     )
@@ -256,15 +262,7 @@ class PluginState:
     async def upsert_pending(self, approval: PendingApproval) -> None:
         async with self._lock:
             pending = _read_dict(self._data.get("pending"))
-            pending[approval.request_id] = {
-                "request_id": approval.request_id,
-                "session_id": approval.session_id,
-                "tool_name": approval.tool_name,
-                "input_data": approval.input_data,
-                "provider": approval.provider,
-                "received_at": approval.received_at or time.time(),
-                "resolved": False,
-            }
+            pending[approval.request_id] = self._pending_record(approval)
             self._data["pending"] = pending
             await self._save_locked()
 
@@ -296,17 +294,36 @@ class PluginState:
         async with self._lock:
             pending = _read_dict(self._data.get("pending"))
             for approval in approvals:
-                pending[approval.request_id] = {
-                    "request_id": approval.request_id,
-                    "session_id": approval.session_id,
-                    "tool_name": approval.tool_name,
-                    "input_data": approval.input_data,
-                    "provider": approval.provider,
-                    "received_at": approval.received_at or time.time(),
-                    "resolved": False,
-                }
+                pending[approval.request_id] = self._pending_record(approval)
             self._data["pending"] = pending
             await self._save_locked()
+
+    async def replace_pending_for_session(
+        self,
+        session_id: str,
+        approvals: list[PendingApproval],
+    ) -> list[str]:
+        if not is_valid_session_id(session_id):
+            return []
+        async with self._lock:
+            pending = _read_dict(self._data.get("pending"))
+            incoming = {
+                approval.request_id: approval
+                for approval in approvals
+                if approval.session_id == session_id and is_valid_request_id(approval.request_id)
+            }
+            removed: list[str] = []
+            for request_id, item in list(pending.items()):
+                if not isinstance(item, dict):
+                    continue
+                if _read_str(item.get("session_id")) == session_id and request_id not in incoming:
+                    removed.append(request_id)
+                    pending.pop(request_id, None)
+            for approval in incoming.values():
+                pending[approval.request_id] = self._pending_record(approval)
+            self._data["pending"] = pending
+            await self._save_locked()
+            return removed
 
     async def visible_pending_for_user(
         self,
@@ -502,6 +519,7 @@ class PluginState:
             user_key,
             {
                 "display_name": "",
+                "is_admin": False,
                 "origins": [],
                 "bindings": [],
                 "last_seen_at": 0,
@@ -512,6 +530,7 @@ class PluginState:
         if not isinstance(entry, dict):
             entry = {
                 "display_name": "",
+                "is_admin": False,
                 "origins": [],
                 "bindings": [],
                 "last_seen_at": 0,
@@ -524,6 +543,17 @@ class PluginState:
     def _guess_next_run_id(self, runs: dict[str, Any]) -> int:
         ids = [int(key) for key in runs if isinstance(key, str) and RUN_ID_RE.fullmatch(key)]
         return max(ids, default=0) + 1
+
+    def _pending_record(self, approval: PendingApproval) -> dict[str, Any]:
+        return {
+            "request_id": approval.request_id,
+            "session_id": approval.session_id,
+            "tool_name": _safe_text(approval.tool_name, 120) or "UnknownTool",
+            "input_data": _safe_json_value(approval.input_data),
+            "provider": _safe_text(approval.provider, 60) or "claude",
+            "received_at": approval.received_at or time.time(),
+            "resolved": False,
+        }
 
     async def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -594,7 +624,29 @@ def _safe_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
     return text
 
 
-def _safe_json_value(value: Any) -> Any:
+def _safe_json_value(value: Any, depth: int = 0) -> Any:
+    if depth >= MAX_STORED_JSON_DEPTH:
+        return _safe_text(value, MAX_STORED_TEXT)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _safe_text(value, MAX_STORED_TEXT)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= MAX_STORED_JSON_ITEMS:
+                result["...[truncated]"] = len(value) - MAX_STORED_JSON_ITEMS
+                break
+            result[_safe_text(key, 120)] = _safe_json_value(item, depth + 1)
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [
+            _safe_json_value(item, depth + 1)
+            for item in list(value)[:MAX_STORED_JSON_ITEMS]
+        ]
+        if len(value) > MAX_STORED_JSON_ITEMS:
+            result.append(f"...[truncated {len(value) - MAX_STORED_JSON_ITEMS} items]")
+        return result
     try:
         json.dumps(value, ensure_ascii=False)
         return value

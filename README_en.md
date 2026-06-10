@@ -54,7 +54,8 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - `/cloudcli run` uses CloudCLI's external agent API, so `cloudcli_api_key` must contain an API key generated in CloudCLI Settings → API & Tokens.
 - If CloudCLI is started with a global `API_KEY`, protected endpoints also need `cloudcli_api_key`.
 - Users only receive push notifications for sessions they have bound.
-- When `approval_allowed_user_keys` is empty, any user who can see a bound session approval may approve it. Once configured, only allowlisted users can run `/cloudcli allow` or `/cloudcli deny`.
+- By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
+- `/cloudcli pending` refreshes the local pending approval cache from CloudCLI and removes approvals that no longer exist upstream.
 - Approval timeout defaults to reminders only. Automatic denial happens only when `approval_timeout_action` is set to `deny`.
 
 ## CloudCLI setup
@@ -68,9 +69,12 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `recent_sessions_limit`: number of recent sessions shown by `/cloudcli session`
 - `chat_messages_limit`: default recent message count shown by `/cloudcli chat`
 - `max_run_message_length`: maximum task text length accepted by `/cloudcli run`
+- `agent_idle_timeout_seconds`: idle timeout for the `/cloudcli run` streaming response
+- `agent_max_duration_seconds`: maximum wait time for one `/cloudcli run`; `0` disables this guard
 - `run_list_limit`: default task count shown by `/cloudcli run list`
 - `run_status_interval_seconds` / `max_run_status_pushes`: control background run status push frequency
 - `approval_allowed_user_keys`: comma-separated approval allowlist; use `/cloudcli whoami` to get the current user key
+- `approval_require_admin`: when enabled, approvals require an AstrBot admin unless the user is allowlisted
 - `approval_timeout_seconds`: seconds before timeout handling; `0` disables it
 - `approval_timeout_action`: timeout action, `remind` or `deny`
 

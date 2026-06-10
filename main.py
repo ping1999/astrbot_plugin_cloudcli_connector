@@ -181,7 +181,8 @@ class CloudCLIConnectorPlugin(Star):
         if command.name == "whoami":
             if command.args:
                 return "用法：/cloudcli whoami"
-            return f"当前用户标识：{user.user_key}\n昵称：{user.display_name}"
+            admin_text = "是" if user.is_admin else "否"
+            return f"当前用户标识：{user.user_key}\n昵称：{user.display_name}\nAstrBot 管理员：{admin_text}"
 
         return f"未知指令：{command.name}\n\n{HELP_TEXT}"
 
@@ -204,7 +205,7 @@ class CloudCLIConnectorPlugin(Star):
 
         try:
             recent_sessions = await self.client.get_recent_sessions(
-                _read_int(self.config.get("recent_sessions_limit"), 20)
+                _read_limited_int(self.config.get("recent_sessions_limit"), 20, 1, 100)
             )
             await self.state.remember_session_index(
                 user,
@@ -243,7 +244,7 @@ class CloudCLIConnectorPlugin(Star):
             return error
         assert resolved is not None
         session_id = resolved["id"]
-        max_bindings = _read_int(self.config.get("max_bindings_per_user"), 20)
+        max_bindings = _read_limited_int(self.config.get("max_bindings_per_user"), 20, 1, 100)
         _, message = await self.state.bind_session(user, session_id, max_bindings)
         return message
 
@@ -261,7 +262,7 @@ class CloudCLIConnectorPlugin(Star):
         return message
 
     async def _handle_chat(self, user: UserRef, args: list[str]) -> str:
-        default_limit = _read_int(self.config.get("chat_messages_limit"), 12)
+        default_limit = _read_limited_int(self.config.get("chat_messages_limit"), 12, 1, 50)
         session_id = ""
         limit = default_limit
 
@@ -293,7 +294,7 @@ class CloudCLIConnectorPlugin(Star):
                 session_id,
                 payload,
                 limit,
-                _read_int(self.config.get("max_push_text_length"), 1800),
+                self._max_push_text_length(),
             )
         except CloudCLIError as exc:
             return f"获取 CloudCLI session 消息失败：{exc}"
@@ -325,7 +326,7 @@ class CloudCLIConnectorPlugin(Star):
         if subcommand == "list":
             if len(args) > 2:
                 return "用法：/cloudcli run list [数量]"
-            limit = _read_int(self.config.get("run_list_limit"), 10)
+            limit = _read_limited_int(self.config.get("run_list_limit"), 10, 1, 50)
             if len(args) == 2:
                 limit, error = _parse_positive_int(args[1], "数量", 1, 50)
                 if error:
@@ -339,7 +340,7 @@ class CloudCLIConnectorPlugin(Star):
             if error:
                 return error
             assert task is not None
-            return format_run_log(task, _read_int(self.config.get("max_push_text_length"), 1800))
+            return format_run_log(task, self._max_push_text_length())
 
         if subcommand == "cancel":
             if len(args) != 2:
@@ -376,17 +377,20 @@ class CloudCLIConnectorPlugin(Star):
         return self._run_usage()
 
     async def _handle_pending(self, user: UserRef) -> str:
+        approval_error = self._approval_permission_error(user)
+        if approval_error:
+            return approval_error
         bindings = await self.state.list_bindings(user)
         if not bindings:
             return "当前用户没有绑定 session，请先使用 /cloudcli bind <sessionId>。"
         sync_error = await self._refresh_pending_for_bindings(bindings)
         approvals = await self.state.visible_pending_for_user(
             user,
-            _read_int(self.config.get("max_pending_display"), 30),
+            _read_limited_int(self.config.get("max_pending_display"), 30, 1, 100),
         )
         body = format_pending(
             approvals,
-            _read_int(self.config.get("max_push_text_length"), 1800),
+            self._max_push_text_length(),
         )
         if sync_error:
             return f"同步 CloudCLI 待审批权限失败，以下可能是本地缓存：{sync_error}\n\n{body}"
@@ -494,6 +498,9 @@ class CloudCLIConnectorPlugin(Star):
             return f"发送拒绝决定失败：{exc}"
 
     async def _handle_audit(self, user: UserRef, args: list[str]) -> str:
+        approval_error = self._approval_permission_error(user)
+        if approval_error:
+            return approval_error
         if len(args) > 1:
             return "用法：/cloudcli audit [数量]"
         limit = 10
@@ -515,7 +522,7 @@ class CloudCLIConnectorPlugin(Star):
         return await self.state.resolve_visible_request(
             user,
             request_no,
-            _read_int(self.config.get("max_pending_display"), 30),
+            _read_limited_int(self.config.get("max_pending_display"), 30, 1, 100),
         )
 
     async def _infer_single_bound_session(self, user: UserRef) -> tuple[str, str | None]:
@@ -541,20 +548,28 @@ class CloudCLIConnectorPlugin(Star):
         return resolved, None
 
     def _approval_permission_error(self, user: UserRef) -> str:
+        if self._can_manage_approvals(user.user_key, user.is_admin):
+            return ""
+        return (
+            "当前用户没有权限审批 CloudCLI 权限请求。\n"
+            f"当前用户标识：{user.user_key}\n"
+            "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 approval_allowed_user_keys。"
+        )
+
+    def _can_manage_approvals(self, user_key: str, is_admin: bool) -> bool:
         allowed = set(_read_str_list(self.config.get("approval_allowed_user_keys")))
-        if allowed and user.user_key not in allowed:
-            return (
-                "当前用户没有权限审批 CloudCLI 权限请求。\n"
-                f"当前用户标识：{user.user_key}\n"
-                "请让管理员把该标识加入 approval_allowed_user_keys。"
-            )
-        return ""
+        if user_key in allowed:
+            return True
+        require_admin = _read_bool(self.config.get("approval_require_admin"), True)
+        return bool(is_admin) if require_admin else True
 
     def _schedule_approval_timeout(self, approval: PendingApproval) -> None:
-        timeout_seconds = _read_nonnegative_int(self.config.get("approval_timeout_seconds"), 300)
+        timeout_seconds = _read_nonnegative_limited_int(self.config.get("approval_timeout_seconds"), 300, 86400)
         if timeout_seconds <= 0:
             return
-        self._cancel_approval_timeout(approval.request_id)
+        existing = self._approval_timeout_tasks.get(approval.request_id)
+        if existing and not existing.done():
+            return
         task = asyncio.create_task(self._approval_timeout_worker(approval.request_id, timeout_seconds))
         self._approval_timeout_tasks[approval.request_id] = task
         task.add_done_callback(
@@ -574,7 +589,9 @@ class CloudCLIConnectorPlugin(Star):
             if approval is None:
                 return
             action = _read_str(self.config.get("approval_timeout_action"), "remind").lower()
-            targets = await self.state.users_bound_to_session(approval.session_id)
+            targets = self._filter_approval_targets(
+                await self.state.users_bound_to_session(approval.session_id)
+            )
             if action == "deny":
                 reason = f"审批超时 {timeout_seconds} 秒，自动拒绝。"
                 try:
@@ -684,7 +701,12 @@ class CloudCLIConnectorPlugin(Star):
         message = " ".join(message_parts).strip()
         if not message:
             return None, "任务内容不能为空。\n" + self._run_usage()
-        max_message_len = _read_int(self.config.get("max_run_message_length"), MAX_RUN_MESSAGE_LEN)
+        max_message_len = _read_limited_int(
+            self.config.get("max_run_message_length"),
+            MAX_RUN_MESSAGE_LEN,
+            1,
+            20000,
+        )
         if len(message) > max_message_len:
             return None, f"任务内容太长，请控制在 {max_message_len} 字以内。"
 
@@ -812,7 +834,7 @@ class CloudCLIConnectorPlugin(Star):
     async def _find_recent_session(self, session_id: str) -> dict[str, Any] | None:
         try:
             sessions = await self.client.get_recent_sessions(
-                max(100, _read_int(self.config.get("recent_sessions_limit"), 20))
+                100
             )
         except CloudCLIError:
             return None
@@ -837,20 +859,24 @@ class CloudCLIConnectorPlugin(Star):
                 return session_id, [], str(exc)
 
         results = await asyncio.gather(*(fetch_one(session_id) for session_id in bindings))
-        approvals_to_merge: list[PendingApproval] = []
         errors: list[str] = []
         for session_id, approvals, error in results:
-            approvals_to_merge.extend(approvals)
             if error:
                 errors.append(f"{session_id}: {error}")
-        if approvals_to_merge:
-            await self.state.merge_pending(approvals_to_merge)
+                continue
+            removed = await self.state.replace_pending_for_session(session_id, approvals)
+            for request_id in removed:
+                self._cancel_approval_timeout(request_id)
+            for approval in approvals:
+                self._schedule_approval_timeout(approval)
         return "; ".join(errors)
 
     async def _run_agent_background(self, run_id: str, unified_msg_origin: str, payload: dict[str, Any]) -> None:
-        text_limit = _read_int(self.config.get("max_push_text_length"), 1800)
-        status_interval = _read_int(self.config.get("run_status_interval_seconds"), 20)
-        max_status_pushes = _read_int(self.config.get("max_run_status_pushes"), 10)
+        text_limit = self._max_push_text_length()
+        status_interval = _read_limited_int(self.config.get("run_status_interval_seconds"), 20, 1, 3600)
+        max_status_pushes = _read_nonnegative_limited_int(self.config.get("max_run_status_pushes"), 10, 50)
+        max_duration = _read_nonnegative_limited_int(self.config.get("agent_max_duration_seconds"), 7200, 86400)
+        summary_text_limit = max(4000, min(24000, text_limit * 4))
         summary: dict[str, Any] = {
             "sessionId": payload.get("sessionId"),
             "projectPath": payload.get("projectPath"),
@@ -859,13 +885,19 @@ class CloudCLIConnectorPlugin(Star):
             "assistantText": "",
             "errors": [],
         }
-        text_parts: list[str] = []
+        assistant_text = ""
+        assistant_text_truncated = False
         status_pushes = 0
         last_status = ""
         last_status_at = 0.0
 
-        try:
-            await self.state.update_run_task(run_id, status="running", event="任务已启动。")
+        async def consume_stream() -> None:
+            nonlocal assistant_text
+            nonlocal assistant_text_truncated
+            nonlocal status_pushes
+            nonlocal last_status
+            nonlocal last_status_at
+
             async for event in self.client.stream_agent(payload):
                 event_type = str(event.get("type") or event.get("event") or "")
                 self._merge_agent_event(summary, event)
@@ -877,7 +909,14 @@ class CloudCLIConnectorPlugin(Star):
 
                 extracted_text = extract_agent_text(event)
                 if extracted_text:
-                    text_parts.append(extracted_text)
+                    if len(assistant_text) < summary_text_limit:
+                        remaining = summary_text_limit - len(assistant_text)
+                        chunk = extracted_text[:remaining]
+                        assistant_text = f"{assistant_text}\n{chunk}" if assistant_text else chunk
+                        if len(extracted_text) > remaining:
+                            assistant_text_truncated = True
+                    else:
+                        assistant_text_truncated = True
                     await self.state.update_run_task(
                         run_id,
                         event=f"assistant: {clip_text(extracted_text, 500)}",
@@ -898,8 +937,17 @@ class CloudCLIConnectorPlugin(Star):
                     last_status = status_text
                     last_status_at = now
 
-            if text_parts:
-                summary["assistantText"] = "\n".join(text_parts).strip()
+        try:
+            await self.state.update_run_task(run_id, status="running", event="任务已启动。")
+            if max_duration > 0:
+                await asyncio.wait_for(consume_stream(), timeout=max_duration)
+            else:
+                await consume_stream()
+
+            if assistant_text:
+                summary["assistantText"] = assistant_text.strip()
+                if assistant_text_truncated:
+                    summary["assistantText"] += "\n...[truncated]"
             final_text = format_agent_final(summary, text_limit)
             await self.state.update_run_task(
                 run_id,
@@ -909,6 +957,16 @@ class CloudCLIConnectorPlugin(Star):
                 finished=True,
             )
             await self._send_proactive(unified_msg_origin, final_text)
+        except asyncio.TimeoutError:
+            message = f"CloudCLI 任务超过最大运行时间 {max_duration} 秒，已停止等待。"
+            await self.state.update_run_task(
+                run_id,
+                status="failed",
+                event=message,
+                error=message,
+                finished=True,
+            )
+            await self._send_proactive(unified_msg_origin, message)
         except CloudCLIError as exc:
             await self.state.update_run_task(
                 run_id,
@@ -969,12 +1027,13 @@ class CloudCLIConnectorPlugin(Star):
     async def _on_permission_request(self, approval: PendingApproval) -> None:
         await self.state.upsert_pending(approval)
         targets = await self.state.users_bound_to_session(approval.session_id)
+        targets = self._filter_approval_targets(targets)
         if not targets:
             return
         self._schedule_approval_timeout(approval)
         text = format_push_message(
             approval,
-            _read_int(self.config.get("max_push_text_length"), 1800),
+            self._max_push_text_length(),
         )
         for target in targets:
             for origin in target.get("origins", []):
@@ -987,7 +1046,7 @@ class CloudCLIConnectorPlugin(Star):
             logger.warning("Invalid unified_msg_origin: %s", unified_msg_origin)
             return
 
-        chain = MessageChain().message(clip_text(text, _read_int(self.config.get("max_push_text_length"), 1800)))
+        chain = MessageChain().message(clip_text(text, self._max_push_text_length()))
         for platform in getattr(self.context.platform_manager, "platform_insts", []):
             try:
                 meta = platform.meta()
@@ -1000,6 +1059,16 @@ class CloudCLIConnectorPlugin(Star):
                 return
         logger.warning("No platform instance found for %s", unified_msg_origin)
 
+    def _filter_approval_targets(self, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            target
+            for target in targets
+            if self._can_manage_approvals(
+                str(target.get("user_key") or ""),
+                bool(target.get("is_admin")),
+            )
+        ]
+
     async def _warm_connect(self) -> None:
         try:
             await self.client.ensure_connected()
@@ -1010,6 +1079,9 @@ class CloudCLIConnectorPlugin(Star):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    def _max_push_text_length(self) -> int:
+        return _read_limited_int(self.config.get("max_push_text_length"), 1800, 200, 8000)
+
     def _read_cloudcli_config(self) -> CloudCLIConfig:
         return CloudCLIConfig(
             base_url=_read_str(self.config.get("cloudcli_base_url"), "http://127.0.0.1:3001"),
@@ -1018,7 +1090,13 @@ class CloudCLIConnectorPlugin(Star):
             password=_read_str(self.config.get("cloudcli_password"), ""),
             api_key=_read_str(self.config.get("cloudcli_api_key"), ""),
             allow_unauthenticated_ws=_read_bool(self.config.get("allow_unauthenticated_ws"), False),
-            timeout_seconds=_read_int(self.config.get("request_timeout_seconds"), 8),
+            timeout_seconds=_read_limited_int(self.config.get("request_timeout_seconds"), 8, 2, 120),
+            agent_idle_timeout_seconds=_read_limited_int(
+                self.config.get("agent_idle_timeout_seconds"),
+                120,
+                10,
+                3600,
+            ),
         )
 
     def _user_ref(self, event: AstrMessageEvent) -> UserRef:
@@ -1029,6 +1107,7 @@ class CloudCLIConnectorPlugin(Star):
             user_key=f"{platform_id}:{sender_id}",
             display_name=display_name,
             unified_msg_origin=event.unified_msg_origin,
+            is_admin=_is_event_admin(event),
         )
 
     def _parse_command(self, message: str) -> ParsedCommand:
@@ -1082,6 +1161,30 @@ def _read_nonnegative_int(value: Any, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
+def _read_limited_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed < minimum:
+        return minimum
+    if parsed > maximum:
+        return maximum
+    return parsed
+
+
+def _read_nonnegative_limited_int(value: Any, default: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if parsed < 0:
+        return 0
+    if parsed > maximum:
+        return maximum
+    return parsed
+
+
 def _read_bool(value: Any, default: bool) -> bool:
     return value if isinstance(value, bool) else default
 
@@ -1118,7 +1221,6 @@ def _looks_like_github_url(value: str) -> bool:
         return False
     return (
         value.startswith("https://github.com/")
-        or value.startswith("http://github.com/")
         or value.startswith("git@github.com:")
     )
 
@@ -1133,3 +1235,13 @@ def _strip_wrapping_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
+
+
+def _is_event_admin(event: AstrMessageEvent) -> bool:
+    checker = getattr(event, "is_admin", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:  # noqa: BLE001
+            pass
+    return str(getattr(event, "role", "")).lower() == "admin"

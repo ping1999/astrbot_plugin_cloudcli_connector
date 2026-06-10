@@ -45,6 +45,18 @@
     "type": "int",
     "default": 8
   },
+  "agent_idle_timeout_seconds": {
+    "description": "CloudCLI agent stream idle timeout",
+    "type": "int",
+    "default": 120,
+    "hint": "Abort /cloudcli run when the CloudCLI agent stream sends no data for this many seconds."
+  },
+  "agent_max_duration_seconds": {
+    "description": "CloudCLI agent max task duration",
+    "type": "int",
+    "default": 7200,
+    "hint": "Maximum seconds to wait for one /cloudcli run task. Set 0 to disable this guard."
+  },
   "max_bindings_per_user": {
     "description": "Max bound sessions per user",
     "type": "int",
@@ -89,7 +101,13 @@
     "description": "Comma-separated AstrBot user keys allowed to approve permissions",
     "type": "string",
     "default": "",
-    "hint": "Leave empty to allow any user who can see the bound session approval. Use /cloudcli whoami to get the key."
+    "hint": "Users in this list can approve even if they are not AstrBot admins. Use /cloudcli whoami to get the key."
+  },
+  "approval_require_admin": {
+    "description": "Require AstrBot admin for approvals",
+    "type": "bool",
+    "default": true,
+    "hint": "When enabled, only AstrBot admins or approval_allowed_user_keys can view, receive, approve, or deny CloudCLI permission requests."
   },
   "approval_timeout_seconds": {
     "description": "Seconds before pending approval timeout action; 0 disables it",
