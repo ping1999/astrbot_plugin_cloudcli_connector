@@ -61,6 +61,7 @@
 - 非管理员使用 `/cloudcli run --project` 时建议配置 `allowed_project_roots`，否则默认会拒绝访问本地任意目录。
 - 非管理员默认不能直接手填未绑定的 sessionId；请先执行 `/cloudcli session` 后使用序号，或由管理员开启 `allow_direct_session_id`。
 - 默认只有 AstrBot 管理员或 `approval_allowed_user_keys` 白名单用户可以查看、接收和处理审批请求。
+- 为避免历史管理员状态失效导致敏感审批内容误推，主动审批详情只会推送到绑定该 session 的聊天会话，并且在 `approval_require_admin=true` 时只主动推给 `approval_allowed_user_keys` 中的用户；管理员仍可主动执行 `/cloudcli pending` 查看并处理。
 - `/cloudcli pending` 会按 CloudCLI 当前返回结果刷新本地待审批缓存，已不存在的审批会从本地清理。
 - 审批超时默认只提醒，不会自动允许。只有把 `approval_timeout_action` 设置为 `deny` 时才会自动拒绝。
 
@@ -88,7 +89,7 @@
 - `run_list_limit`：`/cloudcli run list` 默认展示的任务数量
 - `run_status_interval_seconds` / `max_run_status_pushes`：控制长任务状态推送频率
 - `approval_allowed_user_keys`：审批白名单，多个用户标识用英文逗号分隔；用 `/cloudcli whoami` 获取当前用户标识
-- `approval_require_admin`：开启后要求审批用户是 AstrBot 管理员，白名单用户除外
+- `approval_require_admin`：开启后要求审批用户是 AstrBot 管理员，白名单用户除外；如需主动收到审批详情推送，建议同时加入 `approval_allowed_user_keys`
 - `approval_timeout_seconds`：审批超时时间，`0` 表示关闭超时处理
 - `approval_timeout_action`：超时动作，支持 `remind` 或 `deny`
 

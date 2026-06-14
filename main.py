@@ -12,6 +12,7 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
 
 try:
+    from .approval_notifications import ApprovalNotificationPolicy
     from .authz import AuthorizationPolicy
     from .cloudcli_client import CloudCLIClient, CloudCLIError
     from .config import load_connector_settings
@@ -40,7 +41,15 @@ try:
         resolve_data_path,
     )
     from .runtime import RunQuota
+    from .run_validation import (
+        has_control_chars,
+        is_index_session_ref,
+        is_safe_git_branch_name,
+        is_safe_short_value,
+        looks_like_github_url,
+    )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from approval_notifications import ApprovalNotificationPolicy
     from authz import AuthorizationPolicy
     from cloudcli_client import CloudCLIClient, CloudCLIError
     from config import load_connector_settings
@@ -69,6 +78,13 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         resolve_data_path,
     )
     from runtime import RunQuota
+    from run_validation import (
+        has_control_chars,
+        is_index_session_ref,
+        is_safe_git_branch_name,
+        is_safe_short_value,
+        looks_like_github_url,
+    )
 
 
 PLUGIN_NAME = "astrbot_plugin_cloudcli_connector"
@@ -102,6 +118,10 @@ class CloudCLIConnectorPlugin(Star):
         self.config = config or {}
         self.settings = load_connector_settings(self.config)
         self.authz = AuthorizationPolicy(self.settings)
+        self.approval_notifications = ApprovalNotificationPolicy(
+            approval_allowed_user_keys=self.settings.approval_allowed_user_keys,
+            approval_require_admin=self.settings.approval_require_admin,
+        )
         self.state = PluginState(
             resolve_data_path(__file__, PLUGIN_NAME) / "state.json"
         )
@@ -591,7 +611,7 @@ class CloudCLIConnectorPlugin(Star):
         return resolved, None
 
     async def _direct_bind_error(self, user: UserRef, ref: str) -> str:
-        if _is_index_session_ref(ref):
+        if is_index_session_ref(ref):
             return ""
         if not is_valid_session_id(ref.strip()):
             return ""
@@ -602,7 +622,7 @@ class CloudCLIConnectorPlugin(Star):
         return "" if decision.allowed else decision.message
 
     async def _direct_session_ref_error(self, user: UserRef, ref: str) -> str:
-        if _is_index_session_ref(ref):
+        if is_index_session_ref(ref):
             return ""
         if not is_valid_session_id(ref.strip()):
             return ""
@@ -619,9 +639,6 @@ class CloudCLIConnectorPlugin(Star):
     def _approval_permission_error(self, user: UserRef) -> str:
         decision = self.authz.can_manage_approvals(user)
         return "" if decision.allowed else decision.message
-
-    def _can_manage_approvals(self, user_key: str, is_admin: bool) -> bool:
-        return self.authz.can_manage_approvals_by_values(user_key, is_admin)
 
     def _schedule_approval_timeout(self, approval: PendingApproval) -> None:
         timeout_seconds = self.settings.approval_timeout_seconds
@@ -649,7 +666,7 @@ class CloudCLIConnectorPlugin(Star):
             if approval is None:
                 return
             action = self.settings.approval_timeout_action
-            targets = self._filter_approval_targets(
+            targets = self._approval_detail_targets(
                 await self.state.users_bound_to_session(approval.session_id)
             )
             if action == "deny":
@@ -848,19 +865,19 @@ class CloudCLIConnectorPlugin(Star):
             return "sessionId 格式不合法。"
 
         project_path = str(options.get("projectPath") or "")
-        if project_path and _has_control_chars(project_path):
+        if project_path and has_control_chars(project_path):
             return "projectPath 含有非法控制字符。"
 
         github_url = str(options.get("githubUrl") or "")
-        if github_url and not _looks_like_github_url(github_url):
+        if github_url and not looks_like_github_url(github_url):
             return "githubUrl 格式不合法，只支持 github.com 的 HTTPS 或 SSH URL。"
 
         model = str(options.get("model") or "")
-        if model and not _is_safe_short_value(model, 120):
+        if model and not is_safe_short_value(model, 120):
             return "model 格式不合法或过长。"
 
         branch_name = str(options.get("branchName") or "")
-        if branch_name and not _is_safe_git_branch_name(branch_name):
+        if branch_name and not is_safe_git_branch_name(branch_name):
             return "branch 名称不合法或过长。"
 
         target_count = sum(1 for key in ("projectPath", "githubUrl") if options.get(key))
@@ -1098,11 +1115,11 @@ class CloudCLIConnectorPlugin(Star):
 
     async def _on_permission_request(self, approval: PendingApproval) -> None:
         await self.state.upsert_pending(approval)
+        self._schedule_approval_timeout(approval)
         targets = await self.state.users_bound_to_session(approval.session_id)
-        targets = self._filter_approval_targets(targets)
+        targets = self._approval_detail_targets(targets)
         if not targets:
             return
-        self._schedule_approval_timeout(approval)
         text = format_push_message(
             approval,
             self._max_push_text_length(),
@@ -1131,15 +1148,8 @@ class CloudCLIConnectorPlugin(Star):
                 return
         logger.warning("No platform instance found for %s", unified_msg_origin)
 
-    def _filter_approval_targets(self, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [
-            target
-            for target in targets
-            if self._can_manage_approvals(
-                str(target.get("user_key") or ""),
-                bool(target.get("is_admin")),
-            )
-        ]
+    def _approval_detail_targets(self, targets: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+        return self.approval_notifications.plan(targets).detailed_targets
 
     async def _warm_connect(self) -> None:
         try:
@@ -1213,51 +1223,6 @@ def _parse_positive_int(
     if parsed < minimum or parsed > maximum:
         return minimum, f"{name} 必须在 {minimum}-{maximum} 之间。"
     return parsed, None
-
-
-def _has_control_chars(value: str) -> bool:
-    return any(ord(char) < 32 or ord(char) == 127 for char in value)
-
-
-def _is_index_session_ref(value: str) -> bool:
-    ref = value.strip().lower()
-    return ref in {"last", "latest"} or ref.isdigit()
-
-
-def _looks_like_github_url(value: str) -> bool:
-    if _has_control_chars(value) or len(value) > 500:
-        return False
-    return (
-        value.startswith("https://github.com/")
-        or value.startswith("git@github.com:")
-    )
-
-
-def _is_safe_short_value(value: str, max_len: int) -> bool:
-    if not value or len(value) > max_len or _has_control_chars(value):
-        return False
-    return not any(char.isspace() for char in value)
-
-
-def _is_safe_git_branch_name(value: str) -> bool:
-    if not _is_safe_short_value(value, 120):
-        return False
-    forbidden_chars = set("~^:?*[\\")
-    if any(char in forbidden_chars for char in value):
-        return False
-    if (
-        value.startswith("-")
-        or value.startswith("/")
-        or value.endswith("/")
-        or value.endswith(".")
-        or value.endswith(".lock")
-        or ".." in value
-        or "//" in value
-        or "@{" in value
-        or value == "@"
-    ):
-        return False
-    return True
 
 
 def _strip_wrapping_quotes(value: str) -> str:

@@ -4,8 +4,10 @@ import json
 from typing import Any
 
 try:
+    from .redaction import redact_text
     from .state import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from redaction import redact_text
     from state import PendingApproval
 
 
@@ -36,6 +38,7 @@ run 选项：--project <path>、--github <url>、--session <sessionId>、--provi
 def clip_text(text: str, limit: int) -> str:
     if limit < 20:
         limit = 20
+    text = redact_text(text, limit)
     if len(text) <= limit:
         return text
     return f"{text[: limit - 20]}\n... 已截断 {len(text) - limit + 20} 字符"

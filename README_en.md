@@ -59,6 +59,7 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
 - Non-admin users cannot directly type an unbound raw sessionId by default. They should use an index from `/cloudcli session`, or an admin can enable `allow_direct_session_id`.
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
+- To avoid leaking sensitive approval input through stale stored admin state, proactive approval detail pushes only go to the chat origin that bound that session. When `approval_require_admin=true`, detailed proactive pushes are sent only to users in `approval_allowed_user_keys`; admins can still run `/cloudcli pending` to view and handle requests.
 - `/cloudcli pending` refreshes the local pending approval cache from CloudCLI and removes approvals that no longer exist upstream.
 - Approval timeout defaults to reminders only. Automatic denial happens only when `approval_timeout_action` is set to `deny`.
 
@@ -86,7 +87,7 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `run_list_limit`: default task count shown by `/cloudcli run list`
 - `run_status_interval_seconds` / `max_run_status_pushes`: control background run status push frequency
 - `approval_allowed_user_keys`: comma-separated approval allowlist; use `/cloudcli whoami` to get the current user key
-- `approval_require_admin`: when enabled, approvals require an AstrBot admin unless the user is allowlisted
+- `approval_require_admin`: when enabled, approvals require an AstrBot admin unless the user is allowlisted; add admins to `approval_allowed_user_keys` when they should receive proactive approval details
 - `approval_timeout_seconds`: seconds before timeout handling; `0` disables it
 - `approval_timeout_action`: timeout action, `remind` or `deny`
 

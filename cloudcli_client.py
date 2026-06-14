@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -12,8 +11,10 @@ from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 import aiohttp
 
 try:
+    from .redaction import redact_text
     from .state import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from redaction import redact_text
     from state import PendingApproval
 
 
@@ -288,29 +289,31 @@ class CloudCLIClient:
         token = await self._get_token()
         ws_url = self._ws_url(token)
         try:
-            self._ws = await self._session.ws_connect(
+            ws = await self._session.ws_connect(
                 ws_url,
                 heartbeat=25,
             )
+            self._ws = ws
         except Exception as exc:  # noqa: BLE001
             if token and not self.config.jwt_token.strip() and self.config.username and self.config.password:
                 await self._clear_cached_token()
                 try:
                     token = await self._get_token()
-                    self._ws = await self._session.ws_connect(
+                    ws = await self._session.ws_connect(
                         self._ws_url(token),
                         heartbeat=25,
                     )
+                    self._ws = ws
                 except Exception as retry_exc:  # noqa: BLE001
                     raise CloudCLIError(
                         f"无法连接 CloudCLI WebSocket，重新登录后仍失败：{_redact_text(str(retry_exc))}"
                     ) from retry_exc
                 else:
-                    self._reader_task = asyncio.create_task(self._reader_loop())
+                    self._reader_task = asyncio.create_task(self._reader_loop(ws))
                     return
             raise CloudCLIError(f"无法连接 CloudCLI WebSocket：{_redact_text(str(exc))}") from exc
 
-        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._reader_task = asyncio.create_task(self._reader_loop(ws))
 
     async def _ensure_http_session(self) -> None:
         if self._session and self._session.closed:
@@ -480,10 +483,10 @@ class CloudCLIClient:
         async with self._send_lock:
             await self._ws.send_json(payload)
 
-    async def _reader_loop(self) -> None:
-        assert self._ws is not None
+    async def _reader_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        disconnect_error: CloudCLIError | None = None
         try:
-            async for message in self._ws:
+            async for message in ws:
                 if message.type == aiohttp.WSMsgType.TEXT:
                     try:
                         data = json.loads(message.data)
@@ -496,15 +499,21 @@ class CloudCLIClient:
                     aiohttp.WSMsgType.ERROR,
                     aiohttp.WSMsgType.CLOSE,
                 }:
+                    disconnect_error = CloudCLIError("CloudCLI WebSocket 已断开。")
                     break
+            if disconnect_error is None:
+                disconnect_error = CloudCLIError("CloudCLI WebSocket 已断开。")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            self._fail_waiters(CloudCLIError(f"CloudCLI WS 读取失败：{exc}"))
+            disconnect_error = CloudCLIError(f"CloudCLI WS 读取失败：{_redact_text(str(exc))}")
         finally:
-            if self._ws:
-                await self._ws.close()
-            self._ws = None
+            if not ws.closed:
+                await ws.close()
+            if self._ws is ws:
+                self._ws = None
+                if disconnect_error is not None:
+                    self._fail_waiters(disconnect_error)
 
     async def _handle_message(self, data: Any) -> None:
         if not isinstance(data, dict):
@@ -650,20 +659,4 @@ class CloudCLIClient:
 
 
 def _redact_text(value: str) -> str:
-    if not value:
-        return ""
-    text = value
-    patterns = [
-        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,'\"}]+",
-        r"(?i)(x-api-key\s*[:=]\s*)[^\s,'\"}]+",
-        r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,'\"}]+",
-        r"(?i)(jwt[_-]?token\s*[:=]\s*)[^\s,'\"}]+",
-        r"(?i)(token\s*[:=]\s*)[^\s,'\"}]+",
-        r"(?i)(password\s*[:=]\s*)[^\s,'\"}]+",
-        r"(?i)([?&]token=)[^&\s]+",
-    ]
-    for pattern in patterns:
-        text = re.sub(pattern, r"\1[redacted]", text)
-    if len(text) > MAX_ERROR_BODY_CHARS:
-        text = text[:MAX_ERROR_BODY_CHARS] + "...[truncated]"
-    return text
+    return redact_text(value, MAX_ERROR_BODY_CHARS)

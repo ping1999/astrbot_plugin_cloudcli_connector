@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     from .config import ConnectorSettings
@@ -74,11 +75,6 @@ class AuthorizationPolicy:
             "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 approval_allowed_user_keys。",
         )
 
-    def can_manage_approvals_by_values(self, user_key: str, is_admin: bool) -> bool:
-        if user_key in self.settings.approval_allowed_user_keys:
-            return True
-        return bool(is_admin) if self.settings.approval_require_admin else True
-
     def validate_project_path(self, user: UserRef, project_path: str) -> str:
         if not project_path:
             return ""
@@ -111,7 +107,11 @@ class AuthorizationPolicy:
 
 def _normalize_path(value: str) -> str:
     expanded = os.path.expandvars(os.path.expanduser(value))
-    return os.path.normcase(os.path.abspath(expanded))
+    try:
+        resolved = Path(expanded).resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = Path(os.path.abspath(expanded))
+    return os.path.normcase(str(resolved))
 
 
 def _is_path_within(path: str, root: str) -> bool:

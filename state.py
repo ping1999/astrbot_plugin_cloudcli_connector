@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from .redaction import redact_text
+except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from redaction import redact_text
+
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 RUN_ID_RE = re.compile(r"^[0-9]{1,12}$")
@@ -107,7 +112,6 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
-            entry["is_admin"] = bool(user.is_admin)
             origins = _read_list(entry.get("origins"))
             if user.unified_msg_origin not in origins:
                 origins.append(user.unified_msg_origin)
@@ -128,18 +132,29 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
-            entry["is_admin"] = bool(user.is_admin)
             origins = _read_list(entry.get("origins"))
             if user.unified_msg_origin not in origins:
                 origins.append(user.unified_msg_origin)
             entry["origins"] = origins[-5:]
+            binding_origins = _read_origin_map(entry.get("binding_origins"))
+            session_origins = binding_origins.get(session_id, [])
+            origin_added = False
+            if user.unified_msg_origin not in session_origins:
+                session_origins.append(user.unified_msg_origin)
+                binding_origins[session_id] = session_origins[-5:]
+                entry["binding_origins"] = binding_origins
+                origin_added = True
             bindings = _read_list(entry.get("bindings"))
             if session_id in bindings:
+                if origin_added:
+                    await self._save_locked()
+                    return False, f"已绑定 session：{session_id}，并已为当前会话启用通知。"
                 return False, f"已绑定 session：{session_id}"
             if len(bindings) >= max_bindings:
                 return False, f"绑定数量已达上限 {max_bindings}。"
             bindings.append(session_id)
             entry["bindings"] = sorted(bindings)
+            entry["binding_origins"] = binding_origins
             await self._save_locked()
             return True, f"已绑定 session：{session_id}"
 
@@ -153,6 +168,9 @@ class PluginState:
                 return False, f"未绑定 session：{session_id}"
             bindings.remove(session_id)
             entry["bindings"] = sorted(bindings)
+            binding_origins = _read_origin_map(entry.get("binding_origins"))
+            binding_origins.pop(session_id, None)
+            entry["binding_origins"] = binding_origins
             await self._save_locked()
             return True, f"已解绑 session：{session_id}"
 
@@ -161,6 +179,7 @@ class PluginState:
             entry = self._user_entry(user.user_key)
             count = len(_read_list(entry.get("bindings")))
             entry["bindings"] = []
+            entry["binding_origins"] = {}
             await self._save_locked()
             if count == 0:
                 return False, "当前没有绑定任何 session。"
@@ -271,12 +290,15 @@ class PluginState:
                 if not isinstance(entry, dict):
                     continue
                 if session_id in _read_list(entry.get("bindings")):
+                    binding_origins = _read_origin_map(entry.get("binding_origins"))
+                    origins = binding_origins.get(session_id, [])
+                    if not origins:
+                        continue
                     result.append(
                         {
                             "user_key": user_key,
                             "display_name": _read_str(entry.get("display_name")),
-                            "is_admin": bool(entry.get("is_admin")),
-                            "origins": _read_list(entry.get("origins")),
+                            "origins": origins,
                         }
                     )
             return result
@@ -541,9 +563,9 @@ class PluginState:
             user_key,
             {
                 "display_name": "",
-                "is_admin": False,
                 "origins": [],
                 "bindings": [],
+                "binding_origins": {},
                 "last_seen_at": 0,
                 "session_index": [],
                 "session_index_at": 0,
@@ -552,14 +574,25 @@ class PluginState:
         if not isinstance(entry, dict):
             entry = {
                 "display_name": "",
-                "is_admin": False,
                 "origins": [],
                 "bindings": [],
+                "binding_origins": {},
                 "last_seen_at": 0,
                 "session_index": [],
                 "session_index_at": 0,
             }
             users[user_key] = entry
+        if "binding_origins" not in entry:
+            origins = _read_list(entry.get("origins"))
+            bindings = _read_list(entry.get("bindings"))
+            if len(origins) == 1 and bindings:
+                entry["binding_origins"] = {
+                    session_id: origins[:]
+                    for session_id in bindings
+                    if is_valid_session_id(session_id)
+                }
+            else:
+                entry["binding_origins"] = {}
         return entry
 
     def _guess_next_run_id(self, runs: dict[str, Any]) -> int:
@@ -584,7 +617,9 @@ class PluginState:
             json.dumps(self._data, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        _restrict_file_permissions(tmp_path)
         os.replace(tmp_path, self.path)
+        _restrict_file_permissions(self.path)
 
 
 def is_valid_session_id(value: str) -> bool:
@@ -622,6 +657,20 @@ def _read_list(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
+def _read_origin_map(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for key, raw_origins in value.items():
+        session_id = _read_str(key)
+        if not is_valid_session_id(session_id):
+            continue
+        origins = _read_list(raw_origins)
+        if origins:
+            result[session_id] = origins[-5:]
+    return result
+
+
 def _read_dict_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -641,6 +690,7 @@ def _safe_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
         return ""
     text = value if isinstance(value, str) else str(value)
     text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")
+    text = redact_text(text, limit)
     if len(text) > limit:
         return text[: max(0, limit - 20)] + "...[truncated]"
     return text
@@ -659,7 +709,11 @@ def _safe_json_value(value: Any, depth: int = 0) -> Any:
             if index >= MAX_STORED_JSON_ITEMS:
                 result["...[truncated]"] = len(value) - MAX_STORED_JSON_ITEMS
                 break
-            result[_safe_text(key, 120)] = _safe_json_value(item, depth + 1)
+            safe_key = _safe_text(key, 120)
+            if _is_sensitive_key(safe_key):
+                result[safe_key] = "[redacted]"
+            else:
+                result[safe_key] = _safe_json_value(item, depth + 1)
         return result
     if isinstance(value, (list, tuple)):
         result = [
@@ -687,6 +741,22 @@ def _compact_json(value: Any) -> str:
         return str(value)
 
 
+def _is_sensitive_key(value: str) -> bool:
+    normalized = value.lower().replace("-", "_")
+    return normalized in {
+        "authorization",
+        "x_api_key",
+        "api_key",
+        "apikey",
+        "jwt_token",
+        "access_token",
+        "refresh_token",
+        "token",
+        "password",
+        "secret",
+    }
+
+
 def _parse_timestamp(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -698,3 +768,10 @@ def _parse_timestamp(value: Any) -> float:
         except ValueError:
             return 0
     return 0
+
+
+def _restrict_file_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
