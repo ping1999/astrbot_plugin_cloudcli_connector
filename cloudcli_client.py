@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +18,8 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 logger = logging.getLogger(__name__)
+MAX_ERROR_BODY_CHARS = 2000
+MAX_SSE_EVENT_CHARS = 1_000_000
 
 
 class CloudCLIError(RuntimeError):
@@ -212,7 +215,9 @@ class CloudCLIClient:
                             raise CloudCLIError(
                                 "CloudCLI agent API 认证失败：请在 cloudcli_api_key 填写 CloudCLI UI 生成的 API Key。"
                             )
-                        raise CloudCLIError(f"CloudCLI agent API 请求失败：HTTP {response.status} {body}")
+                        raise CloudCLIError(
+                            f"CloudCLI agent API 请求失败：HTTP {response.status} {_redact_text(body)}"
+                        )
 
                     content_type = response.headers.get("Content-Type", "")
                     if "text/event-stream" not in content_type:
@@ -228,7 +233,7 @@ class CloudCLIClient:
         except CloudCLIError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise CloudCLIError(f"CloudCLI agent 任务执行失败：{exc}") from exc
+            raise CloudCLIError(f"CloudCLI agent 任务执行失败：{_redact_text(str(exc))}") from exc
 
     async def get_pending_permissions(self, session_id: str) -> list[PendingApproval]:
         await self.ensure_connected()
@@ -298,12 +303,12 @@ class CloudCLIClient:
                     )
                 except Exception as retry_exc:  # noqa: BLE001
                     raise CloudCLIError(
-                        f"无法连接 CloudCLI WebSocket，重新登录后仍失败：{retry_exc}"
+                        f"无法连接 CloudCLI WebSocket，重新登录后仍失败：{_redact_text(str(retry_exc))}"
                     ) from retry_exc
                 else:
                     self._reader_task = asyncio.create_task(self._reader_loop())
                     return
-            raise CloudCLIError(f"无法连接 CloudCLI WebSocket：{exc}") from exc
+            raise CloudCLIError(f"无法连接 CloudCLI WebSocket：{_redact_text(str(exc))}") from exc
 
         self._reader_task = asyncio.create_task(self._reader_loop())
 
@@ -336,12 +341,22 @@ class CloudCLIClient:
                 },
                 headers=headers,
             ) as response:
-                data = await response.json(content_type=None)
+                raw_body = await response.text()
+                try:
+                    data = json.loads(raw_body) if raw_body else {}
+                except json.JSONDecodeError:
+                    data = raw_body
+                if response.status >= 400:
+                    raise CloudCLIError(
+                        f"登录 CloudCLI 失败：HTTP {response.status} {_redact_text(raw_body)}"
+                    )
         except Exception as exc:  # noqa: BLE001
-            raise CloudCLIError(f"登录 CloudCLI 失败：{exc}") from exc
+            if isinstance(exc, CloudCLIError):
+                raise
+            raise CloudCLIError(f"登录 CloudCLI 失败：{_redact_text(str(exc))}") from exc
 
         if not isinstance(data, dict) or not data.get("token"):
-            raise CloudCLIError(f"登录 CloudCLI 失败：{data}")
+            raise CloudCLIError(f"登录 CloudCLI 失败：{_redact_text(str(data))}")
         self._cached_token = str(data["token"])
         return self._cached_token
 
@@ -391,7 +406,7 @@ class CloudCLIClient:
                 return None, True
             if response.status >= 400:
                 body = await response.text()
-                raise CloudCLIError(f"CloudCLI REST 请求失败：HTTP {response.status} {body}")
+                raise CloudCLIError(f"CloudCLI REST 请求失败：HTTP {response.status} {_redact_text(body)}")
             return await response.json(content_type=None), False
 
     async def _iter_sse(self, content: Any) -> AsyncIterator[dict[str, Any]]:
@@ -400,6 +415,8 @@ class CloudCLIClient:
             if not chunk:
                 continue
             buffer += chunk.decode("utf-8", errors="replace")
+            if len(buffer) > MAX_SSE_EVENT_CHARS:
+                raise CloudCLIError("CloudCLI agent SSE 单条事件过大，已停止读取。")
             buffer = buffer.replace("\r\n", "\n")
             while "\n\n" in buffer:
                 raw_event, buffer = buffer.split("\n\n", 1)
@@ -630,3 +647,23 @@ class CloudCLIClient:
             "projectName": project_name,
             "projectPath": project_path,
         }
+
+
+def _redact_text(value: str) -> str:
+    if not value:
+        return ""
+    text = value
+    patterns = [
+        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,'\"}]+",
+        r"(?i)(x-api-key\s*[:=]\s*)[^\s,'\"}]+",
+        r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,'\"}]+",
+        r"(?i)(jwt[_-]?token\s*[:=]\s*)[^\s,'\"}]+",
+        r"(?i)(token\s*[:=]\s*)[^\s,'\"}]+",
+        r"(?i)(password\s*[:=]\s*)[^\s,'\"}]+",
+        r"(?i)([?&]token=)[^&\s]+",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, r"\1[redacted]", text)
+    if len(text) > MAX_ERROR_BODY_CHARS:
+        text = text[:MAX_ERROR_BODY_CHARS] + "...[truncated]"
+    return text

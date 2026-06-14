@@ -171,6 +171,13 @@ class PluginState:
             entry = self._user_entry(user.user_key)
             return sorted(_read_list(entry.get("bindings")))
 
+    async def has_binding(self, user: UserRef, session_id: str) -> bool:
+        if not is_valid_session_id(session_id):
+            return False
+        async with self._lock:
+            entry = self._user_entry(user.user_key)
+            return session_id in _read_list(entry.get("bindings"))
+
     async def remember_session_index(
         self,
         user: UserRef,
@@ -205,6 +212,21 @@ class PluginState:
             entry["session_index"] = normalized
             entry["session_index_at"] = time.time()
             await self._save_locked()
+
+    async def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
+        if not is_valid_session_id(session_id):
+            return None
+        async with self._lock:
+            entry = self._user_entry(user.user_key)
+            for item in _read_dict_list(entry.get("session_index")):
+                if _read_str(item.get("id")) == session_id:
+                    return {
+                        "id": session_id,
+                        "provider": _read_str(item.get("provider")),
+                        "projectName": _read_str(item.get("projectName")),
+                        "projectPath": _read_str(item.get("projectPath")),
+                    }
+        return None
 
     async def resolve_session_ref(
         self,

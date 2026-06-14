@@ -12,7 +12,9 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
 
 try:
-    from .cloudcli_client import CloudCLIClient, CloudCLIConfig, CloudCLIError
+    from .authz import AuthorizationPolicy
+    from .cloudcli_client import CloudCLIClient, CloudCLIError
+    from .config import load_connector_settings
     from .formatting import (
         HELP_TEXT,
         clip_text,
@@ -37,8 +39,11 @@ try:
         is_valid_session_id,
         resolve_data_path,
     )
+    from .runtime import RunQuota
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from cloudcli_client import CloudCLIClient, CloudCLIConfig, CloudCLIError
+    from authz import AuthorizationPolicy
+    from cloudcli_client import CloudCLIClient, CloudCLIError
+    from config import load_connector_settings
     from formatting import (
         HELP_TEXT,
         clip_text,
@@ -63,11 +68,11 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         is_valid_session_id,
         resolve_data_path,
     )
+    from runtime import RunQuota
 
 
 PLUGIN_NAME = "astrbot_plugin_cloudcli_connector"
 MAX_DENY_REASON_LEN = 500
-MAX_RUN_MESSAGE_LEN = 4000
 RUN_PROVIDERS = {"claude", "cursor", "codex", "gemini"}
 SESSION_PROVIDERS = RUN_PROVIDERS | {"opencode"}
 
@@ -95,12 +100,18 @@ class CloudCLIConnectorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or {}
+        self.settings = load_connector_settings(self.config)
+        self.authz = AuthorizationPolicy(self.settings)
         self.state = PluginState(
             resolve_data_path(__file__, PLUGIN_NAME) / "state.json"
         )
         self.client = CloudCLIClient(
-            self._read_cloudcli_config(),
+            self.settings.cloudcli,
             on_permission_request=self._on_permission_request,
+        )
+        self.run_quota = RunQuota(
+            self.settings.max_active_runs_per_user,
+            self.settings.max_active_runs_global,
         )
         self._background_tasks: set[asyncio.Task] = set()
         self._run_tasks_by_id: dict[str, asyncio.Task] = {}
@@ -108,7 +119,7 @@ class CloudCLIConnectorPlugin(Star):
 
     async def initialize(self) -> None:
         await self.state.load()
-        if _read_bool(self.config.get("auto_connect"), True):
+        if self.settings.auto_connect:
             task = asyncio.create_task(self._warm_connect())
             self._track_task(task)
 
@@ -194,6 +205,9 @@ class CloudCLIConnectorPlugin(Star):
             return f"检查 CloudCLI 状态失败：{exc}"
 
     async def _handle_session(self, user: UserRef) -> str:
+        decision = self.authz.can_access_sessions(user)
+        if not decision.allowed:
+            return decision.message
         active_payload: dict[str, Any] | None = None
         active_error = ""
         recent_sessions: list[dict[str, Any]] = []
@@ -205,7 +219,7 @@ class CloudCLIConnectorPlugin(Star):
 
         try:
             recent_sessions = await self.client.get_recent_sessions(
-                _read_limited_int(self.config.get("recent_sessions_limit"), 20, 1, 100)
+                self.settings.recent_sessions_limit
             )
             await self.state.remember_session_index(
                 user,
@@ -231,6 +245,9 @@ class CloudCLIConnectorPlugin(Star):
         return body
 
     async def _handle_bind(self, user: UserRef, args: list[str]) -> str:
+        decision = self.authz.can_access_sessions(user)
+        if not decision.allowed:
+            return decision.message
         if not args:
             return "用法：/cloudcli bind <sessionId|序号|last> 或 /cloudcli bind list"
         if args[0] == "list":
@@ -239,13 +256,15 @@ class CloudCLIConnectorPlugin(Star):
             return format_bindings(await self.state.list_bindings(user))
         if len(args) != 1:
             return "用法：/cloudcli bind <sessionId|序号|last>"
+        direct_error = await self._direct_bind_error(user, args[0])
+        if direct_error:
+            return direct_error
         resolved, error = await self._resolve_session_ref(user, args[0])
         if error:
             return error
         assert resolved is not None
         session_id = resolved["id"]
-        max_bindings = _read_limited_int(self.config.get("max_bindings_per_user"), 20, 1, 100)
-        _, message = await self.state.bind_session(user, session_id, max_bindings)
+        _, message = await self.state.bind_session(user, session_id, self.settings.max_bindings_per_user)
         return message
 
     async def _handle_unbind(self, user: UserRef, args: list[str]) -> str:
@@ -262,7 +281,10 @@ class CloudCLIConnectorPlugin(Star):
         return message
 
     async def _handle_chat(self, user: UserRef, args: list[str]) -> str:
-        default_limit = _read_limited_int(self.config.get("chat_messages_limit"), 12, 1, 50)
+        decision = self.authz.can_access_sessions(user)
+        if not decision.allowed:
+            return decision.message
+        default_limit = self.settings.chat_messages_limit
         session_id = ""
         limit = default_limit
 
@@ -281,6 +303,9 @@ class CloudCLIConnectorPlugin(Star):
             session_id = args[0].strip()
             if not is_valid_session_id(session_id):
                 return "sessionId 格式不合法。"
+            session_error = await self._session_usage_error(user, session_id)
+            if session_error:
+                return session_error
             if len(args) == 2:
                 limit, error = _parse_positive_int(args[1], "limit", 1, 50)
                 if error:
@@ -303,12 +328,22 @@ class CloudCLIConnectorPlugin(Star):
         if args and args[0] in {"list", "log", "cancel"}:
             return await self._handle_run_control(user, args)
 
+        decision = self.authz.can_run_agent(user)
+        if not decision.allowed:
+            return decision.message
         parsed, error = await self._parse_run_args(user, args)
         if error:
             return error
         assert parsed is not None
 
-        run_id = await self.state.create_run_task(user, parsed.payload, parsed.display_target)
+        quota_error = self.run_quota.try_acquire(user.user_key)
+        if quota_error:
+            return quota_error
+        try:
+            run_id = await self.state.create_run_task(user, parsed.payload, parsed.display_target)
+        except Exception:
+            self.run_quota.release(user.user_key)
+            raise
         task = asyncio.create_task(
             self._run_agent_background(
                 run_id,
@@ -317,7 +352,9 @@ class CloudCLIConnectorPlugin(Star):
             )
         )
         self._run_tasks_by_id[run_id] = task
-        task.add_done_callback(lambda _task, task_id=run_id: self._run_tasks_by_id.pop(task_id, None))
+        task.add_done_callback(
+            lambda _task, task_id=run_id, user_key=user.user_key: self._on_run_task_done(task_id, user_key)
+        )
         self._track_task(task)
         return format_agent_start_message(parsed.payload, run_id)
 
@@ -326,7 +363,7 @@ class CloudCLIConnectorPlugin(Star):
         if subcommand == "list":
             if len(args) > 2:
                 return "用法：/cloudcli run list [数量]"
-            limit = _read_limited_int(self.config.get("run_list_limit"), 10, 1, 50)
+            limit = self.settings.run_list_limit
             if len(args) == 2:
                 limit, error = _parse_positive_int(args[1], "数量", 1, 50)
                 if error:
@@ -386,7 +423,7 @@ class CloudCLIConnectorPlugin(Star):
         sync_error = await self._refresh_pending_for_bindings(bindings)
         approvals = await self.state.visible_pending_for_user(
             user,
-            _read_limited_int(self.config.get("max_pending_display"), 30, 1, 100),
+            self.settings.max_pending_display,
         )
         body = format_pending(
             approvals,
@@ -397,8 +434,14 @@ class CloudCLIConnectorPlugin(Star):
         return body
 
     async def _handle_stop(self, user: UserRef, args: list[str]) -> str:
+        decision = self.authz.can_access_sessions(user)
+        if not decision.allowed:
+            return decision.message
         if len(args) not in {1, 2}:
             return "用法：/cloudcli stop <sessionId|序号|last> [provider]"
+        direct_error = await self._direct_session_ref_error(user, args[0])
+        if direct_error:
+            return direct_error
         resolved, error = await self._resolve_session_ref(user, args[0])
         if error:
             return error
@@ -522,7 +565,7 @@ class CloudCLIConnectorPlugin(Star):
         return await self.state.resolve_visible_request(
             user,
             request_no,
-            _read_limited_int(self.config.get("max_pending_display"), 30, 1, 100),
+            self.settings.max_pending_display,
         )
 
     async def _infer_single_bound_session(self, user: UserRef) -> tuple[str, str | None]:
@@ -547,24 +590,41 @@ class CloudCLIConnectorPlugin(Star):
                 resolved["projectName"] = str(recent.get("projectName") or "")
         return resolved, None
 
-    def _approval_permission_error(self, user: UserRef) -> str:
-        if self._can_manage_approvals(user.user_key, user.is_admin):
+    async def _direct_bind_error(self, user: UserRef, ref: str) -> str:
+        if _is_index_session_ref(ref):
             return ""
-        return (
-            "当前用户没有权限审批 CloudCLI 权限请求。\n"
-            f"当前用户标识：{user.user_key}\n"
-            "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 approval_allowed_user_keys。"
-        )
+        if not is_valid_session_id(ref.strip()):
+            return ""
+        indexed = await self.state.find_session_index_item(user, ref.strip())
+        if indexed:
+            return ""
+        decision = self.authz.can_use_direct_session_id(user)
+        return "" if decision.allowed else decision.message
+
+    async def _direct_session_ref_error(self, user: UserRef, ref: str) -> str:
+        if _is_index_session_ref(ref):
+            return ""
+        if not is_valid_session_id(ref.strip()):
+            return ""
+        return await self._session_usage_error(user, ref.strip())
+
+    async def _session_usage_error(self, user: UserRef, session_id: str) -> str:
+        if await self.state.has_binding(user, session_id):
+            return ""
+        if await self.state.find_session_index_item(user, session_id):
+            return ""
+        decision = self.authz.can_use_direct_session_id(user)
+        return "" if decision.allowed else decision.message
+
+    def _approval_permission_error(self, user: UserRef) -> str:
+        decision = self.authz.can_manage_approvals(user)
+        return "" if decision.allowed else decision.message
 
     def _can_manage_approvals(self, user_key: str, is_admin: bool) -> bool:
-        allowed = set(_read_str_list(self.config.get("approval_allowed_user_keys")))
-        if user_key in allowed:
-            return True
-        require_admin = _read_bool(self.config.get("approval_require_admin"), True)
-        return bool(is_admin) if require_admin else True
+        return self.authz.can_manage_approvals_by_values(user_key, is_admin)
 
     def _schedule_approval_timeout(self, approval: PendingApproval) -> None:
-        timeout_seconds = _read_nonnegative_limited_int(self.config.get("approval_timeout_seconds"), 300, 86400)
+        timeout_seconds = self.settings.approval_timeout_seconds
         if timeout_seconds <= 0:
             return
         existing = self._approval_timeout_tasks.get(approval.request_id)
@@ -588,7 +648,7 @@ class CloudCLIConnectorPlugin(Star):
             approval = await self.state.get_pending(request_id)
             if approval is None:
                 return
-            action = _read_str(self.config.get("approval_timeout_action"), "remind").lower()
+            action = self.settings.approval_timeout_action
             targets = self._filter_approval_targets(
                 await self.state.users_bound_to_session(approval.session_id)
             )
@@ -701,16 +761,15 @@ class CloudCLIConnectorPlugin(Star):
         message = " ".join(message_parts).strip()
         if not message:
             return None, "任务内容不能为空。\n" + self._run_usage()
-        max_message_len = _read_limited_int(
-            self.config.get("max_run_message_length"),
-            MAX_RUN_MESSAGE_LEN,
-            1,
-            20000,
-        )
+        max_message_len = self.settings.max_run_message_length
         if len(message) > max_message_len:
             return None, f"任务内容太长，请控制在 {max_message_len} 字以内。"
 
         session_ref = str(options.get("sessionId") or "")
+        if session_ref:
+            session_decision = self.authz.can_access_sessions(user)
+            if not session_decision.allowed:
+                return None, session_decision.message
         if session_ref.lower() in {"last", "latest"} or session_ref.isdigit():
             resolved, error = await self._resolve_session_ref(user, session_ref)
             if error:
@@ -719,6 +778,10 @@ class CloudCLIConnectorPlugin(Star):
             options["sessionId"] = resolved["id"]
             if not options.get("provider") and resolved.get("provider") in RUN_PROVIDERS:
                 options["provider"] = resolved["provider"]
+        elif session_ref and is_valid_session_id(session_ref):
+            session_error = await self._session_usage_error(user, session_ref)
+            if session_error:
+                return None, session_error
 
         error = self._validate_run_options(options)
         if error:
@@ -727,6 +790,9 @@ class CloudCLIConnectorPlugin(Star):
         error = await self._complete_run_target(user, options)
         if error:
             return None, error
+        project_error = self.authz.validate_project_path(user, str(options.get("projectPath") or ""))
+        if project_error:
+            return None, project_error
 
         payload: dict[str, Any] = {
             "message": message,
@@ -794,7 +860,7 @@ class CloudCLIConnectorPlugin(Star):
             return "model 格式不合法或过长。"
 
         branch_name = str(options.get("branchName") or "")
-        if branch_name and (len(branch_name) > 120 or _has_control_chars(branch_name)):
+        if branch_name and not _is_safe_git_branch_name(branch_name):
             return "branch 名称不合法或过长。"
 
         target_count = sum(1 for key in ("projectPath", "githubUrl") if options.get(key))
@@ -805,6 +871,12 @@ class CloudCLIConnectorPlugin(Star):
     async def _complete_run_target(self, user: UserRef, options: dict[str, Any]) -> str | None:
         session_id = str(options.get("sessionId") or "")
         if not session_id and not options.get("projectPath") and not options.get("githubUrl"):
+            session_decision = self.authz.can_access_sessions(user)
+            if not session_decision.allowed:
+                return (
+                    "请通过 --project <path> 或 --github <url> 指定任务目标；"
+                    + session_decision.message
+                )
             session_id, error = await self._infer_single_bound_session(user)
             if error:
                 return (
@@ -873,9 +945,9 @@ class CloudCLIConnectorPlugin(Star):
 
     async def _run_agent_background(self, run_id: str, unified_msg_origin: str, payload: dict[str, Any]) -> None:
         text_limit = self._max_push_text_length()
-        status_interval = _read_limited_int(self.config.get("run_status_interval_seconds"), 20, 1, 3600)
-        max_status_pushes = _read_nonnegative_limited_int(self.config.get("max_run_status_pushes"), 10, 50)
-        max_duration = _read_nonnegative_limited_int(self.config.get("agent_max_duration_seconds"), 7200, 86400)
+        status_interval = self.settings.run_status_interval_seconds
+        max_status_pushes = self.settings.max_run_status_pushes
+        max_duration = self.settings.agent_max_duration_seconds
         summary_text_limit = max(4000, min(24000, text_limit * 4))
         summary: dict[str, Any] = {
             "sessionId": payload.get("sessionId"),
@@ -1079,25 +1151,12 @@ class CloudCLIConnectorPlugin(Star):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    def _max_push_text_length(self) -> int:
-        return _read_limited_int(self.config.get("max_push_text_length"), 1800, 200, 8000)
+    def _on_run_task_done(self, run_id: str, user_key: str) -> None:
+        self._run_tasks_by_id.pop(run_id, None)
+        self.run_quota.release(user_key)
 
-    def _read_cloudcli_config(self) -> CloudCLIConfig:
-        return CloudCLIConfig(
-            base_url=_read_str(self.config.get("cloudcli_base_url"), "http://127.0.0.1:3001"),
-            jwt_token=_read_str(self.config.get("cloudcli_jwt_token"), ""),
-            username=_read_str(self.config.get("cloudcli_username"), ""),
-            password=_read_str(self.config.get("cloudcli_password"), ""),
-            api_key=_read_str(self.config.get("cloudcli_api_key"), ""),
-            allow_unauthenticated_ws=_read_bool(self.config.get("allow_unauthenticated_ws"), False),
-            timeout_seconds=_read_limited_int(self.config.get("request_timeout_seconds"), 8, 2, 120),
-            agent_idle_timeout_seconds=_read_limited_int(
-                self.config.get("agent_idle_timeout_seconds"),
-                120,
-                10,
-                3600,
-            ),
-        )
+    def _max_push_text_length(self) -> int:
+        return self.settings.max_push_text_length
 
     def _user_ref(self, event: AstrMessageEvent) -> UserRef:
         platform_id = event.get_platform_id() or "unknown-platform"
@@ -1141,62 +1200,6 @@ class CloudCLIConnectorPlugin(Star):
         return value, None
 
 
-def _read_str(value: Any, default: str) -> str:
-    return value.strip() if isinstance(value, str) and value.strip() else default
-
-
-def _read_int(value: Any, default: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed > 0 else default
-
-
-def _read_nonnegative_int(value: Any, default: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= 0 else default
-
-
-def _read_limited_int(value: Any, default: int, minimum: int, maximum: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    if parsed < minimum:
-        return minimum
-    if parsed > maximum:
-        return maximum
-    return parsed
-
-
-def _read_nonnegative_limited_int(value: Any, default: int, maximum: int) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    if parsed < 0:
-        return 0
-    if parsed > maximum:
-        return maximum
-    return parsed
-
-
-def _read_bool(value: Any, default: bool) -> bool:
-    return value if isinstance(value, bool) else default
-
-
-def _read_str_list(value: Any) -> list[str]:
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return []
-
-
 def _parse_positive_int(
     value: str,
     name: str,
@@ -1216,6 +1219,11 @@ def _has_control_chars(value: str) -> bool:
     return any(ord(char) < 32 or ord(char) == 127 for char in value)
 
 
+def _is_index_session_ref(value: str) -> bool:
+    ref = value.strip().lower()
+    return ref in {"last", "latest"} or ref.isdigit()
+
+
 def _looks_like_github_url(value: str) -> bool:
     if _has_control_chars(value) or len(value) > 500:
         return False
@@ -1229,6 +1237,27 @@ def _is_safe_short_value(value: str, max_len: int) -> bool:
     if not value or len(value) > max_len or _has_control_chars(value):
         return False
     return not any(char.isspace() for char in value)
+
+
+def _is_safe_git_branch_name(value: str) -> bool:
+    if not _is_safe_short_value(value, 120):
+        return False
+    forbidden_chars = set("~^:?*[\\")
+    if any(char in forbidden_chars for char in value):
+        return False
+    if (
+        value.startswith("-")
+        or value.startswith("/")
+        or value.endswith("/")
+        or value.endswith(".")
+        or value.endswith(".lock")
+        or ".." in value
+        or "//" in value
+        or "@{" in value
+        or value == "@"
+    ):
+        return False
+    return True
 
 
 def _strip_wrapping_quotes(value: str) -> str:

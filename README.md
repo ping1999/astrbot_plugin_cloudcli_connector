@@ -56,6 +56,10 @@
 - `/cloudcli run` 使用 CloudCLI 的外部 agent API，需要在 `cloudcli_api_key` 填写 CloudCLI UI 中 Settings → API & Tokens 生成的 API Key。
 - 如果 CloudCLI 启动时设置了全局 `API_KEY`，受保护接口也需要配置 `cloudcli_api_key`。
 - 用户只会收到自己已绑定 session 的主动审批推送。
+- 默认只有 AstrBot 管理员或 `session_allowed_user_keys` 白名单用户可以查看、绑定、读取和中止 CloudCLI session。
+- 默认只有 AstrBot 管理员或 `run_allowed_user_keys` 白名单用户可以使用 `/cloudcli run` 发起 agent 任务。
+- 非管理员使用 `/cloudcli run --project` 时建议配置 `allowed_project_roots`，否则默认会拒绝访问本地任意目录。
+- 非管理员默认不能直接手填未绑定的 sessionId；请先执行 `/cloudcli session` 后使用序号，或由管理员开启 `allow_direct_session_id`。
 - 默认只有 AstrBot 管理员或 `approval_allowed_user_keys` 白名单用户可以查看、接收和处理审批请求。
 - `/cloudcli pending` 会按 CloudCLI 当前返回结果刷新本地待审批缓存，已不存在的审批会从本地清理。
 - 审批超时默认只提醒，不会自动允许。只有把 `approval_timeout_action` 设置为 `deny` 时才会自动拒绝。
@@ -68,9 +72,17 @@
 - `cloudcli_jwt_token`：如果已有当前 UI 的 JWT token，可以直接粘贴到这里
 - `cloudcli_username` / `cloudcli_password`：用于替代手动填写 JWT token，插件会自动登录获取 token
 - `cloudcli_api_key`：用于 `/api/agent`；在 CloudCLI UI 的 Settings → API & Tokens 中生成
+- `session_allowed_user_keys`：session 命令白名单，多个用户标识用英文逗号分隔
+- `session_require_admin`：开启后要求 session 命令用户是 AstrBot 管理员，白名单用户除外
+- `allow_direct_session_id`：是否允许非管理员直接使用未绑定、未出现在当前 session 序号缓存中的 sessionId
 - `recent_sessions_limit`：`/cloudcli session` 展示的最近会话数量
 - `chat_messages_limit`：`/cloudcli chat` 默认展示的最近消息数量
 - `max_run_message_length`：`/cloudcli run` 接受的任务文本长度上限
+- `run_allowed_user_keys`：`/cloudcli run` 白名单，多个用户标识用英文逗号分隔
+- `run_require_admin`：开启后要求 `/cloudcli run` 用户是 AstrBot 管理员，白名单用户除外
+- `allowed_project_roots`：允许 `/cloudcli run --project` 访问的本地根目录，多个目录用英文逗号分隔
+- `allow_unrestricted_project_paths`：是否允许非管理员在未配置 `allowed_project_roots` 时访问任意本地路径
+- `max_active_runs_per_user` / `max_active_runs_global`：限制并发 `/cloudcli run` 任务数量，`0` 表示不限制
 - `agent_idle_timeout_seconds`：`/cloudcli run` 流式响应空闲超时
 - `agent_max_duration_seconds`：单个 `/cloudcli run` 最大等待时间，`0` 表示关闭
 - `run_list_limit`：`/cloudcli run list` 默认展示的任务数量

@@ -62,6 +62,24 @@
     "type": "int",
     "default": 20
   },
+  "session_allowed_user_keys": {
+    "description": "Comma-separated AstrBot user keys allowed to access sessions",
+    "type": "string",
+    "default": "",
+    "hint": "Users in this list can list, bind, read, and stop CloudCLI sessions even if they are not AstrBot admins."
+  },
+  "session_require_admin": {
+    "description": "Require AstrBot admin for session commands",
+    "type": "bool",
+    "default": true,
+    "hint": "When enabled, only AstrBot admins or session_allowed_user_keys can list, bind, read, or stop sessions."
+  },
+  "allow_direct_session_id": {
+    "description": "Allow direct raw sessionId usage",
+    "type": "bool",
+    "default": false,
+    "hint": "When disabled, non-admin users must use bound sessions or IDs from their latest /cloudcli session index."
+  },
   "recent_sessions_limit": {
     "description": "Max recent sessions shown by /cloudcli session",
     "type": "int",
@@ -76,6 +94,40 @@
     "description": "Max task length accepted by /cloudcli run",
     "type": "int",
     "default": 4000
+  },
+  "run_allowed_user_keys": {
+    "description": "Comma-separated AstrBot user keys allowed to run CloudCLI agent tasks",
+    "type": "string",
+    "default": "",
+    "hint": "Users in this list can use /cloudcli run even if they are not AstrBot admins."
+  },
+  "run_require_admin": {
+    "description": "Require AstrBot admin for /cloudcli run",
+    "type": "bool",
+    "default": true,
+    "hint": "When enabled, only AstrBot admins or run_allowed_user_keys can start CloudCLI agent tasks."
+  },
+  "allowed_project_roots": {
+    "description": "Comma-separated local project roots allowed for /cloudcli run --project",
+    "type": "string",
+    "default": "",
+    "hint": "Recommended for any non-admin run access. Paths outside these roots are rejected."
+  },
+  "allow_unrestricted_project_paths": {
+    "description": "Allow unrestricted /cloudcli run --project paths",
+    "type": "bool",
+    "default": false,
+    "hint": "Only enable in fully trusted chats. Admin users are allowed even when this is false."
+  },
+  "max_active_runs_per_user": {
+    "description": "Max concurrent /cloudcli run tasks per user",
+    "type": "int",
+    "default": 1
+  },
+  "max_active_runs_global": {
+    "description": "Max concurrent /cloudcli run tasks globally",
+    "type": "int",
+    "default": 3
   },
   "run_status_interval_seconds": {
     "description": "Minimum seconds between background run status pushes",

@@ -54,6 +54,10 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - `/cloudcli run` uses CloudCLI's external agent API, so `cloudcli_api_key` must contain an API key generated in CloudCLI Settings → API & Tokens.
 - If CloudCLI is started with a global `API_KEY`, protected endpoints also need `cloudcli_api_key`.
 - Users only receive push notifications for sessions they have bound.
+- By default, only AstrBot admins or users in `session_allowed_user_keys` can list, bind, read, or stop CloudCLI sessions.
+- By default, only AstrBot admins or users in `run_allowed_user_keys` can start `/cloudcli run` agent tasks.
+- For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
+- Non-admin users cannot directly type an unbound raw sessionId by default. They should use an index from `/cloudcli session`, or an admin can enable `allow_direct_session_id`.
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
 - `/cloudcli pending` refreshes the local pending approval cache from CloudCLI and removes approvals that no longer exist upstream.
 - Approval timeout defaults to reminders only. Automatic denial happens only when `approval_timeout_action` is set to `deny`.
@@ -66,9 +70,17 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `cloudcli_jwt_token`: paste a current UI JWT token if you already have one
 - `cloudcli_username` / `cloudcli_password`: alternative to a pasted JWT token
 - `cloudcli_api_key`: used for `/api/agent`; generate it in CloudCLI Settings → API & Tokens
+- `session_allowed_user_keys`: comma-separated allowlist for session commands
+- `session_require_admin`: require AstrBot admin for session commands, except allowlisted users
+- `allow_direct_session_id`: allow non-admin users to use raw session IDs that are not bound and not in their current session index
 - `recent_sessions_limit`: number of recent sessions shown by `/cloudcli session`
 - `chat_messages_limit`: default recent message count shown by `/cloudcli chat`
 - `max_run_message_length`: maximum task text length accepted by `/cloudcli run`
+- `run_allowed_user_keys`: comma-separated allowlist for `/cloudcli run`
+- `run_require_admin`: require AstrBot admin for `/cloudcli run`, except allowlisted users
+- `allowed_project_roots`: comma-separated local roots allowed for `/cloudcli run --project`
+- `allow_unrestricted_project_paths`: allow non-admin users to use arbitrary local paths when `allowed_project_roots` is empty
+- `max_active_runs_per_user` / `max_active_runs_global`: concurrent `/cloudcli run` limits; `0` disables a limit
 - `agent_idle_timeout_seconds`: idle timeout for the `/cloudcli run` streaming response
 - `agent_max_duration_seconds`: maximum wait time for one `/cloudcli run`; `0` disables this guard
 - `run_list_limit`: default task count shown by `/cloudcli run list`
