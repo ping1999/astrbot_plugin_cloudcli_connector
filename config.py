@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     from .cloudcli_client import CloudCLIConfig
@@ -42,7 +43,7 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
     get = config.get if hasattr(config, "get") else lambda _key, default=None: default
     return ConnectorSettings(
         cloudcli=CloudCLIConfig(
-            base_url=_read_str(get("cloudcli_base_url"), "http://127.0.0.1:3001"),
+            base_url=_read_base_url(get("cloudcli_base_url")),
             jwt_token=_read_str(get("cloudcli_jwt_token"), ""),
             username=_read_str(get("cloudcli_username"), ""),
             password=_read_str(get("cloudcli_password"), ""),
@@ -89,6 +90,19 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
 
 def _read_str(value: Any, default: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _read_base_url(value: Any) -> str:
+    raw = _read_str(value, "http://127.0.0.1:3001")
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return "http://127.0.0.1:3001"
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "http://127.0.0.1:3001"
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        return "http://127.0.0.1:3001"
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
 
 
 def _read_bool(value: Any, default: bool) -> bool:

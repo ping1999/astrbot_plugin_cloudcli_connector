@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import re
+from urllib.parse import urlsplit
+
+
+_GITHUB_REPO_PATH_RE = re.compile(r"^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$")
+_GITHUB_SSH_RE = re.compile(r"^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$")
+
 
 def has_control_chars(value: str) -> bool:
     return any(ord(char) < 32 or ord(char) == 127 for char in value)
@@ -13,10 +20,19 @@ def is_index_session_ref(value: str) -> bool:
 def looks_like_github_url(value: str) -> bool:
     if has_control_chars(value) or len(value) > 500:
         return False
-    return (
-        value.startswith("https://github.com/")
-        or value.startswith("git@github.com:")
-    )
+    if any(char.isspace() for char in value):
+        return False
+    if _GITHUB_SSH_RE.fullmatch(value):
+        return True
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
+        return False
+    if parsed.query or parsed.fragment:
+        return False
+    return bool(_GITHUB_REPO_PATH_RE.fullmatch(parsed.path))
 
 
 def is_safe_short_value(value: str, max_len: int) -> bool:
@@ -43,4 +59,7 @@ def is_safe_git_branch_name(value: str) -> bool:
         or value == "@"
     ):
         return False
+    for component in value.split("/"):
+        if not component or component.startswith(".") or component.endswith(".lock"):
+            return False
     return True

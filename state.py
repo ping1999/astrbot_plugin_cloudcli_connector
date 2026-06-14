@@ -32,6 +32,7 @@ class UserRef:
     display_name: str
     unified_msg_origin: str
     is_admin: bool = False
+    identity_verified: bool = True
 
 
 @dataclass

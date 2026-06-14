@@ -6,21 +6,31 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote
 
 import aiohttp
 
 try:
-    from .redaction import redact_text
+    from .cloudcli_protocol import (
+        build_api_url,
+        build_auth_headers,
+        build_ws_url,
+        iter_sse,
+        redact_error_text,
+    )
     from .state import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from redaction import redact_text
+    from cloudcli_protocol import (
+        build_api_url,
+        build_auth_headers,
+        build_ws_url,
+        iter_sse,
+        redact_error_text,
+    )
     from state import PendingApproval
 
 
 logger = logging.getLogger(__name__)
-MAX_ERROR_BODY_CHARS = 2000
-MAX_SSE_EVENT_CHARS = 1_000_000
 
 
 class CloudCLIError(RuntimeError):
@@ -107,12 +117,13 @@ class CloudCLIClient:
             token = await self._get_token()
             if token:
                 result["auth"] = {"ok": True, "message": "JWT 已可用。"}
-            elif self.config.allow_unauthenticated_ws:
-                result["auth"] = {"ok": True, "message": "已启用未认证 WebSocket。"}
             else:
                 result["auth"] = {"ok": True, "message": "未返回 token，但配置允许继续尝试。"}
         except CloudCLIError as exc:
-            result["auth"] = {"ok": False, "message": str(exc)}
+            if self.config.allow_unauthenticated_ws:
+                result["auth"] = {"ok": True, "message": f"REST 未认证；WebSocket 允许匿名连接：{exc}"}
+            else:
+                result["auth"] = {"ok": False, "message": str(exc)}
         except Exception as exc:  # noqa: BLE001
             result["auth"] = {"ok": False, "message": f"认证检查失败：{exc}"}
 
@@ -143,7 +154,7 @@ class CloudCLIClient:
 
     async def get_recent_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
         await self._ensure_http_session()
-        token = await self._get_token()
+        token = await self._get_token(allow_anonymous=self.config.allow_unauthenticated_ws)
         headers = self._auth_headers(token)
         params = {
             "skipSynchronization": "false",
@@ -229,7 +240,7 @@ class CloudCLIClient:
                             yield {"type": "response", "data": {"raw": data}}
                         return
 
-                    async for item in self._iter_sse(response.content):
+                    async for item in iter_sse(response.content):
                         yield item
         except CloudCLIError:
             raise
@@ -322,12 +333,12 @@ class CloudCLIClient:
             timeout = aiohttp.ClientTimeout(total=max(3, self.config.timeout_seconds))
             self._session = aiohttp.ClientSession(timeout=timeout)
 
-    async def _get_token(self) -> str:
+    async def _get_token(self, *, allow_anonymous: bool = False) -> str:
         if self._cached_token:
             return self._cached_token
-        if self.config.allow_unauthenticated_ws:
-            return ""
         if not self.config.username or not self.config.password:
+            if allow_anonymous:
+                return ""
             raise CloudCLIError("未配置 CloudCLI JWT token，也没有配置用户名/密码。")
         if self._session is None:
             raise CloudCLIError("CloudCLI HTTP session 未初始化。")
@@ -368,12 +379,7 @@ class CloudCLIClient:
             self._cached_token = ""
 
     def _auth_headers(self, token: str) -> dict[str, str]:
-        headers: dict[str, str] = {}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        if self.config.api_key:
-            headers["X-API-Key"] = self.config.api_key
-        return headers
+        return build_auth_headers(token, self.config.api_key)
 
     async def _get_json_with_auth_retry(
         self,
@@ -411,48 +417,6 @@ class CloudCLIClient:
                 body = await response.text()
                 raise CloudCLIError(f"CloudCLI REST 请求失败：HTTP {response.status} {_redact_text(body)}")
             return await response.json(content_type=None), False
-
-    async def _iter_sse(self, content: Any) -> AsyncIterator[dict[str, Any]]:
-        buffer = ""
-        async for chunk in content.iter_any():
-            if not chunk:
-                continue
-            buffer += chunk.decode("utf-8", errors="replace")
-            if len(buffer) > MAX_SSE_EVENT_CHARS:
-                raise CloudCLIError("CloudCLI agent SSE 单条事件过大，已停止读取。")
-            buffer = buffer.replace("\r\n", "\n")
-            while "\n\n" in buffer:
-                raw_event, buffer = buffer.split("\n\n", 1)
-                item = self._parse_sse_event(raw_event)
-                if item is not None:
-                    yield item
-        if buffer.strip():
-            item = self._parse_sse_event(buffer)
-            if item is not None:
-                yield item
-
-    def _parse_sse_event(self, raw_event: str) -> dict[str, Any] | None:
-        data_lines: list[str] = []
-        event_name = ""
-        for line in raw_event.replace("\r\n", "\n").split("\n"):
-            if line.startswith("event:"):
-                event_name = line.removeprefix("event:").strip()
-            elif line.startswith("data:"):
-                data_lines.append(line.removeprefix("data:").strip())
-        if not data_lines:
-            return None
-        raw_data = "\n".join(data_lines).strip()
-        if not raw_data:
-            return None
-        try:
-            parsed = json.loads(raw_data)
-        except json.JSONDecodeError:
-            parsed = {"content": raw_data}
-        if isinstance(parsed, dict):
-            if event_name and "event" not in parsed:
-                parsed["event"] = event_name
-            return parsed
-        return {"type": event_name or "message", "data": parsed}
 
     async def _request(
         self,
@@ -559,18 +523,10 @@ class CloudCLIClient:
         self._waiters = []
 
     def _api_url(self, path: str) -> str:
-        base = self.config.base_url.rstrip("/")
-        return f"{base}{path}"
+        return build_api_url(self.config.base_url, path)
 
     def _ws_url(self, token: str) -> str:
-        raw = self.config.base_url.rstrip("/")
-        split = urlsplit(raw)
-        scheme = "wss" if split.scheme == "https" else "ws"
-        path = f"{split.path.rstrip('/')}/ws"
-        query = ""
-        if token:
-            query = urlencode({"token": token})
-        return urlunsplit((scheme, split.netloc, path, query, ""))
+        return build_ws_url(self.config.base_url, token)
 
     def _extract_recent_sessions(self, data: Any, limit: int) -> list[dict[str, Any]]:
         if isinstance(data, dict):
@@ -659,4 +615,4 @@ class CloudCLIClient:
 
 
 def _redact_text(value: str) -> str:
-    return redact_text(value, MAX_ERROR_BODY_CHARS)
+    return redact_error_text(value)

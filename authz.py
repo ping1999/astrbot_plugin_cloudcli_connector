@@ -6,9 +6,11 @@ from pathlib import Path
 
 try:
     from .config import ConnectorSettings
+    from .identity import missing_identity_message
     from .state import UserRef
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from config import ConnectorSettings
+    from identity import missing_identity_message
     from state import UserRef
 
 
@@ -23,6 +25,9 @@ class AuthorizationPolicy:
         self.settings = settings
 
     def can_access_sessions(self, user: UserRef) -> Decision:
+        identity_error = self._identity_error(user)
+        if identity_error:
+            return Decision(False, identity_error)
         if self._is_allowed(
             user,
             allowed_keys=self.settings.session_allowed_user_keys,
@@ -37,6 +42,9 @@ class AuthorizationPolicy:
         )
 
     def can_use_direct_session_id(self, user: UserRef) -> Decision:
+        identity_error = self._identity_error(user)
+        if identity_error:
+            return Decision(False, identity_error)
         if user.is_admin:
             return Decision(True)
         if self.settings.allow_direct_session_id and self.can_access_sessions(user).allowed:
@@ -48,6 +56,9 @@ class AuthorizationPolicy:
         )
 
     def can_run_agent(self, user: UserRef) -> Decision:
+        identity_error = self._identity_error(user)
+        if identity_error:
+            return Decision(False, identity_error)
         if self._is_allowed(
             user,
             allowed_keys=self.settings.run_allowed_user_keys,
@@ -62,6 +73,9 @@ class AuthorizationPolicy:
         )
 
     def can_manage_approvals(self, user: UserRef) -> Decision:
+        identity_error = self._identity_error(user)
+        if identity_error:
+            return Decision(False, identity_error)
         if self._is_allowed(
             user,
             allowed_keys=self.settings.approval_allowed_user_keys,
@@ -103,6 +117,11 @@ class AuthorizationPolicy:
         if user.user_key in allowed_keys:
             return True
         return bool(user.is_admin) if require_admin else True
+
+    def _identity_error(self, user: UserRef) -> str:
+        if getattr(user, "identity_verified", True):
+            return ""
+        return missing_identity_message(user)
 
 
 def _normalize_path(value: str) -> str:

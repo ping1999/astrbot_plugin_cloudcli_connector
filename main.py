@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import shlex
-from dataclasses import dataclass
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -15,7 +13,14 @@ try:
     from .approval_notifications import ApprovalNotificationPolicy
     from .authz import AuthorizationPolicy
     from .cloudcli_client import CloudCLIClient, CloudCLIError
+    from .command_parser import (
+        ParsedCommand,
+        parse_command,
+        parse_optional_request_no,
+        parse_positive_int,
+    )
     from .config import load_connector_settings
+    from .constants import MAX_DENY_REASON_LEN, PLUGIN_NAME, SESSION_PROVIDERS
     from .formatting import (
         HELP_TEXT,
         clip_text,
@@ -33,6 +38,9 @@ try:
         format_run_tasks,
         format_session_overview,
     )
+    from .identity import build_user_ref, missing_identity_message
+    from .run_requests import RunRequestBuilder
+    from .session_resolver import SessionResolver
     from .state import (
         PendingApproval,
         PluginState,
@@ -41,18 +49,18 @@ try:
         resolve_data_path,
     )
     from .runtime import RunQuota
-    from .run_validation import (
-        has_control_chars,
-        is_index_session_ref,
-        is_safe_git_branch_name,
-        is_safe_short_value,
-        looks_like_github_url,
-    )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from approval_notifications import ApprovalNotificationPolicy
     from authz import AuthorizationPolicy
     from cloudcli_client import CloudCLIClient, CloudCLIError
+    from command_parser import (
+        ParsedCommand,
+        parse_command,
+        parse_optional_request_no,
+        parse_positive_int,
+    )
     from config import load_connector_settings
+    from constants import MAX_DENY_REASON_LEN, PLUGIN_NAME, SESSION_PROVIDERS
     from formatting import (
         HELP_TEXT,
         clip_text,
@@ -70,6 +78,9 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         format_run_tasks,
         format_session_overview,
     )
+    from identity import build_user_ref, missing_identity_message
+    from run_requests import RunRequestBuilder
+    from session_resolver import SessionResolver
     from state import (
         PendingApproval,
         PluginState,
@@ -78,32 +89,6 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         resolve_data_path,
     )
     from runtime import RunQuota
-    from run_validation import (
-        has_control_chars,
-        is_index_session_ref,
-        is_safe_git_branch_name,
-        is_safe_short_value,
-        looks_like_github_url,
-    )
-
-
-PLUGIN_NAME = "astrbot_plugin_cloudcli_connector"
-MAX_DENY_REASON_LEN = 500
-RUN_PROVIDERS = {"claude", "cursor", "codex", "gemini"}
-SESSION_PROVIDERS = RUN_PROVIDERS | {"opencode"}
-
-
-@dataclass
-class ParsedCommand:
-    name: str
-    args: list[str]
-    raw_args: str
-
-
-@dataclass
-class ParsedRun:
-    payload: dict[str, Any]
-    display_target: str
 
 
 @register(
@@ -128,6 +113,17 @@ class CloudCLIConnectorPlugin(Star):
         self.client = CloudCLIClient(
             self.settings.cloudcli,
             on_permission_request=self._on_permission_request,
+        )
+        self.session_resolver = SessionResolver(
+            settings=self.settings,
+            authz=self.authz,
+            state=self.state,
+            client=self.client,
+        )
+        self.run_request_builder = RunRequestBuilder(
+            settings=self.settings,
+            authz=self.authz,
+            sessions=self.session_resolver,
         )
         self.run_quota = RunQuota(
             self.settings.max_active_runs_per_user,
@@ -156,10 +152,10 @@ class CloudCLIConnectorPlugin(Star):
     @filter.command("cloudcli")
     async def cloudcli(self, event: AstrMessageEvent):
         """CloudCLI session and permission approval commands."""
-        user = self._user_ref(event)
+        user = await build_user_ref(event)
         await self.state.remember_user(user)
         try:
-            parsed = self._parse_command(event.get_message_str() or event.message_str or "")
+            parsed = parse_command(event.get_message_str() or event.message_str or "")
             text = await self._dispatch(parsed, user)
         except Exception as exc:  # noqa: BLE001
             logger.exception("CloudCLI connector command failed")
@@ -173,7 +169,7 @@ class CloudCLIConnectorPlugin(Star):
         if command.name == "status":
             if command.args:
                 return "用法：/cloudcli status"
-            return await self._handle_status()
+            return await self._handle_status(user)
 
         if command.name == "session":
             if command.args:
@@ -217,7 +213,10 @@ class CloudCLIConnectorPlugin(Star):
 
         return f"未知指令：{command.name}\n\n{HELP_TEXT}"
 
-    async def _handle_status(self) -> str:
+    async def _handle_status(self, user: UserRef) -> str:
+        decision = self.authz.can_access_sessions(user)
+        if not decision.allowed:
+            return decision.message
         try:
             return format_health_report(await self.client.health_check())
         except Exception as exc:  # noqa: BLE001
@@ -276,10 +275,10 @@ class CloudCLIConnectorPlugin(Star):
             return format_bindings(await self.state.list_bindings(user))
         if len(args) != 1:
             return "用法：/cloudcli bind <sessionId|序号|last>"
-        direct_error = await self._direct_bind_error(user, args[0])
+        direct_error = await self.session_resolver.direct_bind_error(user, args[0])
         if direct_error:
             return direct_error
-        resolved, error = await self._resolve_session_ref(user, args[0])
+        resolved, error = await self.session_resolver.resolve_session_ref(user, args[0])
         if error:
             return error
         assert resolved is not None
@@ -288,6 +287,8 @@ class CloudCLIConnectorPlugin(Star):
         return message
 
     async def _handle_unbind(self, user: UserRef, args: list[str]) -> str:
+        if not user.identity_verified:
+            return missing_identity_message(user)
         if not args:
             return "用法：/cloudcli unbind <sessionId> 或 /cloudcli unbind all"
         if args[0] == "all":
@@ -309,25 +310,25 @@ class CloudCLIConnectorPlugin(Star):
         limit = default_limit
 
         if not args:
-            session_id, error = await self._infer_single_bound_session(user)
+            session_id, error = await self.session_resolver.infer_single_bound_session(user)
             if error:
                 return error
         elif len(args) == 1 and args[0].isdigit():
-            session_id, error = await self._infer_single_bound_session(user)
+            session_id, error = await self.session_resolver.infer_single_bound_session(user)
             if error:
                 return error
-            limit, error = _parse_positive_int(args[0], "limit", 1, 50)
+            limit, error = parse_positive_int(args[0], "limit", 1, 50)
             if error:
                 return error
         elif len(args) in {1, 2}:
             session_id = args[0].strip()
             if not is_valid_session_id(session_id):
                 return "sessionId 格式不合法。"
-            session_error = await self._session_usage_error(user, session_id)
+            session_error = await self.session_resolver.session_usage_error(user, session_id)
             if session_error:
                 return session_error
             if len(args) == 2:
-                limit, error = _parse_positive_int(args[1], "limit", 1, 50)
+                limit, error = parse_positive_int(args[1], "limit", 1, 50)
                 if error:
                     return error
         else:
@@ -351,7 +352,7 @@ class CloudCLIConnectorPlugin(Star):
         decision = self.authz.can_run_agent(user)
         if not decision.allowed:
             return decision.message
-        parsed, error = await self._parse_run_args(user, args)
+        parsed, error = await self.run_request_builder.parse(user, args)
         if error:
             return error
         assert parsed is not None
@@ -379,13 +380,15 @@ class CloudCLIConnectorPlugin(Star):
         return format_agent_start_message(parsed.payload, run_id)
 
     async def _handle_run_control(self, user: UserRef, args: list[str]) -> str:
+        if not user.identity_verified:
+            return missing_identity_message(user)
         subcommand = args[0]
         if subcommand == "list":
             if len(args) > 2:
                 return "用法：/cloudcli run list [数量]"
             limit = self.settings.run_list_limit
             if len(args) == 2:
-                limit, error = _parse_positive_int(args[1], "数量", 1, 50)
+                limit, error = parse_positive_int(args[1], "数量", 1, 50)
                 if error:
                     return error
             return format_run_tasks(await self.state.list_run_tasks(user, limit), limit)
@@ -431,7 +434,7 @@ class CloudCLIConnectorPlugin(Star):
             )
             return f"已取消 CloudCLI 任务 #{run_id}。{abort_message}"
 
-        return self._run_usage()
+            return self.run_request_builder.usage()
 
     async def _handle_pending(self, user: UserRef) -> str:
         approval_error = self._approval_permission_error(user)
@@ -459,10 +462,10 @@ class CloudCLIConnectorPlugin(Star):
             return decision.message
         if len(args) not in {1, 2}:
             return "用法：/cloudcli stop <sessionId|序号|last> [provider]"
-        direct_error = await self._direct_session_ref_error(user, args[0])
+        direct_error = await self.session_resolver.direct_session_ref_error(user, args[0])
         if direct_error:
             return direct_error
-        resolved, error = await self._resolve_session_ref(user, args[0])
+        resolved, error = await self.session_resolver.resolve_session_ref(user, args[0])
         if error:
             return error
         assert resolved is not None
@@ -484,7 +487,7 @@ class CloudCLIConnectorPlugin(Star):
             return approval_error
         if len(args) > 1:
             return "用法：/cloudcli allow [序号]"
-        request_no, error = self._parse_optional_request_no(args)
+        request_no, error = parse_optional_request_no(args)
         if error:
             return error
         approval, error = await self._resolve_approval(user, request_no)
@@ -568,7 +571,7 @@ class CloudCLIConnectorPlugin(Star):
             return "用法：/cloudcli audit [数量]"
         limit = 10
         if args:
-            limit, error = _parse_positive_int(args[0], "数量", 1, 50)
+            limit, error = parse_positive_int(args[0], "数量", 1, 50)
             if error:
                 return error
         return format_audit(await self.state.list_audit(user, limit), limit)
@@ -587,54 +590,6 @@ class CloudCLIConnectorPlugin(Star):
             request_no,
             self.settings.max_pending_display,
         )
-
-    async def _infer_single_bound_session(self, user: UserRef) -> tuple[str, str | None]:
-        bindings = await self.state.list_bindings(user)
-        if not bindings:
-            return "", "当前用户没有绑定 session，请先使用 /cloudcli bind <sessionId>，或显式传入 sessionId。"
-        if len(bindings) > 1:
-            return "", "当前用户绑定了多个 session，请显式传入 sessionId。"
-        return bindings[0], None
-
-    async def _resolve_session_ref(self, user: UserRef, ref: str) -> tuple[dict[str, str] | None, str | None]:
-        resolved, error = await self.state.resolve_session_ref(user, ref)
-        if error or resolved is None:
-            return resolved, error
-        provider = resolved.get("provider") or ""
-        if not provider:
-            recent = await self._find_recent_session(resolved["id"])
-            if recent:
-                provider = str(recent.get("provider") or "")
-                resolved["provider"] = provider
-                resolved["projectPath"] = str(recent.get("projectPath") or "")
-                resolved["projectName"] = str(recent.get("projectName") or "")
-        return resolved, None
-
-    async def _direct_bind_error(self, user: UserRef, ref: str) -> str:
-        if is_index_session_ref(ref):
-            return ""
-        if not is_valid_session_id(ref.strip()):
-            return ""
-        indexed = await self.state.find_session_index_item(user, ref.strip())
-        if indexed:
-            return ""
-        decision = self.authz.can_use_direct_session_id(user)
-        return "" if decision.allowed else decision.message
-
-    async def _direct_session_ref_error(self, user: UserRef, ref: str) -> str:
-        if is_index_session_ref(ref):
-            return ""
-        if not is_valid_session_id(ref.strip()):
-            return ""
-        return await self._session_usage_error(user, ref.strip())
-
-    async def _session_usage_error(self, user: UserRef, session_id: str) -> str:
-        if await self.state.has_binding(user, session_id):
-            return ""
-        if await self.state.find_session_index_item(user, session_id):
-            return ""
-        decision = self.authz.can_use_direct_session_id(user)
-        return "" if decision.allowed else decision.message
 
     def _approval_permission_error(self, user: UserRef) -> str:
         decision = self.authz.can_manage_approvals(user)
@@ -715,230 +670,6 @@ class CloudCLIConnectorPlugin(Star):
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("CloudCLI approval timeout worker failed: %s", exc)
-
-    async def _parse_run_args(
-        self,
-        user: UserRef,
-        args: list[str],
-    ) -> tuple[ParsedRun | None, str | None]:
-        if not args:
-            return None, self._run_usage()
-
-        options: dict[str, Any] = {
-            "provider": "",
-            "projectPath": "",
-            "githubUrl": "",
-            "sessionId": "",
-            "model": "",
-            "branchName": "",
-            "createBranch": False,
-            "createPR": False,
-            "cleanup": None,
-        }
-        message_parts: list[str] = []
-        index = 0
-        while index < len(args):
-            token = args[index]
-            if token == "--":
-                message_parts = args[index + 1 :]
-                break
-            if not token.startswith("--"):
-                message_parts = args[index:]
-                break
-
-            name, value, consumed_next, error = self._read_run_option(args, index)
-            if error:
-                return None, error
-            assert name is not None
-            if name == "project":
-                options["projectPath"] = value
-            elif name == "github":
-                options["githubUrl"] = value
-            elif name == "session":
-                options["sessionId"] = value
-            elif name == "provider":
-                options["provider"] = value.lower()
-            elif name == "model":
-                options["model"] = value
-            elif name == "branch":
-                options["branchName"] = value
-            elif name == "create-branch":
-                options["createBranch"] = True
-            elif name == "pr":
-                options["createPR"] = True
-                options["createBranch"] = True
-            elif name == "no-cleanup":
-                options["cleanup"] = False
-            elif name == "cleanup":
-                options["cleanup"] = True
-            else:
-                return None, f"未知 run 选项：--{name}\n{self._run_usage()}"
-            index += 2 if consumed_next else 1
-
-        message = " ".join(message_parts).strip()
-        if not message:
-            return None, "任务内容不能为空。\n" + self._run_usage()
-        max_message_len = self.settings.max_run_message_length
-        if len(message) > max_message_len:
-            return None, f"任务内容太长，请控制在 {max_message_len} 字以内。"
-
-        session_ref = str(options.get("sessionId") or "")
-        if session_ref:
-            session_decision = self.authz.can_access_sessions(user)
-            if not session_decision.allowed:
-                return None, session_decision.message
-        if session_ref.lower() in {"last", "latest"} or session_ref.isdigit():
-            resolved, error = await self._resolve_session_ref(user, session_ref)
-            if error:
-                return None, error
-            assert resolved is not None
-            options["sessionId"] = resolved["id"]
-            if not options.get("provider") and resolved.get("provider") in RUN_PROVIDERS:
-                options["provider"] = resolved["provider"]
-        elif session_ref and is_valid_session_id(session_ref):
-            session_error = await self._session_usage_error(user, session_ref)
-            if session_error:
-                return None, session_error
-
-        error = self._validate_run_options(options)
-        if error:
-            return None, error
-
-        error = await self._complete_run_target(user, options)
-        if error:
-            return None, error
-        project_error = self.authz.validate_project_path(user, str(options.get("projectPath") or ""))
-        if project_error:
-            return None, project_error
-
-        payload: dict[str, Any] = {
-            "message": message,
-            "provider": options["provider"] or "claude",
-        }
-        for key in ("projectPath", "githubUrl", "sessionId", "model", "branchName"):
-            if options.get(key):
-                payload[key] = options[key]
-        if options.get("createBranch"):
-            payload["createBranch"] = True
-        if options.get("createPR"):
-            payload["createPR"] = True
-        if options.get("cleanup") is not None:
-            payload["cleanup"] = bool(options["cleanup"])
-
-        display_target = payload.get("projectPath") or payload.get("githubUrl") or payload.get("sessionId") or ""
-        return ParsedRun(payload=payload, display_target=str(display_target)), None
-
-    def _read_run_option(
-        self,
-        args: list[str],
-        index: int,
-    ) -> tuple[str | None, str, bool, str | None]:
-        token = args[index]
-        raw = token[2:]
-        if "=" in raw:
-            name, value = raw.split("=", 1)
-            if not value:
-                return None, "", False, f"--{name} 不能为空。"
-            return name, value.strip(), False, None
-
-        name = raw
-        flag_options = {"create-branch", "pr", "no-cleanup", "cleanup"}
-        value_options = {"project", "github", "session", "provider", "model", "branch"}
-        if name in flag_options:
-            return name, "", False, None
-        if name not in value_options:
-            return name, "", False, None
-        if index + 1 >= len(args):
-            return None, "", False, f"--{name} 缺少参数。"
-        value = args[index + 1].strip()
-        if not value or value.startswith("--"):
-            return None, "", False, f"--{name} 缺少参数。"
-        return name, value, True, None
-
-    def _validate_run_options(self, options: dict[str, Any]) -> str | None:
-        provider = str(options.get("provider") or "")
-        if provider and provider not in RUN_PROVIDERS:
-            return f"provider 不支持：{provider}。可选：claude、cursor、codex、gemini。"
-
-        session_id = str(options.get("sessionId") or "")
-        if session_id and not is_valid_session_id(session_id):
-            return "sessionId 格式不合法。"
-
-        project_path = str(options.get("projectPath") or "")
-        if project_path and has_control_chars(project_path):
-            return "projectPath 含有非法控制字符。"
-
-        github_url = str(options.get("githubUrl") or "")
-        if github_url and not looks_like_github_url(github_url):
-            return "githubUrl 格式不合法，只支持 github.com 的 HTTPS 或 SSH URL。"
-
-        model = str(options.get("model") or "")
-        if model and not is_safe_short_value(model, 120):
-            return "model 格式不合法或过长。"
-
-        branch_name = str(options.get("branchName") or "")
-        if branch_name and not is_safe_git_branch_name(branch_name):
-            return "branch 名称不合法或过长。"
-
-        target_count = sum(1 for key in ("projectPath", "githubUrl") if options.get(key))
-        if target_count > 1:
-            return "--project 和 --github 不能同时使用。"
-        return None
-
-    async def _complete_run_target(self, user: UserRef, options: dict[str, Any]) -> str | None:
-        session_id = str(options.get("sessionId") or "")
-        if not session_id and not options.get("projectPath") and not options.get("githubUrl"):
-            session_decision = self.authz.can_access_sessions(user)
-            if not session_decision.allowed:
-                return (
-                    "请通过 --project <path> 或 --github <url> 指定任务目标；"
-                    + session_decision.message
-                )
-            session_id, error = await self._infer_single_bound_session(user)
-            if error:
-                return (
-                    "请通过 --project <path>、--github <url> 或 --session <sessionId> 指定任务目标；"
-                    + error
-                )
-            options["sessionId"] = session_id
-
-        if options.get("sessionId") and not options.get("projectPath") and not options.get("githubUrl"):
-            session_meta = await self._find_recent_session(str(options["sessionId"]))
-            if not session_meta:
-                return "无法从 CloudCLI 最近 session 中找到该 session 的 projectPath，请改用 --project <path>。"
-            project_path = str(session_meta.get("projectPath") or "")
-            if not project_path:
-                return "该 session 没有关联 projectPath，请改用 --project <path>。"
-            options["projectPath"] = project_path
-            provider = str(session_meta.get("provider") or "")
-            if not options.get("provider") and provider in RUN_PROVIDERS:
-                options["provider"] = provider
-
-        if options.get("provider") == "opencode":
-            return "/api/agent 当前不支持 opencode，请选择 claude、cursor、codex 或 gemini。"
-        if not options.get("projectPath") and not options.get("githubUrl"):
-            return "请指定 --project <path> 或 --github <url>。"
-        return None
-
-    async def _find_recent_session(self, session_id: str) -> dict[str, Any] | None:
-        try:
-            sessions = await self.client.get_recent_sessions(
-                100
-            )
-        except CloudCLIError:
-            return None
-        for item in sessions:
-            if item.get("id") == session_id:
-                return item
-        return None
-
-    def _run_usage(self) -> str:
-        return (
-            "用法：/cloudcli run [选项] <任务>\n"
-            "选项：--project <path>、--github <url>、--session <sessionId>、"
-            "--provider <claude|cursor|codex|gemini>、--model <model>、"
-            "--branch <name>、--pr、--no-cleanup"
-        )
 
     async def _refresh_pending_for_bindings(self, bindings: list[str]) -> str:
         async def fetch_one(session_id: str) -> tuple[str, list[PendingApproval], str]:
@@ -1048,6 +779,7 @@ class CloudCLIConnectorPlugin(Star):
             await self._send_proactive(unified_msg_origin, final_text)
         except asyncio.TimeoutError:
             message = f"CloudCLI 任务超过最大运行时间 {max_duration} 秒，已停止等待。"
+            message += await self._abort_run_session(summary, payload)
             await self.state.update_run_task(
                 run_id,
                 status="failed",
@@ -1083,6 +815,18 @@ class CloudCLIConnectorPlugin(Star):
                 finished=True,
             )
             await self._send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{exc}")
+
+    async def _abort_run_session(self, summary: dict[str, Any], payload: dict[str, Any]) -> str:
+        session_id = str(summary.get("sessionId") or payload.get("sessionId") or "")
+        if not session_id:
+            return "\n尚未获得 CloudCLI sessionId，无法主动发送中止请求。"
+        if not is_valid_session_id(session_id):
+            return "\nCloudCLI sessionId 格式异常，未发送中止请求。"
+        try:
+            await self.client.abort_session(session_id, str(payload.get("provider") or ""))
+            return f"\n已向 CloudCLI 发送中止 session 请求：{session_id}"
+        except CloudCLIError as exc:
+            return f"\n尝试中止 CloudCLI session 失败：{exc}"
 
     def _merge_agent_event(self, summary: dict[str, Any], event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or event.get("event") or "")
@@ -1167,75 +911,3 @@ class CloudCLIConnectorPlugin(Star):
 
     def _max_push_text_length(self) -> int:
         return self.settings.max_push_text_length
-
-    def _user_ref(self, event: AstrMessageEvent) -> UserRef:
-        platform_id = event.get_platform_id() or "unknown-platform"
-        sender_id = event.get_sender_id() or event.get_session_id() or event.unified_msg_origin
-        display_name = event.get_sender_name() or sender_id
-        return UserRef(
-            user_key=f"{platform_id}:{sender_id}",
-            display_name=display_name,
-            unified_msg_origin=event.unified_msg_origin,
-            is_admin=_is_event_admin(event),
-        )
-
-    def _parse_command(self, message: str) -> ParsedCommand:
-        stripped = message.strip()
-        if not stripped:
-            return ParsedCommand("", [], "")
-        try:
-            lexer = shlex.shlex(stripped, posix=False)
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = [_strip_wrapping_quotes(token) for token in lexer]
-        except ValueError:
-            return ParsedCommand("help", [], "")
-        if tokens and tokens[0].lstrip("/") == "cloudcli":
-            tokens = tokens[1:]
-        if not tokens:
-            return ParsedCommand("help", [], "")
-        name = tokens[0].lower()
-        args = tokens[1:]
-        raw_args = stripped.split(None, 1)[1] if len(stripped.split(None, 1)) > 1 else ""
-        return ParsedCommand(name, args, raw_args)
-
-    def _parse_optional_request_no(self, args: list[str]) -> tuple[int | None, str | None]:
-        if not args:
-            return None, None
-        if not args[0].isdigit():
-            return None, "序号必须是正整数。"
-        value = int(args[0])
-        if value < 1:
-            return None, "序号必须从 1 开始。"
-        return value, None
-
-
-def _parse_positive_int(
-    value: str,
-    name: str,
-    minimum: int,
-    maximum: int,
-) -> tuple[int, str | None]:
-    try:
-        parsed = int(value)
-    except ValueError:
-        return minimum, f"{name} 必须是整数。"
-    if parsed < minimum or parsed > maximum:
-        return minimum, f"{name} 必须在 {minimum}-{maximum} 之间。"
-    return parsed, None
-
-
-def _strip_wrapping_quotes(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    return value
-
-
-def _is_event_admin(event: AstrMessageEvent) -> bool:
-    checker = getattr(event, "is_admin", None)
-    if callable(checker):
-        try:
-            return bool(checker())
-        except Exception:  # noqa: BLE001
-            pass
-    return str(getattr(event, "role", "")).lower() == "admin"
