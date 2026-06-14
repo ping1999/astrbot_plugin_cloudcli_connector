@@ -46,6 +46,7 @@ try:
         PluginState,
         UserRef,
         is_valid_session_id,
+        pending_storage_key,
         resolve_data_path,
     )
     from .runtime import RunQuota
@@ -86,6 +87,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         PluginState,
         UserRef,
         is_valid_session_id,
+        pending_storage_key,
         resolve_data_path,
     )
     from runtime import RunQuota
@@ -135,6 +137,11 @@ class CloudCLIConnectorPlugin(Star):
 
     async def initialize(self) -> None:
         await self.state.load()
+        interrupted = await self.state.mark_interrupted_runs(
+            "AstrBot 插件重启，本地后台任务已中断。"
+        )
+        if interrupted:
+            logger.info("Marked %s CloudCLI run task(s) as interrupted.", interrupted)
         if self.settings.auto_connect:
             task = asyncio.create_task(self._warm_connect())
             self._track_task(task)
@@ -495,9 +502,13 @@ class CloudCLIConnectorPlugin(Star):
             return error
         assert approval is not None
         try:
-            await self.client.send_permission_decision(approval.request_id, True)
-            await self.state.remove_pending(approval.request_id)
-            self._cancel_approval_timeout(approval.request_id)
+            await self.client.send_permission_decision(
+                approval.request_id,
+                True,
+                session_id=approval.session_id,
+            )
+            await self.state.remove_pending(approval.session_id, approval.request_id)
+            self._cancel_approval_timeout(approval)
             await self.state.append_audit(
                 user=user,
                 action="allow",
@@ -542,9 +553,10 @@ class CloudCLIConnectorPlugin(Star):
                 approval.request_id,
                 False,
                 message=reason,
+                session_id=approval.session_id,
             )
-            await self.state.remove_pending(approval.request_id)
-            self._cancel_approval_timeout(approval.request_id)
+            await self.state.remove_pending(approval.session_id, approval.request_id)
+            self._cancel_approval_timeout(approval)
             await self.state.append_audit(
                 user=user,
                 action="deny",
@@ -599,25 +611,38 @@ class CloudCLIConnectorPlugin(Star):
         timeout_seconds = self.settings.approval_timeout_seconds
         if timeout_seconds <= 0:
             return
-        existing = self._approval_timeout_tasks.get(approval.request_id)
+        approval_key = pending_storage_key(approval.session_id, approval.request_id)
+        if not approval_key:
+            return
+        existing = self._approval_timeout_tasks.get(approval_key)
         if existing and not existing.done():
             return
-        task = asyncio.create_task(self._approval_timeout_worker(approval.request_id, timeout_seconds))
-        self._approval_timeout_tasks[approval.request_id] = task
+        task = asyncio.create_task(
+            self._approval_timeout_worker(
+                approval.session_id,
+                approval.request_id,
+                timeout_seconds,
+            )
+        )
+        self._approval_timeout_tasks[approval_key] = task
         task.add_done_callback(
-            lambda _task, request_id=approval.request_id: self._approval_timeout_tasks.pop(request_id, None)
+            lambda _task, key=approval_key: self._approval_timeout_tasks.pop(key, None)
         )
         self._track_task(task)
 
-    def _cancel_approval_timeout(self, request_id: str) -> None:
-        task = self._approval_timeout_tasks.pop(request_id, None)
+    def _cancel_approval_timeout(self, approval: PendingApproval | str) -> None:
+        if isinstance(approval, PendingApproval):
+            approval_key = pending_storage_key(approval.session_id, approval.request_id)
+        else:
+            approval_key = approval
+        task = self._approval_timeout_tasks.pop(approval_key, None)
         if task and not task.done():
             task.cancel()
 
-    async def _approval_timeout_worker(self, request_id: str, timeout_seconds: int) -> None:
+    async def _approval_timeout_worker(self, session_id: str, request_id: str, timeout_seconds: int) -> None:
         try:
             await asyncio.sleep(timeout_seconds)
-            approval = await self.state.get_pending(request_id)
+            approval = await self.state.get_pending(session_id, request_id)
             if approval is None:
                 return
             action = self.settings.approval_timeout_action
@@ -631,8 +656,9 @@ class CloudCLIConnectorPlugin(Star):
                         approval.request_id,
                         False,
                         message=reason,
+                        session_id=approval.session_id,
                     )
-                    await self.state.remove_pending(approval.request_id)
+                    await self.state.remove_pending(approval.session_id, approval.request_id)
                     await self.state.append_audit(
                         user=None,
                         action="timeout-deny",
@@ -685,8 +711,8 @@ class CloudCLIConnectorPlugin(Star):
                 errors.append(f"{session_id}: {error}")
                 continue
             removed = await self.state.replace_pending_for_session(session_id, approvals)
-            for request_id in removed:
-                self._cancel_approval_timeout(request_id)
+            for approval_key in removed:
+                self._cancel_approval_timeout(approval_key)
             for approval in approvals:
                 self._schedule_approval_timeout(approval)
         return "; ".join(errors)

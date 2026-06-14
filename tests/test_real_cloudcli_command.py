@@ -228,7 +228,13 @@ def bool_setting(config_key: str | tuple[str, ...], env_names: tuple[str, ...], 
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def real_cloudcli_enabled() -> bool:
+    return bool_setting("real_enabled", ("CLOUDCLI_TEST_REAL_ENABLED",))
+
+
 def has_real_cloudcli_config() -> bool:
+    if not real_cloudcli_enabled():
+        return False
     has_token = bool(setting(("jwt_token", "cloudcli_jwt_token"), ("CLOUDCLI_TEST_JWT_TOKEN", "CLOUDCLI_JWT_TOKEN")))
     has_login = bool(
         setting(("username", "cloudcli_username"), ("CLOUDCLI_TEST_USERNAME", "CLOUDCLI_USERNAME"))
@@ -448,8 +454,8 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
     async def test_real_cloudcli_command_flow(self) -> None:
         if not has_real_cloudcli_config():
             self.skipTest(
-                "Set CLOUDCLI_TEST_JWT_TOKEN or CLOUDCLI_TEST_USERNAME/CLOUDCLI_TEST_PASSWORD "
-                "to run the real CloudCLI command flow."
+                "Set CLOUDCLI_TEST_REAL_ENABLED=1 plus CLOUDCLI_TEST_JWT_TOKEN or "
+                "CLOUDCLI_TEST_USERNAME/CLOUDCLI_TEST_PASSWORD to run the real CloudCLI command flow."
             )
 
         help_text = await self.command("/cloudcli help")

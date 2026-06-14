@@ -86,7 +86,7 @@ class PluginState:
                 if isinstance(loaded, dict):
                     self._data["version"] = 2
                     self._data["users"] = _read_dict(loaded.get("users"))
-                    self._data["pending"] = _read_dict(loaded.get("pending"))
+                    self._data["pending"] = _normalize_pending_records(_read_dict(loaded.get("pending")))
                     self._data["runs"] = _read_dict(loaded.get("runs"))
                     self._data["audit"] = _read_dict_list(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
                     self._data["next_run_id"] = _read_positive_int(
@@ -307,20 +307,25 @@ class PluginState:
     async def upsert_pending(self, approval: PendingApproval) -> None:
         async with self._lock:
             pending = _read_dict(self._data.get("pending"))
-            pending[approval.request_id] = self._pending_record(approval)
+            key = pending_storage_key(approval.session_id, approval.request_id)
+            if not key:
+                return
+            pending[key] = self._pending_record(approval)
             self._data["pending"] = pending
             await self._save_locked()
 
-    async def remove_pending(self, request_id: str) -> None:
+    async def remove_pending(self, session_id: str, request_id: str) -> None:
         async with self._lock:
             pending = _read_dict(self._data.get("pending"))
-            pending.pop(request_id, None)
+            pending.pop(pending_storage_key(session_id, request_id), None)
             self._data["pending"] = pending
             await self._save_locked()
 
-    async def get_pending(self, request_id: str) -> PendingApproval | None:
+    async def get_pending(self, session_id: str, request_id: str) -> PendingApproval | None:
         async with self._lock:
-            item = _read_dict(self._data.get("pending")).get(request_id)
+            item = _read_dict(self._data.get("pending")).get(
+                pending_storage_key(session_id, request_id)
+            )
             if not isinstance(item, dict) or item.get("resolved") is True:
                 return None
             session_id = _read_str(item.get("session_id"))
@@ -339,7 +344,9 @@ class PluginState:
         async with self._lock:
             pending = _read_dict(self._data.get("pending"))
             for approval in approvals:
-                pending[approval.request_id] = self._pending_record(approval)
+                key = pending_storage_key(approval.session_id, approval.request_id)
+                if key:
+                    pending[key] = self._pending_record(approval)
             self._data["pending"] = pending
             await self._save_locked()
 
@@ -353,19 +360,20 @@ class PluginState:
         async with self._lock:
             pending = _read_dict(self._data.get("pending"))
             incoming = {
-                approval.request_id: approval
+                pending_storage_key(approval.session_id, approval.request_id): approval
                 for approval in approvals
                 if approval.session_id == session_id and is_valid_request_id(approval.request_id)
             }
             removed: list[str] = []
-            for request_id, item in list(pending.items()):
+            for key, item in list(pending.items()):
                 if not isinstance(item, dict):
                     continue
-                if _read_str(item.get("session_id")) == session_id and request_id not in incoming:
-                    removed.append(request_id)
-                    pending.pop(request_id, None)
-            for approval in incoming.values():
-                pending[approval.request_id] = self._pending_record(approval)
+                if _read_str(item.get("session_id")) == session_id and key not in incoming:
+                    removed.append(key)
+                    pending.pop(key, None)
+            for key, approval in incoming.items():
+                if key:
+                    pending[key] = self._pending_record(approval)
             self._data["pending"] = pending
             await self._save_locked()
             return removed
@@ -515,6 +523,29 @@ class PluginState:
                 return None, "只能查看或操作自己发起的 CloudCLI 任务。"
             return dict(item), None
 
+    async def mark_interrupted_runs(self, reason: str) -> int:
+        async with self._lock:
+            runs = _read_dict(self._data.get("runs"))
+            now = time.time()
+            changed = 0
+            for item in runs.values():
+                if not isinstance(item, dict):
+                    continue
+                status = _read_str(item.get("status"))
+                if status not in {"running", "queued", "pending"}:
+                    continue
+                item["status"] = "interrupted"
+                item["updated_at"] = now
+                item["finished_at"] = now
+                log = _read_dict_list(item.get("log"))
+                log.append({"ts": now, "text": _safe_text(reason, MAX_STORED_TEXT)})
+                item["log"] = log[-MAX_RUN_LOG_ITEMS:]
+                changed += 1
+            if changed:
+                self._data["runs"] = runs
+                await self._save_locked()
+            return changed
+
     async def append_audit(
         self,
         *,
@@ -631,6 +662,12 @@ def is_valid_request_id(value: str) -> bool:
     return bool(REQUEST_ID_RE.fullmatch(value or ""))
 
 
+def pending_storage_key(session_id: str, request_id: str) -> str:
+    if not is_valid_session_id(session_id) or not is_valid_request_id(request_id):
+        return ""
+    return f"{session_id}|{request_id}"
+
+
 def resolve_data_path(plugin_file: str, plugin_name: str) -> Path:
     env_path = os.getenv("ASTRBOT_DATA_PATH") or os.getenv("ASTRBOT_DATA_DIR")
     if env_path:
@@ -642,6 +679,25 @@ def resolve_data_path(plugin_file: str, plugin_name: str) -> Path:
             return parent / "plugin_data" / plugin_name
 
     return plugin_dir / ".runtime_data"
+
+
+def _normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(item, dict):
+            continue
+        session_id = _read_str(item.get("session_id"))
+        request_id = _read_str(item.get("request_id"))
+        if not request_id and isinstance(key, str):
+            request_id = key.split("|", 1)[-1]
+        storage_key = pending_storage_key(session_id, request_id)
+        if not storage_key:
+            continue
+        normalized = dict(item)
+        normalized["session_id"] = session_id
+        normalized["request_id"] = request_id
+        result[storage_key] = normalized
+    return result
 
 
 def _read_str(value: Any) -> str:

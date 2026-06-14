@@ -13,6 +13,7 @@ python -m unittest discover -s tests -v
 Useful environment variables:
 
 ```powershell
+$env:CLOUDCLI_TEST_REAL_ENABLED = "1"
 $env:CLOUDCLI_TEST_BASE_URL = "http://127.0.0.1:13002"
 $env:CLOUDCLI_TEST_USERNAME = "your username"
 $env:CLOUDCLI_TEST_PASSWORD = "your password"

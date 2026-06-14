@@ -271,6 +271,7 @@ class CloudCLIClient:
         request_id: str,
         allow: bool,
         message: str = "",
+        session_id: str = "",
     ) -> None:
         await self.ensure_connected()
         payload: dict[str, Any] = {
@@ -278,6 +279,8 @@ class CloudCLIClient:
             "requestId": request_id,
             "allow": allow,
         }
+        if session_id:
+            payload["sessionId"] = session_id
         if message:
             payload["message"] = message
         await self._send_json(payload)
@@ -297,7 +300,7 @@ class CloudCLIClient:
             return
         await self._ensure_http_session()
 
-        token = await self._get_token()
+        token = await self._get_token(allow_anonymous=self.config.allow_unauthenticated_ws)
         ws_url = self._ws_url(token)
         try:
             ws = await self._session.ws_connect(
