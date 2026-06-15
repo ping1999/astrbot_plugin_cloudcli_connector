@@ -208,6 +208,79 @@ class RunRequestTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_pending_input_redacts_common_secret_key_shapes(self) -> None:
+        async def scenario() -> dict[str, object]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval(
+                        "request-1",
+                        "sess-1",
+                        "Tool",
+                        {
+                            "openai_api_key": "sk-secret",
+                            "githubToken": "ghp-secret",
+                            "client_secret": "client-secret",
+                            "private_key": "pem-secret",
+                            "safe": "visible",
+                        },
+                    )
+                )
+                visible = await state.visible_pending_for_user(user, 10)
+                return visible[0].input_data
+
+        stored = asyncio.run(scenario())
+        self.assertEqual("[redacted]", stored["openai_api_key"])
+        self.assertEqual("[redacted]", stored["githubToken"])
+        self.assertEqual("[redacted]", stored["client_secret"])
+        self.assertEqual("[redacted]", stored["private_key"])
+        self.assertEqual("visible", stored["safe"])
+
+    def test_pending_claim_blocks_double_decision_and_preserves_refresh(self) -> None:
+        async def scenario() -> tuple[bool, str, bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.bind_session(user, "sess-1", 10)
+                approval = PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                await state.upsert_pending(approval)
+                first, first_error = await state.claim_visible_request(user, None, 10, "allow")
+                self.assertIsNone(first_error)
+                await state.replace_pending_for_session("sess-1", [approval])
+                second, second_error = await state.claim_visible_request(user, None, 10, "deny")
+                await state.release_pending_claim("sess-1", "request-1", user.user_key)
+                third, third_error = await state.claim_visible_request(user, None, 10, "deny")
+                self.assertIsNone(third_error)
+                return first is not None, second_error or "", third is not None
+
+        first_claimed, second_error, third_claimed = asyncio.run(scenario())
+        self.assertTrue(first_claimed)
+        self.assertIn("正在被处理", second_error)
+        self.assertTrue(third_claimed)
+
+    def test_stale_pending_claim_is_cleared_on_load(self) -> None:
+        async def scenario() -> bool:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(PendingApproval("request-1", "sess-1", "Tool", {"value": 1}))
+                await state.claim_visible_request(user, None, 10, "allow")
+
+                reloaded = PluginState(path)
+                await reloaded.load()
+                claimed, error = await reloaded.claim_visible_request(user, None, 10, "deny")
+                self.assertIsNone(error)
+                return claimed is not None
+
+        self.assertTrue(asyncio.run(scenario()))
+
     def test_pending_request_ids_are_scoped_by_session(self) -> None:
         async def scenario() -> list[PendingApproval]:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -253,6 +326,26 @@ class StateTests(unittest.TestCase):
         self.assertEqual(1, task["changed"])
         self.assertEqual("interrupted", task["status"])
         self.assertTrue(task["finished_at"])
+
+    def test_run_history_prunes_completed_tasks(self) -> None:
+        async def scenario() -> list[str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                for index in range(5):
+                    run_id = await state.create_run_task(
+                        user,
+                        {"provider": "codex", "projectPath": f"C:/repo-{index}", "message": "doit"},
+                        f"C:/repo-{index}",
+                        2,
+                        10,
+                    )
+                    await state.update_run_task(run_id, status="completed", finished=True)
+                    await state.prune_run_history(2, 10)
+                return [str(item["id"]) for item in await state.list_run_tasks(user, 10)]
+
+        self.assertEqual(["5", "4"], asyncio.run(scenario()))
 
 
 class CloudCLIClientTests(unittest.TestCase):

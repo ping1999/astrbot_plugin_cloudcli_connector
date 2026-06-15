@@ -129,6 +129,18 @@
     "type": "int",
     "default": 3
   },
+  "max_run_history_per_user": {
+    "description": "Max completed /cloudcli run tasks retained per user",
+    "type": "int",
+    "default": 50,
+    "hint": "Set 0 to keep all run history for each user."
+  },
+  "max_run_history_global": {
+    "description": "Max completed /cloudcli run tasks retained globally",
+    "type": "int",
+    "default": 500,
+    "hint": "Set 0 to keep all run history globally."
+  },
   "run_status_interval_seconds": {
     "description": "Minimum seconds between background run status pushes",
     "type": "int",

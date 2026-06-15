@@ -8,7 +8,8 @@ DEFAULT_MAX_REDACTED_TEXT_CHARS = 2000
 _SECRET_SUBSTITUTIONS = (
     (
         r"(?i)((?:\"|')?(?:authorization|x-api-key|api[_-]?key|apikey|jwt[_-]?token|"
-        r"access[_-]?token|refresh[_-]?token|token|password|secret)(?:\"|')?\s*:\s*(?:\"|'))"
+        r"access[_-]?token|refresh[_-]?token|token|password|passwd|secret|"
+        r"credential|credentials|private[_-]?key)(?:\"|')?\s*:\s*(?:\"|'))"
         r"[^\"']+((?:\"|'))",
         r"\1[redacted]\2",
     ),
@@ -21,8 +22,11 @@ _SECRET_SUBSTITUTIONS = (
     (r"(?i)(refresh[_-]?token\s*[:=]\s*)[^\s,'\"}]+", r"\1[redacted]"),
     (r"(?i)(token\s*[:=]\s*)[^\s,'\"}]+", r"\1[redacted]"),
     (r"(?i)(password\s*[:=]\s*)[^\s,'\"}]+", r"\1[redacted]"),
+    (r"(?i)(passwd\s*[:=]\s*)[^\s,'\"}]+", r"\1[redacted]"),
     (r"(?i)(secret\s*[:=]\s*)[^\s,'\"}]+", r"\1[redacted]"),
-    (r"(?i)([?&](?:token|api_key|apikey|password|secret)=)[^&\s]+", r"\1[redacted]"),
+    (r"(?i)(credential[s]?\s*[:=]\s*)[^\s,'\"}]+", r"\1[redacted]"),
+    (r"(?i)(private[_-]?key\s*[:=]\s*)[^\s,'\"}]+", r"\1[redacted]"),
+    (r"(?i)([?&](?:token|api_key|apikey|password|passwd|secret|credential|credentials|private_key)=)[^&\s]+", r"\1[redacted]"),
 )
 
 

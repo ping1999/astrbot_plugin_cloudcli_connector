@@ -84,6 +84,7 @@
 - `allowed_project_roots`：允许 `/cloudcli run --project` 访问的本地根目录，多个目录用英文逗号分隔
 - `allow_unrestricted_project_paths`：是否允许非管理员在未配置 `allowed_project_roots` 时访问任意本地路径
 - `max_active_runs_per_user` / `max_active_runs_global`：限制并发 `/cloudcli run` 任务数量，`0` 表示不限制
+- `max_run_history_per_user` / `max_run_history_global`：保留已完成 `/cloudcli run` 历史的上限，`0` 表示不裁剪
 - `agent_idle_timeout_seconds`：`/cloudcli run` 流式响应空闲超时
 - `agent_max_duration_seconds`：单个 `/cloudcli run` 最大等待时间，`0` 表示关闭
 - `run_list_limit`：`/cloudcli run list` 默认展示的任务数量

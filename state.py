@@ -21,9 +21,12 @@ RUN_ID_RE = re.compile(r"^[0-9]{1,12}$")
 MAX_SESSION_INDEX_ITEMS = 100
 MAX_RUN_LOG_ITEMS = 80
 MAX_AUDIT_ITEMS = 500
+DEFAULT_MAX_RUN_HISTORY_PER_USER = 50
+DEFAULT_MAX_RUN_HISTORY_GLOBAL = 500
 MAX_STORED_TEXT = 1200
 MAX_STORED_JSON_ITEMS = 60
 MAX_STORED_JSON_DEPTH = 6
+PENDING_CLAIM_FIELDS = ("claimed_by", "claimed_action", "claimed_at")
 
 
 @dataclass(frozen=True)
@@ -340,13 +343,24 @@ class PluginState:
                 received_at=float(item.get("received_at") or 0),
             )
 
+    async def list_pending(self) -> list[PendingApproval]:
+        async with self._lock:
+            pending = _read_dict(self._data.get("pending"))
+            approvals: list[PendingApproval] = []
+            for item in pending.values():
+                approval = self._pending_from_record(item)
+                if approval is not None:
+                    approvals.append(approval)
+            approvals.sort(key=lambda item: (item.received_at, item.session_id, item.request_id))
+            return approvals
+
     async def merge_pending(self, approvals: list[PendingApproval]) -> None:
         async with self._lock:
             pending = _read_dict(self._data.get("pending"))
             for approval in approvals:
                 key = pending_storage_key(approval.session_id, approval.request_id)
                 if key:
-                    pending[key] = self._pending_record(approval)
+                    pending[key] = self._pending_record(approval, pending.get(key))
             self._data["pending"] = pending
             await self._save_locked()
 
@@ -373,7 +387,7 @@ class PluginState:
                     pending.pop(key, None)
             for key, approval in incoming.items():
                 if key:
-                    pending[key] = self._pending_record(approval)
+                    pending[key] = self._pending_record(approval, pending.get(key))
             self._data["pending"] = pending
             await self._save_locked()
             return removed
@@ -430,11 +444,71 @@ class PluginState:
             return None, f"序号无效，请输入 1-{len(visible)}。"
         return visible[request_no - 1], None
 
+    async def claim_visible_request(
+        self,
+        user: UserRef,
+        request_no: int | None,
+        max_items: int,
+        action: str,
+    ) -> tuple[PendingApproval | None, str | None]:
+        async with self._lock:
+            bindings = _read_list(self._user_entry(user.user_key).get("bindings"))
+            visible = self._visible_pending_locked(bindings, max_items)
+            if not visible:
+                return None, "当前没有待审批权限。"
+            if request_no is None:
+                if len(visible) != 1:
+                    return None, "有多条待审批权限，请指定序号。"
+                approval = visible[0]
+            else:
+                if request_no < 1 or request_no > len(visible):
+                    return None, f"序号无效，请输入 1-{len(visible)}。"
+                approval = visible[request_no - 1]
+            return await self._claim_pending_locked(
+                approval.session_id,
+                approval.request_id,
+                actor=user.user_key,
+                action=action,
+            )
+
+    async def claim_pending(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        actor: str,
+        action: str,
+    ) -> tuple[PendingApproval | None, str | None]:
+        async with self._lock:
+            return await self._claim_pending_locked(
+                session_id,
+                request_id,
+                actor=actor,
+                action=action,
+            )
+
+    async def release_pending_claim(self, session_id: str, request_id: str, actor: str) -> None:
+        async with self._lock:
+            pending = _read_dict(self._data.get("pending"))
+            key = pending_storage_key(session_id, request_id)
+            item = pending.get(key)
+            if not isinstance(item, dict):
+                return
+            if _read_str(item.get("claimed_by")) != actor:
+                return
+            for field in PENDING_CLAIM_FIELDS:
+                item.pop(field, None)
+            pending[key] = item
+            self._data["pending"] = pending
+            await self._save_locked()
+
     async def create_run_task(
         self,
         user: UserRef,
         payload: dict[str, Any],
         display_target: str,
+        max_history_per_user: int = DEFAULT_MAX_RUN_HISTORY_PER_USER,
+        max_history_global: int = DEFAULT_MAX_RUN_HISTORY_GLOBAL,
     ) -> str:
         async with self._lock:
             run_id = str(_read_positive_int(self._data.get("next_run_id"), 1))
@@ -459,6 +533,7 @@ class PluginState:
                 "log": [],
                 "summary": {},
             }
+            self._prune_runs_locked(runs, max_history_per_user, max_history_global)
             self._data["runs"] = runs
             await self._save_locked()
             return run_id
@@ -500,6 +575,15 @@ class PluginState:
             runs[run_id] = item
             self._data["runs"] = runs
             await self._save_locked()
+
+    async def prune_run_history(self, max_history_per_user: int, max_history_global: int) -> None:
+        async with self._lock:
+            runs = _read_dict(self._data.get("runs"))
+            before = len(runs)
+            self._prune_runs_locked(runs, max_history_per_user, max_history_global)
+            if len(runs) != before:
+                self._data["runs"] = runs
+                await self._save_locked()
 
     async def list_run_tasks(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
         async with self._lock:
@@ -631,8 +715,67 @@ class PluginState:
         ids = [int(key) for key in runs if isinstance(key, str) and RUN_ID_RE.fullmatch(key)]
         return max(ids, default=0) + 1
 
-    def _pending_record(self, approval: PendingApproval) -> dict[str, Any]:
-        return {
+    async def _claim_pending_locked(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        actor: str,
+        action: str,
+    ) -> tuple[PendingApproval | None, str | None]:
+        pending = _read_dict(self._data.get("pending"))
+        key = pending_storage_key(session_id, request_id)
+        item = pending.get(key)
+        approval = self._pending_from_record(item)
+        if approval is None:
+            return None, "当前没有待审批权限，可能已经被处理。"
+        claimed_by = _read_str(item.get("claimed_by")) if isinstance(item, dict) else ""
+        if claimed_by:
+            return None, "该审批请求正在被处理，请稍后执行 /cloudcli pending 刷新。"
+        item["claimed_by"] = _safe_text(actor, 200)
+        item["claimed_action"] = _safe_text(action, 40)
+        item["claimed_at"] = time.time()
+        pending[key] = item
+        self._data["pending"] = pending
+        await self._save_locked()
+        return approval, None
+
+    def _visible_pending_locked(self, bindings: list[str], max_items: int) -> list[PendingApproval]:
+        if not bindings:
+            return []
+        pending = _read_dict(self._data.get("pending"))
+        approvals = []
+        for item in pending.values():
+            if not isinstance(item, dict):
+                continue
+            if _read_str(item.get("session_id")) not in bindings:
+                continue
+            approval = self._pending_from_record(item)
+            if approval is not None:
+                approvals.append(approval)
+        approvals.sort(key=lambda item: (item.received_at, item.request_id))
+        if max_items < 1:
+            max_items = 1
+        return approvals[:max_items]
+
+    def _pending_from_record(self, item: Any) -> PendingApproval | None:
+        if not isinstance(item, dict) or item.get("resolved") is True:
+            return None
+        session_id = _read_str(item.get("session_id"))
+        request_id = _read_str(item.get("request_id"))
+        if not is_valid_session_id(session_id) or not is_valid_request_id(request_id):
+            return None
+        return PendingApproval(
+            request_id=request_id,
+            session_id=session_id,
+            tool_name=_read_str(item.get("tool_name")) or "UnknownTool",
+            input_data=item.get("input_data"),
+            provider=_read_str(item.get("provider")) or "claude",
+            received_at=float(item.get("received_at") or 0),
+        )
+
+    def _pending_record(self, approval: PendingApproval, existing: Any = None) -> dict[str, Any]:
+        record = {
             "request_id": approval.request_id,
             "session_id": approval.session_id,
             "tool_name": _safe_text(approval.tool_name, 120) or "UnknownTool",
@@ -641,6 +784,43 @@ class PluginState:
             "received_at": approval.received_at or time.time(),
             "resolved": False,
         }
+        if isinstance(existing, dict):
+            for field in PENDING_CLAIM_FIELDS:
+                if existing.get(field):
+                    record[field] = existing[field]
+        return record
+
+    def _prune_runs_locked(
+        self,
+        runs: dict[str, Any],
+        max_history_per_user: int,
+        max_history_global: int,
+    ) -> None:
+        removable = [
+            (str(run_id), item)
+            for run_id, item in runs.items()
+            if isinstance(item, dict)
+            and _read_str(item.get("status")) not in {"running", "queued", "pending"}
+        ]
+        if max_history_per_user > 0:
+            by_user: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+            for run_id, item in removable:
+                by_user.setdefault(_read_str(item.get("user_key")), []).append((run_id, item))
+            for items in by_user.values():
+                items.sort(key=lambda pair: float(pair[1].get("started_at") or 0), reverse=True)
+                for run_id, _item in items[max_history_per_user:]:
+                    runs.pop(run_id, None)
+
+        if max_history_global > 0:
+            remaining = [
+                (str(run_id), item)
+                for run_id, item in runs.items()
+                if isinstance(item, dict)
+                and _read_str(item.get("status")) not in {"running", "queued", "pending"}
+            ]
+            remaining.sort(key=lambda pair: float(pair[1].get("started_at") or 0), reverse=True)
+            for run_id, _item in remaining[max_history_global:]:
+                runs.pop(run_id, None)
 
     async def _save_locked(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -696,6 +876,8 @@ def _normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(item)
         normalized["session_id"] = session_id
         normalized["request_id"] = request_id
+        for field in PENDING_CLAIM_FIELDS:
+            normalized.pop(field, None)
         result[storage_key] = normalized
     return result
 
@@ -799,19 +981,25 @@ def _compact_json(value: Any) -> str:
 
 
 def _is_sensitive_key(value: str) -> bool:
-    normalized = value.lower().replace("-", "_")
-    return normalized in {
-        "authorization",
-        "x_api_key",
-        "api_key",
-        "apikey",
-        "jwt_token",
-        "access_token",
-        "refresh_token",
-        "token",
-        "password",
-        "secret",
-    }
+    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", value)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
+    if not normalized:
+        return False
+    parts = {part for part in normalized.split("_") if part}
+    compact = normalized.replace("_", "")
+    if compact in {"authorization", "apikey", "xapikey", "bearertoken"}:
+        return True
+    if parts & {"token", "password", "passwd", "secret", "credential", "credentials"}:
+        return True
+    if "api" in parts and "key" in parts:
+        return True
+    if "private" in parts and "key" in parts:
+        return True
+    if "access" in parts and "key" in parts:
+        return True
+    if "refresh" in parts and "key" in parts:
+        return True
+    return False
 
 
 def _parse_timestamp(value: Any) -> float:

@@ -37,6 +37,8 @@ class ConnectorSettings:
     allow_unrestricted_project_paths: bool
     max_active_runs_per_user: int
     max_active_runs_global: int
+    max_run_history_per_user: int
+    max_run_history_global: int
 
 
 def load_connector_settings(config: Any) -> ConnectorSettings:
@@ -85,6 +87,8 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
         allow_unrestricted_project_paths=_read_bool(get("allow_unrestricted_project_paths"), False),
         max_active_runs_per_user=_read_nonnegative_limited_int(get("max_active_runs_per_user"), 1, 50),
         max_active_runs_global=_read_nonnegative_limited_int(get("max_active_runs_global"), 3, 200),
+        max_run_history_per_user=_read_nonnegative_limited_int(get("max_run_history_per_user"), 50, 1000),
+        max_run_history_global=_read_nonnegative_limited_int(get("max_run_history_global"), 500, 10000),
     )
 
 

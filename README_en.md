@@ -82,6 +82,7 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `allowed_project_roots`: comma-separated local roots allowed for `/cloudcli run --project`
 - `allow_unrestricted_project_paths`: allow non-admin users to use arbitrary local paths when `allowed_project_roots` is empty
 - `max_active_runs_per_user` / `max_active_runs_global`: concurrent `/cloudcli run` limits; `0` disables a limit
+- `max_run_history_per_user` / `max_run_history_global`: retain completed `/cloudcli run` history up to these limits; `0` disables pruning
 - `agent_idle_timeout_seconds`: idle timeout for the `/cloudcli run` streaming response
 - `agent_max_duration_seconds`: maximum wait time for one `/cloudcli run`; `0` disables this guard
 - `run_list_limit`: default task count shown by `/cloudcli run list`
