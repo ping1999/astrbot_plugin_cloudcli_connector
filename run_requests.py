@@ -10,7 +10,7 @@ try:
     from .run_validation import (
         has_control_chars,
         is_safe_git_branch_name,
-        is_safe_short_value,
+        is_safe_model_name,
         looks_like_github_url,
     )
     from .session_resolver import SessionResolver
@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from run_validation import (
         has_control_chars,
         is_safe_git_branch_name,
-        is_safe_short_value,
+        is_safe_model_name,
         looks_like_github_url,
     )
     from session_resolver import SessionResolver
@@ -183,7 +183,7 @@ class RunRequestBuilder:
         return (
             "用法：/cloudcli run [选项] <任务>\n"
             "选项：--project <path>、--github <url>、--session <sessionId>、"
-            "--provider <claude|cursor|codex|gemini>、--model <model>、"
+            "--provider <claude|cursor|codex|gemini|opencode>、--model <model>、"
             "--branch <name>、--pr、--no-cleanup"
         )
 
@@ -243,7 +243,7 @@ class RunRequestBuilder:
     def _validate_options(self, options: RunOptions) -> str | None:
         provider = options.provider
         if provider and provider not in RUN_PROVIDERS:
-            return f"provider 不支持：{provider}。可选：claude、cursor、codex、gemini。"
+            return f"provider 不支持：{provider}。可选：claude、cursor、codex、gemini、opencode。"
 
         session_id = options.session_id
         if session_id and not (
@@ -259,7 +259,7 @@ class RunRequestBuilder:
         if options.github_url and not looks_like_github_url(options.github_url):
             return "githubUrl 格式不合法，只支持 github.com 的标准 HTTPS 或 SSH 仓库 URL。"
 
-        if options.model and not is_safe_short_value(options.model, 120):
+        if options.model and not is_safe_model_name(options.model):
             return "model 格式不合法或过长。"
 
         if options.branch_name and not is_safe_git_branch_name(options.branch_name):

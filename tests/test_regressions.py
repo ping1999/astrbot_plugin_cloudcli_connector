@@ -8,10 +8,12 @@ from pathlib import Path
 from authz import AuthorizationPolicy
 from cloudcli_client import CloudCLIClient, CloudCLIConfig
 from cloudcli_protocol import build_ws_url, parse_sse_event
+from cloudcli_transport import WebSocketRequestMux
 from config import load_connector_settings
 from identity import build_user_ref
 from run_requests import RunRequestBuilder
-from run_validation import is_safe_git_branch_name, looks_like_github_url
+from formatting import format_session_overview
+from run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
 from state import PendingApproval, PluginState, UserRef
 
 
@@ -35,6 +37,19 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(is_safe_git_branch_name("feature/.hidden"))
         self.assertFalse(is_safe_git_branch_name("feature.lock/branch"))
         self.assertFalse(is_safe_git_branch_name("feature/lock.lock"))
+
+    def test_provider_boundary_values_reject_shell_metacharacters(self) -> None:
+        for value in (
+            "feature;calc",
+            "feature$(whoami)",
+            "feature`whoami`",
+            "feature|cat",
+            "feature&cat",
+        ):
+            self.assertFalse(is_safe_git_branch_name(value))
+        for value in ("model;bad", "model$(bad)", "model`bad`", "model|bad"):
+            self.assertFalse(is_safe_model_name(value))
+        self.assertTrue(is_safe_model_name("claude-3.5-sonnet"))
 
 
 class IdentityTests(unittest.TestCase):
@@ -127,10 +142,52 @@ class ProtocolTests(unittest.TestCase):
             {"event": "status", "message": "ok"},
         )
 
+    def test_request_mux_serializes_same_key_requests(self) -> None:
+        async def scenario() -> tuple[int, dict[str, object], dict[str, object]]:
+            mux = WebSocketRequestMux()
+            sent: list[dict[str, object]] = []
+
+            async def send_json(payload: dict[str, object]) -> None:
+                sent.append(payload)
+
+            first = asyncio.create_task(
+                mux.request(
+                    payload={"n": 1},
+                    predicate=lambda item: item.get("type") == "reply",
+                    send_json=send_json,
+                    timeout_seconds=5,
+                    request_key="same",
+                )
+            )
+            await asyncio.sleep(0)
+            second = asyncio.create_task(
+                mux.request(
+                    payload={"n": 2},
+                    predicate=lambda item: item.get("type") == "reply",
+                    send_json=send_json,
+                    timeout_seconds=5,
+                    request_key="same",
+                )
+            )
+            await asyncio.sleep(0)
+            sent_before_reply = len(sent)
+            await mux.handle_message({"type": "reply", "value": 1})
+            first_result = await first
+            await asyncio.sleep(0)
+            await mux.handle_message({"type": "reply", "value": 2})
+            second_result = await second
+            return sent_before_reply, first_result, second_result
+
+        sent_before_reply, first_result, second_result = asyncio.run(scenario())
+        self.assertEqual(1, sent_before_reply)
+        self.assertEqual(1, first_result["value"])
+        self.assertEqual(2, second_result["value"])
+
 
 class FakeSessions:
-    def __init__(self, project_path: str) -> None:
+    def __init__(self, project_path: str, provider: str = "codex") -> None:
         self.project_path = project_path
+        self.provider = provider
 
     async def infer_single_bound_session(self, user: UserRef) -> tuple[str, str | None]:
         return "sess-1", None
@@ -138,7 +195,7 @@ class FakeSessions:
     async def resolve_session_ref(self, user: UserRef, ref: str) -> tuple[dict[str, str] | None, str | None]:
         return {
             "id": "sess-1",
-            "provider": "codex",
+            "provider": self.provider,
             "projectPath": self.project_path,
         }, None
 
@@ -148,7 +205,7 @@ class FakeSessions:
     async def find_recent_session(self, session_id: str) -> dict[str, str] | None:
         return {
             "id": session_id,
-            "provider": "codex",
+            "provider": self.provider,
             "projectPath": self.project_path,
         }
 
@@ -205,6 +262,50 @@ class RunRequestTests(unittest.TestCase):
         parsed, error = asyncio.run(scenario())
         self.assertIsNone(parsed)
         self.assertIn("projectPath 不在 allowed_project_roots", error or "")
+
+    def test_run_session_target_keeps_opencode_provider(self) -> None:
+        async def scenario() -> tuple[object | None, str | None]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                allowed = Path(temp_dir)
+                settings = load_connector_settings(
+                    {
+                        "run_require_admin": False,
+                        "session_require_admin": False,
+                        "allowed_project_roots": str(allowed),
+                    }
+                )
+                builder = RunRequestBuilder(
+                    settings=settings,
+                    authz=AuthorizationPolicy(settings),
+                    sessions=FakeSessions(str(allowed / "repo"), provider="opencode"),
+                )
+                return await builder.parse(
+                    UserRef("test:u1", "User", "origin"),
+                    ["--session", "sess-1", "doit"],
+                )
+
+        parsed, error = asyncio.run(scenario())
+        self.assertIsNone(error)
+        assert parsed is not None
+        self.assertEqual("opencode", parsed.payload["provider"])
+
+
+class FormattingTests(unittest.TestCase):
+    def test_session_overview_is_clipped(self) -> None:
+        rendered = format_session_overview(
+            None,
+            [
+                {
+                    "id": "sess-1",
+                    "provider": "claude",
+                    "projectName": "x" * 1000,
+                    "summary": "y" * 1000,
+                }
+            ],
+            text_limit=240,
+        )
+        self.assertLessEqual(len(rendered), 280)
+        self.assertIn("已截断", rendered)
 
 
 class StateTests(unittest.TestCase):

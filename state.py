@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .redaction import redact_text
+    from .sanitizer import compact_json, safe_json_value, safe_text
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from redaction import redact_text
+    from sanitizer import compact_json, safe_json_value, safe_text
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
@@ -24,8 +24,6 @@ MAX_AUDIT_ITEMS = 500
 DEFAULT_MAX_RUN_HISTORY_PER_USER = 50
 DEFAULT_MAX_RUN_HISTORY_GLOBAL = 500
 MAX_STORED_TEXT = 1200
-MAX_STORED_JSON_ITEMS = 60
-MAX_STORED_JSON_DEPTH = 6
 PENDING_CLAIM_FIELDS = ("claimed_by", "claimed_action", "claimed_at")
 
 
@@ -59,7 +57,7 @@ class PendingApproval:
             request_id=request_id,
             session_id=session_id,
             tool_name=_read_str(payload.get("toolName") or payload.get("tool_name")) or "UnknownTool",
-            input_data=_safe_json_value(payload.get("input")),
+            input_data=safe_json_value(payload.get("input")),
             provider=_read_str(payload.get("provider")) or "claude",
             received_at=_parse_timestamp(payload.get("receivedAt")) or time.time(),
         )
@@ -223,11 +221,11 @@ class PluginState:
                 normalized.append(
                     {
                         "id": session_id,
-                        "provider": _safe_text(item.get("provider"), 60),
-                        "projectName": _safe_text(item.get("projectName"), 160),
-                        "projectPath": _safe_text(item.get("projectPath"), 500),
-                        "summary": _safe_text(item.get("summary"), 240),
-                        "lastActivity": _safe_text(item.get("lastActivity"), 80),
+                        "provider": safe_text(item.get("provider"), 60),
+                        "projectName": safe_text(item.get("projectName"), 160),
+                        "projectPath": safe_text(item.get("projectPath"), 500),
+                        "summary": safe_text(item.get("summary"), 240),
+                        "lastActivity": safe_text(item.get("lastActivity"), 80),
                     }
                 )
                 if len(normalized) >= max(1, min(max_items, MAX_SESSION_INDEX_ITEMS)):
@@ -521,12 +519,12 @@ class PluginState:
                 "display_name": user.display_name,
                 "origin": user.unified_msg_origin,
                 "status": "running",
-                "provider": _safe_text(payload.get("provider"), 60) or "claude",
-                "session_id": _safe_text(payload.get("sessionId"), 200),
-                "project_path": _safe_text(payload.get("projectPath"), 500),
-                "github_url": _safe_text(payload.get("githubUrl"), 500),
-                "target": _safe_text(display_target, 500),
-                "message": _safe_text(payload.get("message"), MAX_STORED_TEXT),
+                "provider": safe_text(payload.get("provider"), 60) or "claude",
+                "session_id": safe_text(payload.get("sessionId"), 200),
+                "project_path": safe_text(payload.get("projectPath"), 500),
+                "github_url": safe_text(payload.get("githubUrl"), 500),
+                "target": safe_text(display_target, 500),
+                "message": safe_text(payload.get("message"), MAX_STORED_TEXT),
                 "started_at": now,
                 "updated_at": now,
                 "finished_at": 0,
@@ -558,16 +556,16 @@ class PluginState:
                 return
             now = time.time()
             if status:
-                item["status"] = _safe_text(status, 40)
+                item["status"] = safe_text(status, 40)
             if session_id and is_valid_session_id(session_id):
                 item["session_id"] = session_id
             if summary is not None:
-                item["summary"] = _safe_json_value(summary)
+                item["summary"] = safe_json_value(summary)
             if error:
-                item["error"] = _safe_text(error, MAX_STORED_TEXT)
+                item["error"] = safe_text(error, MAX_STORED_TEXT)
             if event:
                 log = _read_dict_list(item.get("log"))
-                log.append({"ts": now, "text": _safe_text(event, MAX_STORED_TEXT)})
+                log.append({"ts": now, "text": safe_text(event, MAX_STORED_TEXT)})
                 item["log"] = log[-MAX_RUN_LOG_ITEMS:]
             if finished:
                 item["finished_at"] = now
@@ -622,7 +620,7 @@ class PluginState:
                 item["updated_at"] = now
                 item["finished_at"] = now
                 log = _read_dict_list(item.get("log"))
-                log.append({"ts": now, "text": _safe_text(reason, MAX_STORED_TEXT)})
+                log.append({"ts": now, "text": safe_text(reason, MAX_STORED_TEXT)})
                 item["log"] = log[-MAX_RUN_LOG_ITEMS:]
                 changed += 1
             if changed:
@@ -646,14 +644,14 @@ class PluginState:
                     "ts": time.time(),
                     "user_key": user.user_key if user else "system",
                     "display_name": user.display_name if user else "system",
-                    "action": _safe_text(action, 40),
-                    "result": _safe_text(result, 80),
+                    "action": safe_text(action, 40),
+                    "result": safe_text(result, 80),
                     "request_id": approval.request_id,
                     "session_id": approval.session_id,
                     "tool_name": approval.tool_name,
                     "provider": approval.provider,
-                    "reason": _safe_text(reason, 500),
-                    "input_summary": _safe_text(_compact_json(approval.input_data), 500),
+                    "reason": safe_text(reason, 500),
+                    "input_summary": safe_text(compact_json(approval.input_data), 500),
                 }
             )
             self._data["audit"] = audit[-MAX_AUDIT_ITEMS:]
@@ -732,8 +730,8 @@ class PluginState:
         claimed_by = _read_str(item.get("claimed_by")) if isinstance(item, dict) else ""
         if claimed_by:
             return None, "该审批请求正在被处理，请稍后执行 /cloudcli pending 刷新。"
-        item["claimed_by"] = _safe_text(actor, 200)
-        item["claimed_action"] = _safe_text(action, 40)
+        item["claimed_by"] = safe_text(actor, 200)
+        item["claimed_action"] = safe_text(action, 40)
         item["claimed_at"] = time.time()
         pending[key] = item
         self._data["pending"] = pending
@@ -778,9 +776,9 @@ class PluginState:
         record = {
             "request_id": approval.request_id,
             "session_id": approval.session_id,
-            "tool_name": _safe_text(approval.tool_name, 120) or "UnknownTool",
-            "input_data": _safe_json_value(approval.input_data),
-            "provider": _safe_text(approval.provider, 60) or "claude",
+            "tool_name": safe_text(approval.tool_name, 120) or "UnknownTool",
+            "input_data": safe_json_value(approval.input_data),
+            "provider": safe_text(approval.provider, 60) or "claude",
             "received_at": approval.received_at or time.time(),
             "resolved": False,
         }
@@ -922,84 +920,6 @@ def _read_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
-
-
-def _safe_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
-    if value is None:
-        return ""
-    text = value if isinstance(value, str) else str(value)
-    text = "".join(char for char in text if ord(char) >= 32 or char in "\n\t")
-    text = redact_text(text, limit)
-    if len(text) > limit:
-        return text[: max(0, limit - 20)] + "...[truncated]"
-    return text
-
-
-def _safe_json_value(value: Any, depth: int = 0) -> Any:
-    if depth >= MAX_STORED_JSON_DEPTH:
-        return _safe_text(value, MAX_STORED_TEXT)
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    if isinstance(value, str):
-        return _safe_text(value, MAX_STORED_TEXT)
-    if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for index, (key, item) in enumerate(value.items()):
-            if index >= MAX_STORED_JSON_ITEMS:
-                result["...[truncated]"] = len(value) - MAX_STORED_JSON_ITEMS
-                break
-            safe_key = _safe_text(key, 120)
-            if _is_sensitive_key(safe_key):
-                result[safe_key] = "[redacted]"
-            else:
-                result[safe_key] = _safe_json_value(item, depth + 1)
-        return result
-    if isinstance(value, (list, tuple)):
-        result = [
-            _safe_json_value(item, depth + 1)
-            for item in list(value)[:MAX_STORED_JSON_ITEMS]
-        ]
-        if len(value) > MAX_STORED_JSON_ITEMS:
-            result.append(f"...[truncated {len(value) - MAX_STORED_JSON_ITEMS} items]")
-        return result
-    try:
-        json.dumps(value, ensure_ascii=False)
-        return value
-    except TypeError:
-        return _safe_text(value)
-
-
-def _compact_json(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
-    except TypeError:
-        return str(value)
-
-
-def _is_sensitive_key(value: str) -> bool:
-    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", value)
-    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
-    if not normalized:
-        return False
-    parts = {part for part in normalized.split("_") if part}
-    compact = normalized.replace("_", "")
-    if compact in {"authorization", "apikey", "xapikey", "bearertoken"}:
-        return True
-    if parts & {"token", "password", "passwd", "secret", "credential", "credentials"}:
-        return True
-    if "api" in parts and "key" in parts:
-        return True
-    if "private" in parts and "key" in parts:
-        return True
-    if "access" in parts and "key" in parts:
-        return True
-    if "refresh" in parts and "key" in parts:
-        return True
-    return False
 
 
 def _parse_timestamp(value: Any) -> float:

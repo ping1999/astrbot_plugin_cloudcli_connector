@@ -6,6 +6,8 @@ from urllib.parse import urlsplit
 
 _GITHUB_REPO_PATH_RE = re.compile(r"^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$")
 _GITHUB_SSH_RE = re.compile(r"^git@github\.com:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$")
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:-]+$")
+_BRANCH_SAFE_CHARS_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 
 def has_control_chars(value: str) -> bool:
@@ -41,8 +43,16 @@ def is_safe_short_value(value: str, max_len: int) -> bool:
     return not any(char.isspace() for char in value)
 
 
+def is_safe_model_name(value: str) -> bool:
+    if not is_safe_short_value(value, 120):
+        return False
+    return bool(_MODEL_NAME_RE.fullmatch(value))
+
+
 def is_safe_git_branch_name(value: str) -> bool:
     if not is_safe_short_value(value, 120):
+        return False
+    if not _BRANCH_SAFE_CHARS_RE.fullmatch(value):
         return False
     forbidden_chars = set("~^:?*[\\")
     if any(char in forbidden_chars for char in value):

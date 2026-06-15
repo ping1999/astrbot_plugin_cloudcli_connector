@@ -18,6 +18,7 @@ try:
         iter_sse,
         redact_error_text,
     )
+    from .cloudcli_transport import WaiterPredicate, WebSocketRequestMux
     from .state import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli_protocol import (
@@ -27,6 +28,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         iter_sse,
         redact_error_text,
     )
+    from cloudcli_transport import WaiterPredicate, WebSocketRequestMux
     from state import PendingApproval
 
 
@@ -53,7 +55,6 @@ class CloudCLIConfig:
     agent_idle_timeout_seconds: int = 120
 
 
-WaiterPredicate = Callable[[dict[str, Any]], bool]
 PermissionCallback = Callable[[PendingApproval], Awaitable[None]]
 
 
@@ -70,7 +71,7 @@ class CloudCLIClient:
         self._reader_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
-        self._waiters: list[tuple[WaiterPredicate, asyncio.Future]] = []
+        self._mux = WebSocketRequestMux()
         self._cached_token = config.jwt_token.strip()
 
     async def close(self) -> None:
@@ -87,7 +88,7 @@ class CloudCLIClient:
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
-        self._fail_waiters(CloudCLIError("CloudCLI connection closed."))
+        self._mux.fail_waiters(CloudCLIError("CloudCLI connection closed."))
 
     async def ensure_connected(self) -> None:
         async with self._connect_lock:
@@ -100,6 +101,7 @@ class CloudCLIClient:
         response = await self._request(
             {"type": "get-active-sessions"},
             lambda item: item.get("type") == "active-sessions",
+            request_key="active-sessions",
         )
         return response
 
@@ -253,6 +255,7 @@ class CloudCLIClient:
             {"type": "get-pending-permissions", "sessionId": session_id},
             lambda item: item.get("type") == "pending-permissions-response"
             and item.get("sessionId") == session_id,
+            request_key=f"pending-permissions:{session_id}",
         )
 
         raw_items = response.get("data")
@@ -425,24 +428,20 @@ class CloudCLIClient:
         self,
         payload: dict[str, Any],
         predicate: WaiterPredicate,
+        *,
+        request_key: str = "",
     ) -> dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        self._waiters.append((predicate, future))
+        await self.ensure_connected()
         try:
-            await self._send_json(payload)
-            return await asyncio.wait_for(
-                future,
-                timeout=max(2, self.config.timeout_seconds),
+            return await self._mux.request(
+                payload=payload,
+                predicate=predicate,
+                send_json=self._send_json,
+                timeout_seconds=self.config.timeout_seconds,
+                request_key=request_key,
             )
         except asyncio.TimeoutError as exc:
             raise CloudCLITimeout("等待 CloudCLI 响应超时。") from exc
-        finally:
-            self._waiters = [
-                (match, waiter)
-                for match, waiter in self._waiters
-                if waiter is not future
-            ]
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         if not self._ws or self._ws.closed:
@@ -480,29 +479,13 @@ class CloudCLIClient:
             if self._ws is ws:
                 self._ws = None
                 if disconnect_error is not None:
-                    self._fail_waiters(disconnect_error)
+                    self._mux.fail_waiters(disconnect_error)
 
     async def _handle_message(self, data: Any) -> None:
         if not isinstance(data, dict):
             return
 
-        matched_waiters: list[asyncio.Future] = []
-        for predicate, future in list(self._waiters):
-            if future.done():
-                continue
-            try:
-                if predicate(data):
-                    future.set_result(data)
-                    matched_waiters.append(future)
-            except Exception as exc:  # noqa: BLE001
-                future.set_exception(exc)
-                matched_waiters.append(future)
-        if matched_waiters:
-            self._waiters = [
-                (match, future)
-                for match, future in self._waiters
-                if future not in matched_waiters
-            ]
+        await self._mux.handle_message(data)
 
         approval = self._extract_permission_request(data)
         if approval:
@@ -518,12 +501,6 @@ class CloudCLIClient:
             if not has_shape:
                 return None
         return PendingApproval.from_cloudcli(data)
-
-    def _fail_waiters(self, exc: Exception) -> None:
-        for _, future in self._waiters:
-            if not future.done():
-                future.set_exception(exc)
-        self._waiters = []
 
     def _api_url(self, path: str) -> str:
         return build_api_url(self.config.base_url, path)

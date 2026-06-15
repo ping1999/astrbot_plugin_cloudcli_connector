@@ -265,7 +265,12 @@ class CloudCLIConnectorPlugin(Star):
             if recent_error:
                 return f"获取 CloudCLI 最近 session 失败：{recent_error}"
 
-        body = format_session_overview(active_payload, recent_sessions, recent_error)
+        body = format_session_overview(
+            active_payload,
+            recent_sessions,
+            recent_error,
+            self._max_push_text_length(),
+        )
         if active_error:
             return f"获取 CloudCLI 活跃 session 失败，以下为最近可绑定 session：{active_error}\n\n{body}"
         return body

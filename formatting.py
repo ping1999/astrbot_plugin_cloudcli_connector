@@ -31,7 +31,7 @@ HELP_TEXT = """CloudCLI Connector 指令：
 /cloudcli audit [数量]：查看审批审计记录
 /cloudcli whoami：查看当前 AstrBot 用户标识，用于配置审批白名单
 
-run 选项：--project <path>、--github <url>、--session <sessionId>、--provider <claude|cursor|codex|gemini>、--model <model>、--branch <name>、--pr、--no-cleanup
+run 选项：--project <path>、--github <url>、--session <sessionId>、--provider <claude|cursor|codex|gemini|opencode>、--model <model>、--branch <name>、--pr、--no-cleanup
 """
 
 
@@ -69,6 +69,7 @@ def format_session_overview(
     active_payload: Any | None,
     recent_sessions: list[dict[str, Any]],
     recent_error: str = "",
+    text_limit: int = 1800,
 ) -> str:
     lines: list[str] = []
     if active_payload is not None:
@@ -89,7 +90,7 @@ def format_session_overview(
             lines.append(f"{index}. {rendered}")
     lines.append("")
     lines.append("绑定示例：/cloudcli bind 1、/cloudcli bind last 或 /cloudcli bind <sessionId>")
-    return "\n".join(lines)
+    return clip_text("\n".join(lines), text_limit)
 
 
 def format_health_report(report: dict[str, Any]) -> str:
@@ -332,9 +333,9 @@ def _normalize_session_items(items: Any) -> list[str]:
 def _render_recent_session(item: dict[str, Any]) -> str:
     session_id = item.get("id") or item.get("sessionId") or item.get("session_id")
     provider = item.get("provider") or "unknown"
-    project = item.get("projectName") or item.get("projectPath") or ""
-    summary = item.get("summary") or ""
-    last_activity = item.get("lastActivity") or ""
+    project = clip_text(str(item.get("projectName") or item.get("projectPath") or ""), 180)
+    summary = str(item.get("summary") or "")
+    last_activity = clip_text(str(item.get("lastActivity") or ""), 80)
     message_count = item.get("messageCount")
 
     parts = [f"{session_id} [{provider}]"]

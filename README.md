@@ -40,7 +40,7 @@
 - `/cloudcli run --project "D:\work\repo" --provider codex 检查测试失败原因`
 - `/cloudcli run --github https://github.com/user/repo --branch fix-bug --pr 修复鉴权 bug`
 
-可用选项：`--project <path>`、`--github <url>`、`--session <sessionId>`、`--provider <claude|cursor|codex|gemini>`、`--model <model>`、`--branch <name>`、`--pr`、`--no-cleanup`。
+可用选项：`--project <path>`、`--github <url>`、`--session <sessionId>`、`--provider <claude|cursor|codex|gemini|opencode>`、`--model <model>`、`--branch <name>`、`--pr`、`--no-cleanup`。
 
 每个 `/cloudcli run` 会生成任务编号，可用 `/cloudcli run list` 查看，`/cloudcli run log <任务编号>` 查看状态日志，`/cloudcli run cancel <任务编号>` 取消本地任务并尽量中止关联的 CloudCLI session。
 

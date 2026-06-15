@@ -46,6 +46,10 @@ TrackTask = Callable[[asyncio.Task], None]
 logger = logging.getLogger(__name__)
 
 
+class _RunCancelledByUser(Exception):
+    pass
+
+
 class RunService:
     def __init__(
         self,
@@ -66,6 +70,7 @@ class RunService:
         self.send_proactive = send_proactive
         self.track_task = track_task
         self.run_tasks_by_id: dict[str, asyncio.Task] = {}
+        self.cancel_requested_run_ids: set[str] = set()
 
     async def handle_run(self, user: UserRef, args: list[str]) -> str:
         if args and args[0] in {"list", "log", "cancel"}:
@@ -140,12 +145,22 @@ class RunService:
                 return f"任务 #{run_id} 已经是 {status} 状态。"
 
             local_task = self.run_tasks_by_id.get(run_id)
+            abort_message = ""
+            session_id = str(task.get("session_id") or "")
+            has_session_id = bool(session_id and is_valid_session_id(session_id))
+            if local_task and not local_task.done() and not has_session_id:
+                self.cancel_requested_run_ids.add(run_id)
+                await self.state.update_run_task(
+                    run_id,
+                    status="cancelling",
+                    event="用户请求取消，等待 CloudCLI sessionId 后中止远端任务。",
+                )
+                return f"已请求取消 CloudCLI 任务 #{run_id}，正在等待 CloudCLI sessionId。"
+
             if local_task and not local_task.done():
                 local_task.cancel()
 
-            abort_message = ""
-            session_id = str(task.get("session_id") or "")
-            if session_id and is_valid_session_id(session_id):
+            if has_session_id:
                 try:
                     await self.client.abort_session(session_id, str(task.get("provider") or ""))
                     abort_message = f"\n已向 CloudCLI 发送中止 session 请求：{session_id}"
@@ -182,6 +197,16 @@ class RunService:
         last_status = ""
         last_status_at = 0.0
 
+        async def finish_as_cancelled(message: str) -> None:
+            await self.state.update_run_task(
+                run_id,
+                status="cancelled",
+                event=message,
+                finished=True,
+            )
+            await self._prune_history()
+            await self.send_proactive(unified_msg_origin, message)
+
         async def consume_stream() -> None:
             nonlocal assistant_text
             nonlocal assistant_text_truncated
@@ -194,6 +219,11 @@ class RunService:
                 self.merge_agent_event(summary, event)
                 if summary.get("sessionId"):
                     await self.state.update_run_task(run_id, session_id=str(summary["sessionId"]))
+                    if run_id in self.cancel_requested_run_ids:
+                        message = "用户取消任务。"
+                        message += await self.abort_run_session(summary, payload)
+                        await finish_as_cancelled(message)
+                        raise _RunCancelledByUser()
 
                 if event_type in {"done", "complete"}:
                     break
@@ -235,6 +265,12 @@ class RunService:
             else:
                 await consume_stream()
 
+            if run_id in self.cancel_requested_run_ids:
+                message = "用户取消任务。"
+                message += await self.abort_run_session(summary, payload)
+                await finish_as_cancelled(message)
+                return
+
             if assistant_text:
                 summary["assistantText"] = assistant_text.strip()
                 if assistant_text_truncated:
@@ -249,6 +285,8 @@ class RunService:
             )
             await self._prune_history()
             await self.send_proactive(unified_msg_origin, final_text)
+        except _RunCancelledByUser:
+            return
         except asyncio.TimeoutError:
             message = f"CloudCLI 任务超过最大运行时间 {max_duration} 秒，已停止等待。"
             message += await self.abort_run_session(summary, payload)
@@ -293,6 +331,8 @@ class RunService:
             )
             await self._prune_history()
             await self.send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{exc}")
+        finally:
+            self.cancel_requested_run_ids.discard(run_id)
 
     async def abort_run_session(self, summary: dict[str, Any], payload: dict[str, Any]) -> str:
         session_id = str(summary.get("sessionId") or payload.get("sessionId") or "")

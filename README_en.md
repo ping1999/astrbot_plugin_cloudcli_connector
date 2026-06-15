@@ -38,7 +38,7 @@ AstrBot plugin for viewing CloudCLI running and recently bindable sessions, and 
 - `/cloudcli run --project "D:\work\repo" --provider codex Inspect the failing tests`
 - `/cloudcli run --github https://github.com/user/repo --branch fix-bug --pr Fix the auth bug`
 
-Options: `--project <path>`, `--github <url>`, `--session <sessionId>`, `--provider <claude|cursor|codex|gemini>`, `--model <model>`, `--branch <name>`, `--pr`, `--no-cleanup`.
+Options: `--project <path>`, `--github <url>`, `--session <sessionId>`, `--provider <claude|cursor|codex|gemini|opencode>`, `--model <model>`, `--branch <name>`, `--pr`, `--no-cleanup`.
 
 Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run log <taskId>`, and `/cloudcli run cancel <taskId>` to inspect or cancel tasks.
 
