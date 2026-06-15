@@ -19,6 +19,7 @@ try:
         format_run_tasks,
     )
     from .identity import missing_identity_message
+    from .redaction import redact_exception_text, redact_text
     from .run_requests import RunRequestBuilder
     from .runtime import RunQuota
     from .state import PluginState, UserRef, is_valid_session_id
@@ -36,6 +37,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         format_run_tasks,
     )
     from identity import missing_identity_message
+    from redaction import redact_exception_text, redact_text
     from run_requests import RunRequestBuilder
     from runtime import RunQuota
     from state import PluginState, UserRef, is_valid_session_id
@@ -321,16 +323,20 @@ class RunService:
             await self._prune_history()
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.exception("CloudCLI agent background task failed")
+            safe_error = redact_text(str(exc))
+            logger.error(
+                "CloudCLI agent background task failed:\n%s",
+                redact_exception_text(exc),
+            )
             await self.state.update_run_task(
                 run_id,
                 status="failed",
-                event=f"CloudCLI 任务异常：{exc}",
-                error=str(exc),
+                event=f"CloudCLI 任务异常：{safe_error}",
+                error=safe_error,
                 finished=True,
             )
             await self._prune_history()
-            await self.send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{exc}")
+            await self.send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{safe_error}")
         finally:
             self.cancel_requested_run_ids.discard(run_id)
 

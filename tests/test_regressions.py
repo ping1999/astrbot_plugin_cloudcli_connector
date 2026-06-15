@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from authz import AuthorizationPolicy
+from approval_notifications import ApprovalNotificationPolicy
+from approval_service import ApprovalService
 from cloudcli_client import CloudCLIClient, CloudCLIConfig
+from cloudcli_client import CloudCLIError
 from cloudcli_protocol import build_ws_url, parse_sse_event
 from cloudcli_transport import WebSocketRequestMux
 from config import load_connector_settings
 from identity import build_user_ref
+from redaction import redact_exception_text
 from run_requests import RunRequestBuilder
 from formatting import format_session_overview
 from run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
@@ -309,6 +314,103 @@ class FormattingTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_legacy_single_origin_state_migrates_to_scoped_data(self) -> None:
+        async def scenario() -> tuple[list[str], bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "users": {
+                                "test:u1": {
+                                    "origins": ["origin"],
+                                    "bindings": ["sess-1"],
+                                    "session_index": [
+                                        {
+                                            "id": "sess-1",
+                                            "provider": "codex",
+                                            "projectPath": "C:/repo",
+                                        }
+                                    ],
+                                    "session_index_at": 1,
+                                }
+                            },
+                            "pending": {},
+                            "runs": {},
+                            "audit": [],
+                            "next_run_id": 1,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                indexed = await state.find_session_index_item(user, "sess-1")
+                return await state.list_bindings(user), indexed is not None
+
+        bindings, has_index = asyncio.run(scenario())
+        self.assertEqual(["sess-1"], bindings)
+        self.assertTrue(has_index)
+
+    def test_bindings_pending_runs_and_audit_are_origin_scoped(self) -> None:
+        async def scenario() -> tuple[list[str], int, int, int, bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                private_user = UserRef("test:u1", "User", "private-origin")
+                group_user = UserRef("test:u1", "User", "group-origin")
+                await state.bind_session(private_user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+                await state.create_run_task(
+                    private_user,
+                    {"provider": "codex", "projectPath": "C:/repo", "message": "doit"},
+                    "C:/repo",
+                )
+                await state.append_audit(
+                    user=private_user,
+                    action="allow",
+                    approval=PendingApproval("request-2", "sess-1", "Tool", {}),
+                )
+                await state.remember_session_index(
+                    private_user,
+                    [{"id": "sess-1", "provider": "codex", "projectPath": "C:/repo"}],
+                )
+                indexed = await state.find_session_index_item(group_user, "sess-1")
+                return (
+                    await state.list_bindings(group_user),
+                    len(await state.visible_pending_for_user(group_user, 10)),
+                    len(await state.list_run_tasks(group_user, 10)),
+                    len(await state.list_audit(group_user, 10)),
+                    indexed is None,
+                )
+
+        bindings, pending_count, run_count, audit_count, index_isolated = asyncio.run(scenario())
+        self.assertEqual([], bindings)
+        self.assertEqual(0, pending_count)
+        self.assertEqual(0, run_count)
+        self.assertEqual(0, audit_count)
+        self.assertTrue(index_isolated)
+
+    def test_unbind_removes_only_current_origin_binding(self) -> None:
+        async def scenario() -> tuple[list[str], list[str]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                private_user = UserRef("test:u1", "User", "private-origin")
+                group_user = UserRef("test:u1", "User", "group-origin")
+                await state.bind_session(private_user, "sess-1", 10)
+                await state.bind_session(group_user, "sess-1", 10)
+                await state.unbind_session(group_user, "sess-1")
+                return await state.list_bindings(private_user), await state.list_bindings(group_user)
+
+        private_bindings, group_bindings = asyncio.run(scenario())
+        self.assertEqual(["sess-1"], private_bindings)
+        self.assertEqual([], group_bindings)
+
     def test_pending_input_redacts_common_secret_key_shapes(self) -> None:
         async def scenario() -> dict[str, object]:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -495,6 +597,116 @@ class CloudCLIClientTests(unittest.TestCase):
             return getattr(session, "connected_url", "")
 
         self.assertEqual("ws://127.0.0.1:3001/ws", asyncio.run(scenario()))
+
+    def test_supervisor_reconnects_after_websocket_disconnect(self) -> None:
+        class FakeWebSocket:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(0)
+                raise StopAsyncIteration
+
+            async def close(self) -> None:
+                self.closed = True
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                return None
+
+        class FakeSession:
+            closed = False
+
+            def __init__(self) -> None:
+                self.connect_count = 0
+
+            async def ws_connect(self, url: str, heartbeat: int):
+                self.connect_count += 1
+                return FakeWebSocket()
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class TestClient(CloudCLIClient):
+            reconnect_initial_seconds = 0.01
+            reconnect_max_seconds = 0.02
+
+            async def _ensure_http_session(self) -> None:
+                if self._session is None:
+                    self._session = FakeSession()  # type: ignore[assignment]
+
+        async def scenario() -> int:
+            client = TestClient(
+                CloudCLIConfig(
+                    base_url="http://127.0.0.1:3001",
+                    allow_unauthenticated_ws=True,
+                ),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            client.start(auto_connect=True)
+            for _ in range(100):
+                session = client._session
+                if getattr(session, "connect_count", 0) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            session = client._session
+            count = getattr(session, "connect_count", 0)
+            await client.close()
+            return count
+
+        self.assertGreaterEqual(asyncio.run(scenario()), 2)
+
+
+class ApprovalServiceTests(unittest.TestCase):
+    def test_decision_is_blocked_when_pending_refresh_fails(self) -> None:
+        class FailingClient:
+            decision_sent = False
+
+            async def get_pending_permissions(self, session_id: str):
+                raise CloudCLIError("temporary failure")
+
+            async def send_permission_decision(self, *args, **kwargs) -> None:
+                self.decision_sent = True
+
+        async def scenario() -> tuple[str, bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = load_connector_settings({})
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin", is_admin=True)
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+                client = FailingClient()
+                service = ApprovalService(
+                    settings=settings,
+                    state=state,
+                    client=client,  # type: ignore[arg-type]
+                    notifications=ApprovalNotificationPolicy(
+                        approval_allowed_user_keys=frozenset(),
+                        approval_require_admin=True,
+                    ),
+                    send_proactive=lambda _origin, _text: asyncio.sleep(0),
+                    track_task=lambda _task: None,
+                )
+                result = await service.handle_allow(user, [])
+                return result, client.decision_sent
+
+        result, decision_sent = asyncio.run(scenario())
+        self.assertIn("同步 CloudCLI 待审批权限失败", result)
+        self.assertFalse(decision_sent)
+
+
+class RedactionTests(unittest.TestCase):
+    def test_exception_traceback_is_redacted(self) -> None:
+        try:
+            raise ValueError("client_secret=secret-value token=token-value")
+        except ValueError as exc:
+            rendered = redact_exception_text(exc)
+        self.assertNotIn("secret-value", rendered)
+        self.assertNotIn("token-value", rendered)
 
 
 if __name__ == "__main__":

@@ -56,6 +56,8 @@
 - `/cloudcli run` 使用 CloudCLI 的外部 agent API，需要在 `cloudcli_api_key` 填写 CloudCLI UI 中 Settings → API & Tokens 生成的 API Key。
 - 如果 CloudCLI 启动时设置了全局 `API_KEY`，受保护接口也需要配置 `cloudcli_api_key`。
 - 用户只会收到自己已绑定 session 的主动审批推送。
+- session 绑定、序号缓存、审批列表、审计记录和任务日志默认按当前聊天会话隔离；同一用户在私聊中的绑定不会自动出现在群聊中。
+- WebSocket 断开后插件会自动退避重连，避免 CloudCLI 重启或短暂网络抖动后审批推送长期失效。
 - 默认只有 AstrBot 管理员或 `session_allowed_user_keys` 白名单用户可以查看、绑定、读取和中止 CloudCLI session。
 - 默认只有 AstrBot 管理员或 `run_allowed_user_keys` 白名单用户可以使用 `/cloudcli run` 发起 agent 任务。
 - 非管理员使用 `/cloudcli run --project` 时建议配置 `allowed_project_roots`，否则默认会拒绝访问本地任意目录。
@@ -63,6 +65,7 @@
 - 默认只有 AstrBot 管理员或 `approval_allowed_user_keys` 白名单用户可以查看、接收和处理审批请求。
 - 为避免历史管理员状态失效导致敏感审批内容误推，主动审批详情只会推送到绑定该 session 的聊天会话，并且在 `approval_require_admin=true` 时只主动推给 `approval_allowed_user_keys` 中的用户；管理员仍可主动执行 `/cloudcli pending` 查看并处理。
 - `/cloudcli pending` 会按 CloudCLI 当前返回结果刷新本地待审批缓存，已不存在的审批会从本地清理。
+- `/cloudcli allow` 和 `/cloudcli deny` 在同步待审批列表失败时不会使用旧缓存继续决策。
 - 审批超时默认只提醒，不会自动允许。只有把 `approval_timeout_action` 设置为 `deny` 时才会自动拒绝。
 
 ## CloudCLI 配置

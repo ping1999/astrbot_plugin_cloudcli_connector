@@ -54,6 +54,8 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - `/cloudcli run` uses CloudCLI's external agent API, so `cloudcli_api_key` must contain an API key generated in CloudCLI Settings → API & Tokens.
 - If CloudCLI is started with a global `API_KEY`, protected endpoints also need `cloudcli_api_key`.
 - Users only receive push notifications for sessions they have bound.
+- Session bindings, session indexes, pending approvals, audit entries, and run logs are scoped to the current chat origin by default. A private-chat binding is not automatically visible in a group chat for the same user.
+- The WebSocket connection is supervised and reconnects with backoff after CloudCLI restarts or transient network failures.
 - By default, only AstrBot admins or users in `session_allowed_user_keys` can list, bind, read, or stop CloudCLI sessions.
 - By default, only AstrBot admins or users in `run_allowed_user_keys` can start `/cloudcli run` agent tasks.
 - For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
@@ -61,6 +63,7 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
 - To avoid leaking sensitive approval input through stale stored admin state, proactive approval detail pushes only go to the chat origin that bound that session. When `approval_require_admin=true`, detailed proactive pushes are sent only to users in `approval_allowed_user_keys`; admins can still run `/cloudcli pending` to view and handle requests.
 - `/cloudcli pending` refreshes the local pending approval cache from CloudCLI and removes approvals that no longer exist upstream.
+- `/cloudcli allow` and `/cloudcli deny` stop when the pending approval refresh fails instead of acting on stale cache.
 - Approval timeout defaults to reminders only. Automatic denial happens only when `approval_timeout_action` is set to `deny`.
 
 ## CloudCLI setup

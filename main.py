@@ -30,6 +30,7 @@ try:
         format_session_overview,
     )
     from .identity import build_user_ref, missing_identity_message
+    from .redaction import redact_exception_text, redact_text
     from .run_requests import RunRequestBuilder
     from .run_service import RunService
     from .session_resolver import SessionResolver
@@ -62,6 +63,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         format_session_overview,
     )
     from identity import build_user_ref, missing_identity_message
+    from redaction import redact_exception_text, redact_text
     from run_requests import RunRequestBuilder
     from run_service import RunService
     from session_resolver import SessionResolver
@@ -79,7 +81,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     PLUGIN_NAME,
     "Codex",
     "Connect AstrBot commands to CloudCLI sessions and permission approvals.",
-    "0.3.0",
+    "0.4.0",
 )
 class CloudCLIConnectorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
@@ -131,9 +133,6 @@ class CloudCLIConnectorPlugin(Star):
             send_proactive=self._send_proactive,
             track_task=self._track_task,
         )
-        self._run_tasks_by_id = self.run_service.run_tasks_by_id
-        self._approval_timeout_tasks = self.approval_service.timeout_tasks
-
     async def initialize(self) -> None:
         await self.state.load()
         interrupted = await self.state.mark_interrupted_runs(
@@ -142,9 +141,7 @@ class CloudCLIConnectorPlugin(Star):
         if interrupted:
             logger.info("Marked %s CloudCLI run task(s) as interrupted.", interrupted)
         await self.approval_service.restore_timeouts()
-        if self.settings.auto_connect:
-            task = asyncio.create_task(self._warm_connect())
-            self._track_task(task)
+        self.client.start(auto_connect=self.settings.auto_connect)
 
     async def terminate(self) -> None:
         for task in list(self._background_tasks):
@@ -165,8 +162,8 @@ class CloudCLIConnectorPlugin(Star):
             parsed = parse_command(event.get_message_str() or event.message_str or "")
             text = await self._dispatch(parsed, user)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("CloudCLI connector command failed")
-            text = f"CloudCLI 插件处理失败：{exc}"
+            logger.error("CloudCLI connector command failed:\n%s", redact_exception_text(exc))
+            text = f"CloudCLI 插件处理失败：{redact_text(str(exc))}"
         yield event.plain_result(text)
 
     async def _dispatch(self, command: ParsedCommand, user: UserRef) -> str:
@@ -227,8 +224,8 @@ class CloudCLIConnectorPlugin(Star):
         try:
             return format_health_report(await self.client.health_check())
         except Exception as exc:  # noqa: BLE001
-            logger.exception("CloudCLI status check failed")
-            return f"检查 CloudCLI 状态失败：{exc}"
+            logger.error("CloudCLI status check failed:\n%s", redact_exception_text(exc))
+            return f"检查 CloudCLI 状态失败：{redact_text(str(exc))}"
 
     async def _handle_session(self, user: UserRef) -> str:
         decision = self.authz.can_access_sessions(user)
@@ -366,9 +363,6 @@ class CloudCLIConnectorPlugin(Star):
             return decision.message
         return await self.run_service.handle_run(user, args)
 
-    async def _handle_run_control(self, user: UserRef, args: list[str]) -> str:
-        return await self.run_service.handle_run_control(user, args)
-
     async def _handle_pending(self, user: UserRef) -> str:
         approval_error = self._approval_permission_error(user)
         if approval_error:
@@ -418,50 +412,9 @@ class CloudCLIConnectorPlugin(Star):
             return approval_error
         return await self.approval_service.handle_audit(user, args)
 
-    async def _resolve_approval(
-        self,
-        user: UserRef,
-        request_no: int | None,
-    ) -> tuple[PendingApproval | None, str | None]:
-        bindings = await self.state.list_bindings(user)
-        if not bindings:
-            return None, "当前用户没有绑定 session，请先使用 /cloudcli bind <sessionId>。"
-        await self.approval_service.refresh_pending_for_bindings(bindings)
-        return await self.state.resolve_visible_request(
-            user,
-            request_no,
-            self.settings.max_pending_display,
-        )
-
     def _approval_permission_error(self, user: UserRef) -> str:
         decision = self.authz.can_manage_approvals(user)
         return "" if decision.allowed else decision.message
-
-    def _schedule_approval_timeout(self, approval: PendingApproval) -> None:
-        self.approval_service.schedule_timeout(approval)
-
-    def _cancel_approval_timeout(self, approval: PendingApproval | str) -> None:
-        self.approval_service.cancel_timeout(approval)
-
-    async def _approval_timeout_worker(self, session_id: str, request_id: str, timeout_seconds: int) -> None:
-        await self.approval_service._timeout_worker(
-            session_id,
-            request_id,
-            timeout_seconds,
-            timeout_seconds,
-        )
-
-    async def _refresh_pending_for_bindings(self, bindings: list[str]) -> str:
-        return await self.approval_service.refresh_pending_for_bindings(bindings)
-
-    async def _run_agent_background(self, run_id: str, unified_msg_origin: str, payload: dict[str, Any]) -> None:
-        await self.run_service._run_agent_background(run_id, unified_msg_origin, payload)
-
-    async def _abort_run_session(self, summary: dict[str, Any], payload: dict[str, Any]) -> str:
-        return await self.run_service.abort_run_session(summary, payload)
-
-    def _merge_agent_event(self, summary: dict[str, Any], event: dict[str, Any]) -> None:
-        self.run_service.merge_agent_event(summary, event)
 
     async def _on_permission_request(self, approval: PendingApproval) -> None:
         await self.approval_service.on_permission_request(approval)
@@ -482,26 +435,17 @@ class CloudCLIConnectorPlugin(Star):
                 await platform.send_by_session(session, chain)
                 return
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to push CloudCLI approval to %s: %s", unified_msg_origin, exc)
+                logger.warning(
+                    "Failed to push CloudCLI approval to %s: %s",
+                    unified_msg_origin,
+                    redact_text(str(exc)),
+                )
                 return
         logger.warning("No platform instance found for %s", unified_msg_origin)
-
-    def _approval_detail_targets(self, targets: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
-        return self.approval_notifications.plan(targets).detailed_targets
-
-    async def _warm_connect(self) -> None:
-        try:
-            await self.client.ensure_connected()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("CloudCLI auto connect failed: %s", exc)
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
-
-    def _on_run_task_done(self, run_id: str, user_key: str) -> None:
-        self._run_tasks_by_id.pop(run_id, None)
-        self.run_quota.release(user_key)
 
     def _max_push_text_length(self) -> int:
         return self.settings.max_push_text_length

@@ -68,7 +68,7 @@ class PluginState:
         self.path = path
         self._lock = asyncio.Lock()
         self._data: dict[str, Any] = {
-            "version": 2,
+            "version": 3,
             "users": {},
             "pending": {},
             "runs": {},
@@ -85,7 +85,7 @@ class PluginState:
             try:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
-                    self._data["version"] = 2
+                    self._data["version"] = 3
                     self._data["users"] = _read_dict(loaded.get("users"))
                     self._data["pending"] = _normalize_pending_records(_read_dict(loaded.get("pending")))
                     self._data["runs"] = _read_dict(loaded.get("runs"))
@@ -101,7 +101,7 @@ class PluginState:
                 except OSError:
                     pass
                 self._data = {
-                    "version": 2,
+                    "version": 3,
                     "users": {},
                     "pending": {},
                     "runs": {},
@@ -115,8 +115,9 @@ class PluginState:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
             origins = _read_list(entry.get("origins"))
-            if user.unified_msg_origin not in origins:
-                origins.append(user.unified_msg_origin)
+            origin = _origin_key(user)
+            if origin not in origins:
+                origins.append(origin)
             entry["origins"] = origins[-5:]
             entry["last_seen_at"] = time.time()
             await self._save_locked()
@@ -135,14 +136,15 @@ class PluginState:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
             origins = _read_list(entry.get("origins"))
-            if user.unified_msg_origin not in origins:
-                origins.append(user.unified_msg_origin)
+            origin = _origin_key(user)
+            if origin not in origins:
+                origins.append(origin)
             entry["origins"] = origins[-5:]
             binding_origins = _read_origin_map(entry.get("binding_origins"))
             session_origins = binding_origins.get(session_id, [])
             origin_added = False
-            if user.unified_msg_origin not in session_origins:
-                session_origins.append(user.unified_msg_origin)
+            if origin not in session_origins:
+                session_origins.append(origin)
                 binding_origins[session_id] = session_origins[-5:]
                 entry["binding_origins"] = binding_origins
                 origin_added = True
@@ -166,12 +168,18 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             bindings = _read_list(entry.get("bindings"))
-            if session_id not in bindings:
-                return False, f"未绑定 session：{session_id}"
-            bindings.remove(session_id)
-            entry["bindings"] = sorted(bindings)
             binding_origins = _read_origin_map(entry.get("binding_origins"))
-            binding_origins.pop(session_id, None)
+            origins = binding_origins.get(session_id, [])
+            origin = _origin_key(user)
+            if session_id not in bindings or origin not in origins:
+                return False, f"未绑定 session：{session_id}"
+            origins.remove(origin)
+            if origins:
+                binding_origins[session_id] = origins
+            else:
+                binding_origins.pop(session_id, None)
+                bindings.remove(session_id)
+            entry["bindings"] = sorted(bindings)
             entry["binding_origins"] = binding_origins
             await self._save_locked()
             return True, f"已解绑 session：{session_id}"
@@ -179,9 +187,23 @@ class PluginState:
     async def unbind_all(self, user: UserRef) -> tuple[bool, str]:
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            count = len(_read_list(entry.get("bindings")))
-            entry["bindings"] = []
-            entry["binding_origins"] = {}
+            bindings = _read_list(entry.get("bindings"))
+            binding_origins = _read_origin_map(entry.get("binding_origins"))
+            origin = _origin_key(user)
+            current = _bindings_for_origin(entry, origin)
+            count = len(current)
+            for session_id in current:
+                origins = binding_origins.get(session_id, [])
+                if origin in origins:
+                    origins.remove(origin)
+                if origins:
+                    binding_origins[session_id] = origins
+                else:
+                    binding_origins.pop(session_id, None)
+                    if session_id in bindings:
+                        bindings.remove(session_id)
+            entry["bindings"] = sorted(bindings)
+            entry["binding_origins"] = binding_origins
             await self._save_locked()
             if count == 0:
                 return False, "当前没有绑定任何 session。"
@@ -190,14 +212,14 @@ class PluginState:
     async def list_bindings(self, user: UserRef) -> list[str]:
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            return sorted(_read_list(entry.get("bindings")))
+            return _bindings_for_origin(entry, _origin_key(user))
 
     async def has_binding(self, user: UserRef, session_id: str) -> bool:
         if not is_valid_session_id(session_id):
             return False
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            return session_id in _read_list(entry.get("bindings"))
+            return session_id in _bindings_for_origin(entry, _origin_key(user))
 
     async def remember_session_index(
         self,
@@ -230,8 +252,17 @@ class PluginState:
                 )
                 if len(normalized) >= max(1, min(max_items, MAX_SESSION_INDEX_ITEMS)):
                     break
-            entry["session_index"] = normalized
-            entry["session_index_at"] = time.time()
+            session_indexes = _read_session_indexes(entry.get("session_indexes"))
+            session_indexes[_origin_key(user)] = {
+                "items": normalized,
+                "at": time.time(),
+            }
+            known_origins = set(_read_list(entry.get("origins"))[-5:])
+            entry["session_indexes"] = {
+                origin: value
+                for origin, value in session_indexes.items()
+                if origin in known_origins or origin == _origin_key(user)
+            }
             await self._save_locked()
 
     async def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
@@ -239,7 +270,7 @@ class PluginState:
             return None
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            for item in _read_dict_list(entry.get("session_index")):
+            for item in _session_index_for_origin(entry, _origin_key(user)):
                 if _read_str(item.get("id")) == session_id:
                     return {
                         "id": session_id,
@@ -268,7 +299,7 @@ class PluginState:
 
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            cached = _read_dict_list(entry.get("session_index"))
+            cached = _session_index_for_origin(entry, _origin_key(user))
             if not cached:
                 return None, "没有可用的 session 序号缓存，请先执行 /cloudcli session。"
             if index < 1 or index > len(cached):
@@ -396,7 +427,8 @@ class PluginState:
         max_items: int,
     ) -> list[PendingApproval]:
         async with self._lock:
-            bindings = _read_list(self._user_entry(user.user_key).get("bindings"))
+            entry = self._user_entry(user.user_key)
+            bindings = _bindings_for_origin(entry, _origin_key(user))
             if not bindings:
                 return []
             pending = _read_dict(self._data.get("pending"))
@@ -450,7 +482,8 @@ class PluginState:
         action: str,
     ) -> tuple[PendingApproval | None, str | None]:
         async with self._lock:
-            bindings = _read_list(self._user_entry(user.user_key).get("bindings"))
+            entry = self._user_entry(user.user_key)
+            bindings = _bindings_for_origin(entry, _origin_key(user))
             visible = self._visible_pending_locked(bindings, max_items)
             if not visible:
                 return None, "当前没有待审批权限。"
@@ -517,7 +550,7 @@ class PluginState:
                 "id": run_id,
                 "user_key": user.user_key,
                 "display_name": user.display_name,
-                "origin": user.unified_msg_origin,
+                "origin": _origin_key(user),
                 "status": "running",
                 "provider": safe_text(payload.get("provider"), 60) or "claude",
                 "session_id": safe_text(payload.get("sessionId"), 200),
@@ -589,7 +622,9 @@ class PluginState:
             items = [
                 dict(item)
                 for item in runs.values()
-                if isinstance(item, dict) and item.get("user_key") == user.user_key
+                if isinstance(item, dict)
+                and item.get("user_key") == user.user_key
+                and _run_visible_in_origin(item, user)
             ]
             items.sort(key=lambda item: float(item.get("started_at") or 0), reverse=True)
             return items[: max(1, min(limit, 50))]
@@ -603,6 +638,8 @@ class PluginState:
                 return None, f"没有找到任务 #{run_id}。"
             if item.get("user_key") != user.user_key:
                 return None, "只能查看或操作自己发起的 CloudCLI 任务。"
+            if not _run_visible_in_origin(item, user):
+                return None, "只能在发起任务的聊天会话中查看或操作该任务。"
             return dict(item), None
 
     async def mark_interrupted_runs(self, reason: str) -> int:
@@ -644,6 +681,7 @@ class PluginState:
                     "ts": time.time(),
                     "user_key": user.user_key if user else "system",
                     "display_name": user.display_name if user else "system",
+                    "origin": _origin_key(user) if user else "",
                     "action": safe_text(action, 40),
                     "result": safe_text(result, 80),
                     "request_id": approval.request_id,
@@ -659,13 +697,22 @@ class PluginState:
 
     async def list_audit(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
         async with self._lock:
-            bindings = set(_read_list(self._user_entry(user.user_key).get("bindings")))
+            entry = self._user_entry(user.user_key)
+            origin = _origin_key(user)
+            bindings = set(_bindings_for_origin(entry, origin))
             audit = _read_dict_list(self._data.get("audit"))
             items = [
                 dict(item)
                 for item in audit
-                if item.get("user_key") == user.user_key
-                or (bindings and item.get("session_id") in bindings)
+                if (
+                    item.get("user_key") == user.user_key
+                    and _audit_origin_visible(item, entry, origin)
+                )
+                or (
+                    item.get("user_key") == "system"
+                    and bindings
+                    and item.get("session_id") in bindings
+                )
             ]
             items.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
             return items[: max(1, min(limit, 50))]
@@ -683,6 +730,7 @@ class PluginState:
                 "last_seen_at": 0,
                 "session_index": [],
                 "session_index_at": 0,
+                "session_indexes": {},
             },
         )
         if not isinstance(entry, dict):
@@ -694,6 +742,7 @@ class PluginState:
                 "last_seen_at": 0,
                 "session_index": [],
                 "session_index_at": 0,
+                "session_indexes": {},
             }
             users[user_key] = entry
         if "binding_origins" not in entry:
@@ -707,6 +756,18 @@ class PluginState:
                 }
             else:
                 entry["binding_origins"] = {}
+        if "session_indexes" not in entry:
+            origins = _read_list(entry.get("origins"))
+            legacy_items = _read_dict_list(entry.get("session_index"))
+            if len(origins) == 1 and legacy_items:
+                entry["session_indexes"] = {
+                    origins[0]: {
+                        "items": legacy_items,
+                        "at": _parse_timestamp(entry.get("session_index_at")),
+                    }
+                }
+            else:
+                entry["session_indexes"] = {}
         return entry
 
     def _guess_next_run_id(self, runs: dict[str, Any]) -> int:
@@ -892,6 +953,54 @@ def _read_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str)]
+
+
+def _origin_key(user: UserRef | None) -> str:
+    if user is None:
+        return ""
+    return user.unified_msg_origin or "__default__"
+
+
+def _bindings_for_origin(entry: dict[str, Any], origin: str) -> list[str]:
+    binding_origins = _read_origin_map(entry.get("binding_origins"))
+    return sorted(
+        session_id
+        for session_id, origins in binding_origins.items()
+        if origin in origins
+    )
+
+
+def _read_session_indexes(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for origin, raw in value.items():
+        if not isinstance(origin, str) or not isinstance(raw, dict):
+            continue
+        result[origin] = {
+            "items": _read_dict_list(raw.get("items")),
+            "at": _parse_timestamp(raw.get("at")),
+        }
+    return result
+
+
+def _session_index_for_origin(entry: dict[str, Any], origin: str) -> list[dict[str, Any]]:
+    scoped = _read_session_indexes(entry.get("session_indexes")).get(origin)
+    if isinstance(scoped, dict):
+        return _read_dict_list(scoped.get("items"))
+    return []
+
+
+def _run_visible_in_origin(item: dict[str, Any], user: UserRef) -> bool:
+    return _read_str(item.get("origin")) == _origin_key(user)
+
+
+def _audit_origin_visible(item: dict[str, Any], entry: dict[str, Any], origin: str) -> bool:
+    item_origin = _read_str(item.get("origin"))
+    if item_origin:
+        return item_origin == origin
+    origins = _read_list(entry.get("origins"))
+    return len(origins) == 1 and origins[0] == origin
 
 
 def _read_origin_map(value: Any) -> dict[str, list[str]]:

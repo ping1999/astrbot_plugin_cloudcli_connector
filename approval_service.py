@@ -13,6 +13,7 @@ try:
     from .config import ConnectorSettings
     from .constants import MAX_DENY_REASON_LEN
     from .formatting import format_audit, format_pending, format_push_message
+    from .redaction import redact_exception_text
     from .state import PendingApproval, PluginState, UserRef, pending_storage_key
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from approval_notifications import ApprovalNotificationPolicy
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from config import ConnectorSettings
     from constants import MAX_DENY_REASON_LEN
     from formatting import format_audit, format_pending, format_push_message
+    from redaction import redact_exception_text
     from state import PendingApproval, PluginState, UserRef, pending_storage_key
 
 
@@ -246,7 +248,9 @@ class ApprovalService:
         bindings = await self.state.list_bindings(user)
         if not bindings:
             return None, "当前用户没有绑定 session，请先使用 /cloudcli bind <sessionId>。"
-        await self.refresh_pending_for_bindings(bindings)
+        sync_error = await self.refresh_pending_for_bindings(bindings)
+        if sync_error:
+            return None, f"同步 CloudCLI 待审批权限失败，未执行审批：{sync_error}"
         return await self.state.claim_visible_request(
             user,
             request_no,
@@ -291,11 +295,14 @@ class ApprovalService:
             await self.state.release_pending_claim(approval.session_id, approval.request_id, actor)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             approval = await self.state.get_pending(session_id, request_id)
             if approval is not None:
                 await self.state.release_pending_claim(approval.session_id, approval.request_id, actor)
-            logger.warning("CloudCLI approval timeout worker failed", exc_info=True)
+            logger.warning(
+                "CloudCLI approval timeout worker failed:\n%s",
+                redact_exception_text(exc),
+            )
 
     async def _deny_timed_out_approval(
         self,
