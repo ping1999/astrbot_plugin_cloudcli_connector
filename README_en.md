@@ -61,6 +61,7 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
 - Non-admin users cannot directly type an unbound raw sessionId by default. They should use an index from `/cloudcli session`, or an admin can enable `allow_direct_session_id`.
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
+- Users in `approval_allowed_user_keys` can bind a known session with `/cloudcli bind <sessionId>` for approval handling even without session browsing access; this does not grant `/cloudcli session`, `/cloudcli chat`, or `/cloudcli stop`.
 - To avoid leaking sensitive approval input through stale stored admin state, proactive approval detail pushes only go to the chat origin that bound that session. When `approval_require_admin=true`, detailed proactive pushes are sent only to users in `approval_allowed_user_keys`; admins can still run `/cloudcli pending` to view and handle requests.
 - `/cloudcli pending` refreshes the local pending approval cache from CloudCLI and removes approvals that no longer exist upstream.
 - `/cloudcli allow` and `/cloudcli deny` stop when the pending approval refresh fails instead of acting on stale cache.

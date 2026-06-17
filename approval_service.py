@@ -168,7 +168,11 @@ class ApprovalService:
             limit, error = parse_positive_int(args[0], "数量", 1, 50)
             if error:
                 return error
-        return format_audit(await self.state.list_audit(user, limit), limit)
+        return format_audit(
+            await self.state.list_audit(user, limit),
+            limit,
+            self.settings.max_push_text_length,
+        )
 
     async def on_permission_request(self, approval: PendingApproval) -> None:
         await self.state.upsert_pending(approval)

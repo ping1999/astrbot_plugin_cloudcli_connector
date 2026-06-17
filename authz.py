@@ -41,6 +41,21 @@ class AuthorizationPolicy:
             "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 session_allowed_user_keys。",
         )
 
+    def can_bind_sessions(self, user: UserRef) -> Decision:
+        session_decision = self.can_access_sessions(user)
+        if session_decision.allowed:
+            return session_decision
+        approval_decision = self.can_manage_approvals(user)
+        if approval_decision.allowed:
+            return Decision(True)
+        return session_decision
+
+    def can_bind_direct_session_for_approval(self, user: UserRef) -> Decision:
+        approval_decision = self.can_manage_approvals(user)
+        if approval_decision.allowed:
+            return Decision(True)
+        return self.can_use_direct_session_id(user)
+
     def can_use_direct_session_id(self, user: UserRef) -> Decision:
         identity_error = self._identity_error(user)
         if identity_error:

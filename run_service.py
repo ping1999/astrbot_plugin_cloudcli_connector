@@ -123,7 +123,11 @@ class RunService:
                 limit, error = parse_positive_int(args[1], "数量", 1, 50)
                 if error:
                     return error
-            return format_run_tasks(await self.state.list_run_tasks(user, limit), limit)
+            return format_run_tasks(
+                await self.state.list_run_tasks(user, limit),
+                limit,
+                self.settings.max_push_text_length,
+            )
 
         if subcommand == "log":
             if len(args) != 2:

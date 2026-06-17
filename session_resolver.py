@@ -60,7 +60,7 @@ class SessionResolver:
         indexed = await self.state.find_session_index_item(user, ref.strip())
         if indexed:
             return ""
-        decision = self.authz.can_use_direct_session_id(user)
+        decision = self.authz.can_bind_direct_session_for_approval(user)
         return "" if decision.allowed else decision.message
 
     async def direct_session_ref_error(self, user: UserRef, ref: str) -> str:

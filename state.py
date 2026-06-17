@@ -11,8 +11,10 @@ from typing import Any
 
 try:
     from .sanitizer import compact_json, safe_json_value, safe_text
+    from .state_storage import JsonStateStore
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from sanitizer import compact_json, safe_json_value, safe_text
+    from state_storage import JsonStateStore
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
@@ -66,6 +68,7 @@ class PendingApproval:
 class PluginState:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.store = JsonStateStore(path)
         self._lock = asyncio.Lock()
         self._data: dict[str, Any] = {
             "version": 3,
@@ -83,23 +86,19 @@ class PluginState:
                 await self._save_locked()
                 return
             try:
-                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                loaded = self.store.read()
                 if isinstance(loaded, dict):
                     self._data["version"] = 3
                     self._data["users"] = _read_dict(loaded.get("users"))
                     self._data["pending"] = _normalize_pending_records(_read_dict(loaded.get("pending")))
-                    self._data["runs"] = _read_dict(loaded.get("runs"))
-                    self._data["audit"] = _read_dict_list(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
+                    self._data["runs"] = _normalize_run_records(_read_dict(loaded.get("runs")))
+                    self._data["audit"] = _normalize_audit_records(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
                     self._data["next_run_id"] = _read_positive_int(
                         loaded.get("next_run_id"),
                         self._guess_next_run_id(self._data["runs"]),
                     )
-            except (OSError, json.JSONDecodeError):
-                backup = self.path.with_suffix(f".bad-{int(time.time())}.json")
-                try:
-                    self.path.replace(backup)
-                except OSError:
-                    pass
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                self.store.backup_bad_file()
                 self._data = {
                     "version": 3,
                     "users": {},
@@ -882,15 +881,7 @@ class PluginState:
                 runs.pop(run_id, None)
 
     async def _save_locked(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(".tmp")
-        tmp_path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        _restrict_file_permissions(tmp_path)
-        os.replace(tmp_path, self.path)
-        _restrict_file_permissions(self.path)
+        self.store.write(self._data)
 
 
 def is_valid_session_id(value: str) -> bool:
@@ -932,13 +923,85 @@ def _normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
         storage_key = pending_storage_key(session_id, request_id)
         if not storage_key:
             continue
-        normalized = dict(item)
+        normalized = {
+            "request_id": request_id,
+            "session_id": session_id,
+            "tool_name": safe_text(item.get("tool_name"), 120) or "UnknownTool",
+            "input_data": safe_json_value(item.get("input_data")),
+            "provider": safe_text(item.get("provider"), 60) or "claude",
+            "received_at": _parse_timestamp(item.get("received_at")) or time.time(),
+            "resolved": bool(item.get("resolved") is True),
+        }
         normalized["session_id"] = session_id
         normalized["request_id"] = request_id
         for field in PENDING_CLAIM_FIELDS:
             normalized.pop(field, None)
         result[storage_key] = normalized
     return result
+
+
+def _normalize_run_records(value: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        run_id = _read_str(key)
+        if not RUN_ID_RE.fullmatch(run_id) or not isinstance(item, dict):
+            continue
+        normalized = {
+            "id": run_id,
+            "user_key": safe_text(item.get("user_key"), 200),
+            "display_name": safe_text(item.get("display_name"), 160),
+            "origin": safe_text(item.get("origin"), 500),
+            "status": safe_text(item.get("status"), 40) or "unknown",
+            "provider": safe_text(item.get("provider"), 60) or "claude",
+            "session_id": safe_text(item.get("session_id"), 200),
+            "project_path": safe_text(item.get("project_path"), 500),
+            "github_url": safe_text(item.get("github_url"), 500),
+            "target": safe_text(item.get("target"), 500),
+            "message": safe_text(item.get("message"), MAX_STORED_TEXT),
+            "started_at": _parse_timestamp(item.get("started_at")),
+            "updated_at": _parse_timestamp(item.get("updated_at")),
+            "finished_at": _parse_timestamp(item.get("finished_at")),
+            "log": _normalize_run_log(item.get("log")),
+            "summary": safe_json_value(item.get("summary")),
+        }
+        if item.get("error"):
+            normalized["error"] = safe_text(item.get("error"), MAX_STORED_TEXT)
+        result[run_id] = normalized
+    return result
+
+
+def _normalize_run_log(value: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in _read_dict_list(value):
+        items.append(
+            {
+                "ts": _parse_timestamp(item.get("ts")),
+                "text": safe_text(item.get("text"), MAX_STORED_TEXT),
+            }
+        )
+    return items[-MAX_RUN_LOG_ITEMS:]
+
+
+def _normalize_audit_records(value: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in _read_dict_list(value):
+        records.append(
+            {
+                "ts": _parse_timestamp(item.get("ts")),
+                "user_key": safe_text(item.get("user_key"), 200),
+                "display_name": safe_text(item.get("display_name"), 160),
+                "origin": safe_text(item.get("origin"), 500),
+                "action": safe_text(item.get("action"), 40),
+                "result": safe_text(item.get("result"), 80),
+                "request_id": safe_text(item.get("request_id"), 200),
+                "session_id": safe_text(item.get("session_id"), 200),
+                "tool_name": safe_text(item.get("tool_name"), 120),
+                "provider": safe_text(item.get("provider"), 60) or "claude",
+                "reason": safe_text(item.get("reason"), 500),
+                "input_summary": safe_text(item.get("input_summary"), 500),
+            }
+        )
+    return records
 
 
 def _read_str(value: Any) -> str:
@@ -1042,10 +1105,3 @@ def _parse_timestamp(value: Any) -> float:
         except ValueError:
             return 0
     return 0
-
-
-def _restrict_file_permissions(path: Path) -> None:
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass

@@ -17,7 +17,7 @@ from config import load_connector_settings
 from identity import build_user_ref
 from redaction import redact_exception_text
 from run_requests import RunRequestBuilder
-from formatting import format_session_overview
+from formatting import format_pending, format_run_tasks, format_session_overview
 from run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
 from state import PendingApproval, PluginState, UserRef
 
@@ -132,6 +132,23 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(authz.can_access_sessions(user).allowed)
         self.assertFalse(authz.can_run_agent(user).allowed)
         self.assertFalse(authz.can_manage_approvals(user).allowed)
+
+    def test_approval_allowlist_can_bind_without_session_read_access(self) -> None:
+        settings = load_connector_settings(
+            {
+                "session_require_admin": True,
+                "approval_require_admin": True,
+                "approval_allowed_user_keys": "test:u1",
+            }
+        )
+        authz = AuthorizationPolicy(settings)
+        user = UserRef("test:u1", "User", "origin")
+
+        self.assertFalse(authz.can_access_sessions(user).allowed)
+        self.assertFalse(authz.can_use_direct_session_id(user).allowed)
+        self.assertTrue(authz.can_manage_approvals(user).allowed)
+        self.assertTrue(authz.can_bind_sessions(user).allowed)
+        self.assertTrue(authz.can_bind_direct_session_for_approval(user).allowed)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -312,6 +329,34 @@ class FormattingTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 280)
         self.assertIn("已截断", rendered)
 
+    def test_pending_list_is_clipped_after_all_items_are_rendered(self) -> None:
+        rendered = format_pending(
+            [
+                PendingApproval(f"request-{index}", "sess-1", "Tool", {"text": "x" * 1000})
+                for index in range(20)
+            ],
+            300,
+        )
+        self.assertLessEqual(len(rendered), 380)
+        self.assertIn("已截断", rendered)
+
+    def test_run_task_list_is_clipped(self) -> None:
+        rendered = format_run_tasks(
+            [
+                {
+                    "id": str(index),
+                    "status": "completed",
+                    "provider": "codex",
+                    "target": "C:/repo/" + ("x" * 500),
+                }
+                for index in range(20)
+            ],
+            20,
+            300,
+        )
+        self.assertLessEqual(len(rendered), 380)
+        self.assertIn("已截断", rendered)
+
 
 class StateTests(unittest.TestCase):
     def test_legacy_single_origin_state_migrates_to_scoped_data(self) -> None:
@@ -483,6 +528,86 @@ class StateTests(unittest.TestCase):
                 return claimed is not None
 
         self.assertTrue(asyncio.run(scenario()))
+
+    def test_loaded_legacy_sensitive_state_is_redacted(self) -> None:
+        async def scenario() -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 3,
+                            "users": {
+                                "test:u1": {
+                                    "origins": ["origin"],
+                                    "bindings": ["sess-1"],
+                                    "binding_origins": {"sess-1": ["origin"]},
+                                }
+                            },
+                            "pending": {
+                                "sess-1|request-1": {
+                                    "request_id": "request-1",
+                                    "session_id": "sess-1",
+                                    "tool_name": "Tool",
+                                    "input_data": {"api_key": "pending-secret"},
+                                    "provider": "claude",
+                                    "received_at": 1,
+                                }
+                            },
+                            "runs": {
+                                "1": {
+                                    "id": "1",
+                                    "user_key": "test:u1",
+                                    "display_name": "User",
+                                    "origin": "origin",
+                                    "status": "completed",
+                                    "provider": "codex",
+                                    "target": "C:/repo",
+                                    "message": "password=run-secret",
+                                    "log": [{"ts": 1, "text": "token=log-secret"}],
+                                    "summary": {"api_key": "summary-secret"},
+                                }
+                            },
+                            "audit": [
+                                {
+                                    "ts": 1,
+                                    "user_key": "test:u1",
+                                    "display_name": "User",
+                                    "origin": "origin",
+                                    "action": "allow",
+                                    "result": "failed: token=audit-secret",
+                                    "request_id": "request-1",
+                                    "session_id": "sess-1",
+                                    "tool_name": "Tool",
+                                    "provider": "claude",
+                                    "input_summary": '{"password":"audit-input-secret"}',
+                                }
+                            ],
+                            "next_run_id": 2,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                pending = await state.visible_pending_for_user(user, 10)
+                run, error = await state.get_run_task(user, "1")
+                self.assertIsNone(error)
+                assert run is not None
+                return pending[0].input_data, run, await state.list_audit(user, 10)
+
+        pending_input, run, audit = asyncio.run(scenario())
+        rendered = json.dumps(
+            {"pending": pending_input, "run": run, "audit": audit},
+            ensure_ascii=False,
+        )
+        self.assertNotIn("pending-secret", rendered)
+        self.assertNotIn("run-secret", rendered)
+        self.assertNotIn("log-secret", rendered)
+        self.assertNotIn("summary-secret", rendered)
+        self.assertNotIn("audit-secret", rendered)
+        self.assertNotIn("audit-input-secret", rendered)
 
     def test_pending_request_ids_are_scoped_by_session(self) -> None:
         async def scenario() -> list[PendingApproval]:

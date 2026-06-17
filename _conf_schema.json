@@ -165,7 +165,7 @@
     "description": "Comma-separated AstrBot user keys allowed to approve permissions",
     "type": "string",
     "default": "",
-    "hint": "Users in this list can approve even if they are not AstrBot admins and can receive proactive approval details. Use /cloudcli whoami to get the key."
+    "hint": "Users in this list can approve even if they are not AstrBot admins and can receive proactive approval details. They may bind a known sessionId for approval handling without getting session browsing access. Use /cloudcli whoami to get the key."
   },
   "approval_require_admin": {
     "description": "Require AstrBot admin for approvals",

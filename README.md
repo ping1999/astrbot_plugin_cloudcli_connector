@@ -63,6 +63,7 @@
 - 非管理员使用 `/cloudcli run --project` 时建议配置 `allowed_project_roots`，否则默认会拒绝访问本地任意目录。
 - 非管理员默认不能直接手填未绑定的 sessionId；请先执行 `/cloudcli session` 后使用序号，或由管理员开启 `allow_direct_session_id`。
 - 默认只有 AstrBot 管理员或 `approval_allowed_user_keys` 白名单用户可以查看、接收和处理审批请求。
+- `approval_allowed_user_keys` 用户即使没有 session 浏览权限，也可以使用 `/cloudcli bind <sessionId>` 绑定已知 session 以处理审批；这不会授予 `/cloudcli session`、`/cloudcli chat` 或 `/cloudcli stop` 权限。
 - 为避免历史管理员状态失效导致敏感审批内容误推，主动审批详情只会推送到绑定该 session 的聊天会话，并且在 `approval_require_admin=true` 时只主动推给 `approval_allowed_user_keys` 中的用户；管理员仍可主动执行 `/cloudcli pending` 查看并处理。
 - `/cloudcli pending` 会按 CloudCLI 当前返回结果刷新本地待审批缓存，已不存在的审批会从本地清理。
 - `/cloudcli allow` 和 `/cloudcli deny` 在同步待审批列表失败时不会使用旧缓存继续决策。

@@ -273,7 +273,7 @@ class CloudCLIConnectorPlugin(Star):
         return body
 
     async def _handle_bind(self, user: UserRef, args: list[str]) -> str:
-        decision = self.authz.can_access_sessions(user)
+        decision = self.authz.can_bind_sessions(user)
         if not decision.allowed:
             return decision.message
         if not args:
