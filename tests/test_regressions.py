@@ -11,6 +11,8 @@ from approval_notifications import ApprovalNotificationPolicy
 from approval_service import ApprovalService
 from cloudcli_client import CloudCLIClient, CloudCLIConfig
 from cloudcli_client import CloudCLIError
+from command_parser import ParsedCommand
+from command_router import CommandRoute, CommandRouter
 from cloudcli_protocol import build_ws_url, parse_sse_event
 from cloudcli_transport import WebSocketRequestMux
 from config import load_connector_settings
@@ -19,7 +21,8 @@ from redaction import redact_exception_text
 from run_requests import RunRequestBuilder
 from formatting import format_pending, format_run_tasks, format_session_overview
 from run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
-from state import PendingApproval, PluginState, UserRef
+from state import PluginState
+from state_models import PendingApproval, UserRef
 
 
 class ValidationTests(unittest.TestCase):
@@ -204,6 +207,40 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(1, sent_before_reply)
         self.assertEqual(1, first_result["value"])
         self.assertEqual(2, second_result["value"])
+
+
+class CommandRouterTests(unittest.TestCase):
+    def test_no_arg_route_rejects_extra_args(self) -> None:
+        async def handler(user: UserRef, args: list[str]) -> str:
+            return "ok"
+
+        async def scenario() -> str:
+            router = CommandRouter(
+                help_text="help",
+                routes={
+                    "status": CommandRoute(
+                        handler=handler,
+                        usage="用法：/cloudcli status",
+                        no_args=True,
+                    )
+                },
+            )
+            return await router.dispatch(
+                ParsedCommand("status", ["extra"], ""),
+                UserRef("test:u1", "User", "origin"),
+            )
+
+        self.assertEqual("用法：/cloudcli status", asyncio.run(scenario()))
+
+    def test_unknown_route_returns_help(self) -> None:
+        async def scenario() -> str:
+            router = CommandRouter(help_text="help text", routes={})
+            return await router.dispatch(
+                ParsedCommand("missing", [], ""),
+                UserRef("test:u1", "User", "origin"),
+            )
+
+        self.assertIn("help text", asyncio.run(scenario()))
 
 
 class FakeSessions:
@@ -510,6 +547,44 @@ class StateTests(unittest.TestCase):
         self.assertIn("正在被处理", second_error)
         self.assertTrue(third_claimed)
 
+    def test_pending_upsert_preserves_active_claim(self) -> None:
+        async def scenario() -> tuple[bool, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                first_user = UserRef("test:u1", "User 1", "origin-1")
+                second_user = UserRef("test:u2", "User 2", "origin-2")
+                await state.bind_session(first_user, "sess-1", 10)
+                await state.bind_session(second_user, "sess-1", 10)
+                approval = PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                await state.upsert_pending(approval)
+                claimed, first_error = await state.claim_visible_request(first_user, None, 10, "allow")
+                self.assertIsNone(first_error)
+                self.assertIsNotNone(claimed)
+
+                await state.upsert_pending(approval)
+                second_claim, second_error = await state.claim_visible_request(second_user, None, 10, "deny")
+                return second_claim is not None, second_error or ""
+
+        second_claimed, second_error = asyncio.run(scenario())
+        self.assertFalse(second_claimed)
+        self.assertIn("正在被处理", second_error)
+
+    def test_permission_request_tool_name_is_single_line(self) -> None:
+        approval = PendingApproval.from_cloudcli(
+            {
+                "requestId": "request-1",
+                "sessionId": "sess-1",
+                "toolName": "Tool\nrequest: forged",
+                "provider": "claude\nfake",
+                "input": {},
+            }
+        )
+        self.assertIsNotNone(approval)
+        assert approval is not None
+        self.assertEqual("Tool request: forged", approval.tool_name)
+        self.assertEqual("claude fake", approval.provider)
+
     def test_stale_pending_claim_is_cleared_on_load(self) -> None:
         async def scenario() -> bool:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -696,7 +771,7 @@ class CloudCLIClientTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.connected_url = ""
 
-            async def ws_connect(self, url: str, heartbeat: int):
+            async def ws_connect(self, url: str, heartbeat: int, headers=None):
                 self.connected_url = url
                 return FakeWebSocket()
 
@@ -723,6 +798,84 @@ class CloudCLIClientTests(unittest.TestCase):
 
         self.assertEqual("ws://127.0.0.1:3001/ws", asyncio.run(scenario()))
 
+    def test_websocket_connect_sends_api_key_header(self) -> None:
+        class FakeWebSocket:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class FakeSession:
+            closed = False
+
+            def __init__(self) -> None:
+                self.connected_headers: dict[str, str] = {}
+
+            async def ws_connect(self, url: str, heartbeat: int, headers=None):
+                self.connected_headers = dict(headers or {})
+                return FakeWebSocket()
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class TestClient(CloudCLIClient):
+            async def _ensure_http_session(self) -> None:
+                if self._session is None:
+                    self._session = FakeSession()  # type: ignore[assignment]
+
+        async def scenario() -> dict[str, str]:
+            client = TestClient(
+                CloudCLIConfig(
+                    base_url="http://127.0.0.1:3001",
+                    jwt_token="jwt-token",
+                    api_key="api-secret",
+                ),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            await client.ensure_connected()
+            session = client._session
+            await client.close()
+            return getattr(session, "connected_headers", {})
+
+        headers = asyncio.run(scenario())
+        self.assertEqual("Bearer jwt-token", headers.get("Authorization"))
+        self.assertEqual("api-secret", headers.get("X-API-Key"))
+
+    def test_recent_sessions_do_not_inherit_unauthenticated_ws_setting(self) -> None:
+        class TestClient(CloudCLIClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    CloudCLIConfig(
+                        base_url="http://127.0.0.1:3001",
+                        allow_unauthenticated_ws=True,
+                    ),
+                    on_permission_request=lambda _approval: asyncio.sleep(0),
+                )
+                self.allow_anonymous_values: list[bool] = []
+
+            async def _ensure_http_session(self) -> None:
+                return None
+
+            async def _get_token(self, *, allow_anonymous: bool = False) -> str:
+                self.allow_anonymous_values.append(allow_anonymous)
+                return "token"
+
+            async def _get_json_with_auth_retry(self, path, params, headers):
+                return {"projects": []}
+
+        async def scenario() -> list[bool]:
+            client = TestClient()
+            await client.get_recent_sessions(1)
+            return client.allow_anonymous_values
+
+        self.assertEqual([False], asyncio.run(scenario()))
+
     def test_supervisor_reconnects_after_websocket_disconnect(self) -> None:
         class FakeWebSocket:
             closed = False
@@ -746,7 +899,7 @@ class CloudCLIClientTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.connect_count = 0
 
-            async def ws_connect(self, url: str, heartbeat: int):
+            async def ws_connect(self, url: str, heartbeat: int, headers=None):
                 self.connect_count += 1
                 return FakeWebSocket()
 

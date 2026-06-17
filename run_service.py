@@ -22,7 +22,8 @@ try:
     from .redaction import redact_exception_text, redact_text
     from .run_requests import RunRequestBuilder
     from .runtime import RunQuota
-    from .state import PluginState, UserRef, is_valid_session_id
+    from .state import PluginState
+    from .state_models import UserRef, is_valid_session_id
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli_client import CloudCLIClient, CloudCLIError
     from command_parser import parse_positive_int
@@ -40,7 +41,8 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from redaction import redact_exception_text, redact_text
     from run_requests import RunRequestBuilder
     from runtime import RunQuota
-    from state import PluginState, UserRef, is_valid_session_id
+    from state import PluginState
+    from state_models import UserRef, is_valid_session_id
 
 
 SendProactive = Callable[[str, str], Awaitable[None]]

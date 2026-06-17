@@ -14,7 +14,7 @@ try:
         looks_like_github_url,
     )
     from .session_resolver import SessionResolver
-    from .state import UserRef, is_valid_session_id
+    from .state_models import UserRef, is_valid_session_id
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from authz import AuthorizationPolicy
     from config import ConnectorSettings
@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         looks_like_github_url,
     )
     from session_resolver import SessionResolver
-    from state import UserRef, is_valid_session_id
+    from state_models import UserRef, is_valid_session_id
 
 
 FLAG_OPTIONS = frozenset({"create-branch", "pr", "no-cleanup", "cleanup"})

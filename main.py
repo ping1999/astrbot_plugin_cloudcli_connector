@@ -19,6 +19,7 @@ try:
         parse_command,
         parse_positive_int,
     )
+    from .command_router import CommandHandler, CommandRoute, CommandRouter
     from .config import load_connector_settings
     from .constants import PLUGIN_NAME, SESSION_PROVIDERS
     from .formatting import (
@@ -34,13 +35,8 @@ try:
     from .run_requests import RunRequestBuilder
     from .run_service import RunService
     from .session_resolver import SessionResolver
-    from .state import (
-        PendingApproval,
-        PluginState,
-        UserRef,
-        is_valid_session_id,
-        resolve_data_path,
-    )
+    from .state import PluginState, resolve_data_path
+    from .state_models import PendingApproval, UserRef, is_valid_session_id
     from .runtime import RunQuota
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from approval_notifications import ApprovalNotificationPolicy
@@ -52,6 +48,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         parse_command,
         parse_positive_int,
     )
+    from command_router import CommandHandler, CommandRoute, CommandRouter
     from config import load_connector_settings
     from constants import PLUGIN_NAME, SESSION_PROVIDERS
     from formatting import (
@@ -67,13 +64,8 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from run_requests import RunRequestBuilder
     from run_service import RunService
     from session_resolver import SessionResolver
-    from state import (
-        PendingApproval,
-        PluginState,
-        UserRef,
-        is_valid_session_id,
-        resolve_data_path,
-    )
+    from state import PluginState, resolve_data_path
+    from state_models import PendingApproval, UserRef, is_valid_session_id
     from runtime import RunQuota
 
 
@@ -133,6 +125,8 @@ class CloudCLIConnectorPlugin(Star):
             send_proactive=self._send_proactive,
             track_task=self._track_task,
         )
+        self.command_router = self._build_command_router()
+
     async def initialize(self) -> None:
         await self.state.load()
         interrupted = await self.state.mark_interrupted_runs(
@@ -167,55 +161,48 @@ class CloudCLIConnectorPlugin(Star):
         yield event.plain_result(text)
 
     async def _dispatch(self, command: ParsedCommand, user: UserRef) -> str:
-        if command.name in {"", "help", "-h", "--help"}:
-            return HELP_TEXT
+        return await self.command_router.dispatch(command, user)
 
-        if command.name == "status":
-            if command.args:
-                return "用法：/cloudcli status"
-            return await self._handle_status(user)
+    def _build_command_router(self) -> CommandRouter:
+        return CommandRouter(
+            help_text=HELP_TEXT,
+            routes={
+                "status": CommandRoute(
+                    self._no_args(self._handle_status),
+                    usage="用法：/cloudcli status",
+                    no_args=True,
+                ),
+                "session": CommandRoute(
+                    self._no_args(self._handle_session),
+                    usage="用法：/cloudcli session",
+                    no_args=True,
+                ),
+                "bind": CommandRoute(self._handle_bind),
+                "unbind": CommandRoute(self._handle_unbind),
+                "chat": CommandRoute(self._handle_chat),
+                "run": CommandRoute(self._handle_run),
+                "stop": CommandRoute(self._handle_stop),
+                "pending": CommandRoute(
+                    self._no_args(self._handle_pending),
+                    usage="用法：/cloudcli pending",
+                    no_args=True,
+                ),
+                "allow": CommandRoute(self._handle_allow),
+                "deny": CommandRoute(self._handle_deny),
+                "audit": CommandRoute(self._handle_audit),
+                "whoami": CommandRoute(
+                    self._no_args(self._handle_whoami),
+                    usage="用法：/cloudcli whoami",
+                    no_args=True,
+                ),
+            },
+        )
 
-        if command.name == "session":
-            if command.args:
-                return "用法：/cloudcli session"
-            return await self._handle_session(user)
+    def _no_args(self, handler) -> CommandHandler:
+        async def wrapped(user: UserRef, _args: list[str]) -> str:
+            return await handler(user)
 
-        if command.name == "bind":
-            return await self._handle_bind(user, command.args)
-
-        if command.name == "unbind":
-            return await self._handle_unbind(user, command.args)
-
-        if command.name == "chat":
-            return await self._handle_chat(user, command.args)
-
-        if command.name == "run":
-            return await self._handle_run(user, command.args)
-
-        if command.name == "stop":
-            return await self._handle_stop(user, command.args)
-
-        if command.name == "pending":
-            if command.args:
-                return "用法：/cloudcli pending"
-            return await self._handle_pending(user)
-
-        if command.name == "allow":
-            return await self._handle_allow(user, command.args)
-
-        if command.name == "deny":
-            return await self._handle_deny(user, command.args)
-
-        if command.name == "audit":
-            return await self._handle_audit(user, command.args)
-
-        if command.name == "whoami":
-            if command.args:
-                return "用法：/cloudcli whoami"
-            admin_text = "是" if user.is_admin else "否"
-            return f"当前用户标识：{user.user_key}\n昵称：{user.display_name}\nAstrBot 管理员：{admin_text}"
-
-        return f"未知指令：{command.name}\n\n{HELP_TEXT}"
+        return wrapped
 
     async def _handle_status(self, user: UserRef) -> str:
         decision = self.authz.can_access_sessions(user)
@@ -411,6 +398,10 @@ class CloudCLIConnectorPlugin(Star):
         if approval_error:
             return approval_error
         return await self.approval_service.handle_audit(user, args)
+
+    async def _handle_whoami(self, user: UserRef) -> str:
+        admin_text = "是" if user.is_admin else "否"
+        return f"当前用户标识：{user.user_key}\n昵称：{user.display_name}\nAstrBot 管理员：{admin_text}"
 
     def _approval_permission_error(self, user: UserRef) -> str:
         decision = self.authz.can_manage_approvals(user)

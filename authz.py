@@ -7,11 +7,11 @@ from pathlib import Path
 try:
     from .config import ConnectorSettings
     from .identity import missing_identity_message
-    from .state import UserRef
+    from .state_models import UserRef
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from config import ConnectorSettings
     from identity import missing_identity_message
-    from state import UserRef
+    from state_models import UserRef
 
 
 @dataclass(frozen=True)

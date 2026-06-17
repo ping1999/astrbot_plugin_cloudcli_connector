@@ -19,7 +19,8 @@ try:
         redact_error_text,
     )
     from .cloudcli_transport import WaiterPredicate, WebSocketRequestMux
-    from .state import PendingApproval
+    from .cloudcli_models import extract_recent_sessions
+    from .state_models import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli_protocol import (
         build_api_url,
@@ -29,7 +30,8 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         redact_error_text,
     )
     from cloudcli_transport import WaiterPredicate, WebSocketRequestMux
-    from state import PendingApproval
+    from cloudcli_models import extract_recent_sessions
+    from state_models import PendingApproval
 
 
 logger = logging.getLogger(__name__)
@@ -198,7 +200,7 @@ class CloudCLIClient:
 
     async def get_recent_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
         await self._ensure_http_session()
-        token = await self._get_token(allow_anonymous=self.config.allow_unauthenticated_ws)
+        token = await self._get_token()
         headers = self._auth_headers(token)
         params = {
             "skipSynchronization": "false",
@@ -212,7 +214,10 @@ class CloudCLIClient:
         except Exception as exc:  # noqa: BLE001
             raise CloudCLIError(f"读取 CloudCLI 最近 session 失败：{exc}") from exc
 
-        return self._extract_recent_sessions(data, limit)
+        try:
+            return extract_recent_sessions(data, limit)
+        except ValueError as exc:
+            raise CloudCLIError(str(exc)) from exc
 
     async def get_session_messages(
         self,
@@ -347,10 +352,12 @@ class CloudCLIClient:
 
         token = await self._get_token(allow_anonymous=self.config.allow_unauthenticated_ws)
         ws_url = self._ws_url(token)
+        headers = self._auth_headers(token)
         try:
             ws = await self._session.ws_connect(
                 ws_url,
                 heartbeat=25,
+                headers=headers,
             )
             self._ws = ws
         except Exception as exc:  # noqa: BLE001
@@ -358,9 +365,11 @@ class CloudCLIClient:
                 await self._clear_cached_token()
                 try:
                     token = await self._get_token()
+                    headers = self._auth_headers(token)
                     ws = await self._session.ws_connect(
                         self._ws_url(token),
                         heartbeat=25,
+                        headers=headers,
                     )
                     self._ws = ws
                 except Exception as retry_exc:  # noqa: BLE001
@@ -610,92 +619,6 @@ class CloudCLIClient:
 
     def _ws_url(self, token: str) -> str:
         return build_ws_url(self.config.base_url, token)
-
-    def _extract_recent_sessions(self, data: Any, limit: int) -> list[dict[str, Any]]:
-        if isinstance(data, dict):
-            projects = data.get("projects") or data.get("data") or data.get("items")
-        else:
-            projects = data
-        if not isinstance(projects, list):
-            raise CloudCLIError("无法解析 CloudCLI 最近 session 响应。")
-
-        provider_fields = (
-            ("claude", "sessions"),
-            ("codex", "codexSessions"),
-            ("cursor", "cursorSessions"),
-            ("gemini", "geminiSessions"),
-            ("opencode", "opencodeSessions"),
-        )
-        result: list[dict[str, Any]] = []
-        for project in projects:
-            if not isinstance(project, dict):
-                continue
-            project_name = (
-                project.get("displayName")
-                or project.get("name")
-                or project.get("projectId")
-                or project.get("path")
-                or ""
-            )
-            project_path = project.get("fullPath") or project.get("path") or ""
-            for provider, field_name in provider_fields:
-                sessions = project.get(field_name)
-                if not isinstance(sessions, list):
-                    continue
-                for session in sessions:
-                    item = self._normalize_recent_session(
-                        session,
-                        provider,
-                        str(project_name),
-                        str(project_path),
-                    )
-                    if item:
-                        result.append(item)
-
-        result.sort(key=lambda item: str(item.get("lastActivity") or ""), reverse=True)
-        return result[: max(1, min(limit, 100))]
-
-    def _normalize_recent_session(
-        self,
-        session: Any,
-        provider: str,
-        project_name: str,
-        project_path: str,
-    ) -> dict[str, Any] | None:
-        if isinstance(session, str):
-            session_id = session
-            summary = ""
-            message_count = None
-            last_activity = ""
-        elif isinstance(session, dict):
-            session_id = (
-                session.get("id")
-                or session.get("sessionId")
-                or session.get("session_id")
-                or session.get("conversationId")
-            )
-            summary = session.get("summary") or session.get("title") or ""
-            message_count = session.get("messageCount") or session.get("message_count")
-            last_activity = (
-                session.get("lastActivity")
-                or session.get("updatedAt")
-                or session.get("createdAt")
-                or ""
-            )
-        else:
-            return None
-        if not session_id:
-            return None
-        return {
-            "provider": provider,
-            "id": str(session_id),
-            "summary": str(summary) if summary else "",
-            "messageCount": message_count,
-            "lastActivity": str(last_activity) if last_activity else "",
-            "projectName": project_name,
-            "projectPath": project_path,
-        }
-
 
 def _redact_text(value: str) -> str:
     return redact_error_text(value)

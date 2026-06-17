@@ -14,7 +14,8 @@ try:
     from .constants import MAX_DENY_REASON_LEN
     from .formatting import format_audit, format_pending, format_push_message
     from .redaction import redact_exception_text
-    from .state import PendingApproval, PluginState, UserRef, pending_storage_key
+    from .state import PluginState
+    from .state_models import PendingApproval, UserRef, pending_storage_key
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from approval_notifications import ApprovalNotificationPolicy
     from cloudcli_client import CloudCLIClient, CloudCLIError
@@ -23,7 +24,8 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from constants import MAX_DENY_REASON_LEN
     from formatting import format_audit, format_pending, format_push_message
     from redaction import redact_exception_text
-    from state import PendingApproval, PluginState, UserRef, pending_storage_key
+    from state import PluginState
+    from state_models import PendingApproval, UserRef, pending_storage_key
 
 
 SendProactive = Callable[[str, str], Awaitable[None]]

@@ -5,19 +5,32 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 try:
     from .sanitizer import compact_json, safe_json_value, safe_text
+    from .state_models import (
+        PendingApproval,
+        UserRef,
+        is_valid_request_id,
+        is_valid_session_id,
+        pending_storage_key,
+        safe_inline_text,
+    )
     from .state_storage import JsonStateStore
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from sanitizer import compact_json, safe_json_value, safe_text
+    from state_models import (
+        PendingApproval,
+        UserRef,
+        is_valid_request_id,
+        is_valid_session_id,
+        pending_storage_key,
+        safe_inline_text,
+    )
     from state_storage import JsonStateStore
 
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
-REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 RUN_ID_RE = re.compile(r"^[0-9]{1,12}$")
 
 MAX_SESSION_INDEX_ITEMS = 100
@@ -27,42 +40,6 @@ DEFAULT_MAX_RUN_HISTORY_PER_USER = 50
 DEFAULT_MAX_RUN_HISTORY_GLOBAL = 500
 MAX_STORED_TEXT = 1200
 PENDING_CLAIM_FIELDS = ("claimed_by", "claimed_action", "claimed_at")
-
-
-@dataclass(frozen=True)
-class UserRef:
-    user_key: str
-    display_name: str
-    unified_msg_origin: str
-    is_admin: bool = False
-    identity_verified: bool = True
-
-
-@dataclass
-class PendingApproval:
-    request_id: str
-    session_id: str
-    tool_name: str
-    input_data: Any
-    provider: str = "claude"
-    received_at: float = 0
-
-    @classmethod
-    def from_cloudcli(cls, payload: dict[str, Any]) -> "PendingApproval | None":
-        request_id = _read_str(payload.get("requestId") or payload.get("request_id"))
-        session_id = _read_str(payload.get("sessionId") or payload.get("session_id"))
-        if not request_id or not session_id:
-            return None
-        if not REQUEST_ID_RE.fullmatch(request_id) or not SESSION_ID_RE.fullmatch(session_id):
-            return None
-        return cls(
-            request_id=request_id,
-            session_id=session_id,
-            tool_name=_read_str(payload.get("toolName") or payload.get("tool_name")) or "UnknownTool",
-            input_data=safe_json_value(payload.get("input")),
-            provider=_read_str(payload.get("provider")) or "claude",
-            received_at=_parse_timestamp(payload.get("receivedAt")) or time.time(),
-        )
 
 
 class PluginState:
@@ -341,7 +318,7 @@ class PluginState:
             key = pending_storage_key(approval.session_id, approval.request_id)
             if not key:
                 return
-            pending[key] = self._pending_record(approval)
+            pending[key] = self._pending_record(approval, pending.get(key))
             self._data["pending"] = pending
             await self._save_locked()
 
@@ -836,9 +813,9 @@ class PluginState:
         record = {
             "request_id": approval.request_id,
             "session_id": approval.session_id,
-            "tool_name": safe_text(approval.tool_name, 120) or "UnknownTool",
+            "tool_name": safe_inline_text(approval.tool_name, 120) or "UnknownTool",
             "input_data": safe_json_value(approval.input_data),
-            "provider": safe_text(approval.provider, 60) or "claude",
+            "provider": safe_inline_text(approval.provider, 60) or "claude",
             "received_at": approval.received_at or time.time(),
             "resolved": False,
         }
@@ -884,20 +861,6 @@ class PluginState:
         self.store.write(self._data)
 
 
-def is_valid_session_id(value: str) -> bool:
-    return bool(SESSION_ID_RE.fullmatch(value or ""))
-
-
-def is_valid_request_id(value: str) -> bool:
-    return bool(REQUEST_ID_RE.fullmatch(value or ""))
-
-
-def pending_storage_key(session_id: str, request_id: str) -> str:
-    if not is_valid_session_id(session_id) or not is_valid_request_id(request_id):
-        return ""
-    return f"{session_id}|{request_id}"
-
-
 def resolve_data_path(plugin_file: str, plugin_name: str) -> Path:
     env_path = os.getenv("ASTRBOT_DATA_PATH") or os.getenv("ASTRBOT_DATA_DIR")
     if env_path:
@@ -926,9 +889,9 @@ def _normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
         normalized = {
             "request_id": request_id,
             "session_id": session_id,
-            "tool_name": safe_text(item.get("tool_name"), 120) or "UnknownTool",
+            "tool_name": safe_inline_text(item.get("tool_name"), 120) or "UnknownTool",
             "input_data": safe_json_value(item.get("input_data")),
-            "provider": safe_text(item.get("provider"), 60) or "claude",
+            "provider": safe_inline_text(item.get("provider"), 60) or "claude",
             "received_at": _parse_timestamp(item.get("received_at")) or time.time(),
             "resolved": bool(item.get("resolved") is True),
         }

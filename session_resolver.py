@@ -7,13 +7,15 @@ try:
     from .cloudcli_client import CloudCLIClient, CloudCLIError
     from .config import ConnectorSettings
     from .run_validation import is_index_session_ref
-    from .state import PluginState, UserRef, is_valid_session_id
+    from .state import PluginState
+    from .state_models import UserRef, is_valid_session_id
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from authz import AuthorizationPolicy
     from cloudcli_client import CloudCLIClient, CloudCLIError
     from config import ConnectorSettings
     from run_validation import is_index_session_ref
-    from state import PluginState, UserRef, is_valid_session_id
+    from state import PluginState
+    from state_models import UserRef, is_valid_session_id
 
 
 class SessionResolver:

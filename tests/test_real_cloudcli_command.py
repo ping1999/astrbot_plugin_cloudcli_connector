@@ -177,7 +177,7 @@ from main import CloudCLIConnectorPlugin  # noqa: E402
 from command_parser import parse_command  # noqa: E402
 from redaction import redact_text  # noqa: E402
 from run_validation import looks_like_github_url  # noqa: E402
-from state import PendingApproval, UserRef  # noqa: E402
+from state_models import PendingApproval, UserRef  # noqa: E402
 
 
 class FakePlatformMeta:

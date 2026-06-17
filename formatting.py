@@ -5,10 +5,10 @@ from typing import Any
 
 try:
     from .redaction import redact_text
-    from .state import PendingApproval
+    from .state_models import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from redaction import redact_text
-    from state import PendingApproval
+    from state_models import PendingApproval
 
 
 HELP_TEXT = """CloudCLI Connector 指令：
