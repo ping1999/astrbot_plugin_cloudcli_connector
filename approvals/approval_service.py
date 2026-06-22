@@ -102,6 +102,9 @@ class ApprovalService:
                 result="sent",
             )
             return f"已允许：{approval.tool_name} ({approval.session_id})"
+        except asyncio.CancelledError:
+            await self.state.release_pending_claim(approval.session_id, approval.request_id, user.user_key)
+            raise
         except CloudCLIError as exc:
             await self.state.release_pending_claim(approval.session_id, approval.request_id, user.user_key)
             await self.state.append_audit(
@@ -152,6 +155,9 @@ class ApprovalService:
                 result="sent",
             )
             return f"已拒绝：{approval.tool_name} ({approval.session_id})\n原因：{reason}"
+        except asyncio.CancelledError:
+            await self.state.release_pending_claim(approval.session_id, approval.request_id, user.user_key)
+            raise
         except CloudCLIError as exc:
             await self.state.release_pending_claim(approval.session_id, approval.request_id, user.user_key)
             await self.state.append_audit(
@@ -277,6 +283,7 @@ class ApprovalService:
     ) -> None:
         actor = "system"
         action = self.settings.approval_timeout_action
+        claimed_approval: PendingApproval | None = None
         try:
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
@@ -291,6 +298,7 @@ class ApprovalService:
                 )
                 if error or approval is None:
                     return
+                claimed_approval = approval
                 targets = self._approval_detail_targets(
                     await self.state.users_bound_to_session(approval.session_id)
                 )
@@ -301,6 +309,7 @@ class ApprovalService:
                         timeout_seconds,
                         targets,
                     )
+                    claimed_approval = None
                     if sent or attempts >= max(1, int(self.timeout_deny_max_attempts)):
                         return
                     retry_delay = min(
@@ -318,8 +327,15 @@ class ApprovalService:
                 )
                 await self._send_to_targets(targets, text)
                 await self.state.release_pending_claim(approval.session_id, approval.request_id, actor)
+                claimed_approval = None
                 return
         except asyncio.CancelledError:
+            if claimed_approval is not None:
+                await self.state.release_pending_claim(
+                    claimed_approval.session_id,
+                    claimed_approval.request_id,
+                    actor,
+                )
             raise
         except Exception as exc:
             approval = await self.state.get_pending(session_id, request_id)

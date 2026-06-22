@@ -6,32 +6,31 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
 
 import aiohttp
 
 try:
+    from .cloudcli_agent import CloudCLIAgentClient
     from .cloudcli_auth import CloudCLIAuth
     from .cloudcli_errors import CloudCLIError, CloudCLITimeout
     from .cloudcli_protocol import (
         build_api_url,
         build_ws_url,
-        iter_sse,
         redact_error_text,
     )
+    from .cloudcli_rest import CloudCLIRestClient
     from .cloudcli_transport import WaiterPredicate, WebSocketRequestMux
-    from .cloudcli_models import extract_recent_sessions
     from ..persistence.state_models import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from cloudcli.cloudcli_agent import CloudCLIAgentClient
     from cloudcli.cloudcli_auth import CloudCLIAuth
     from cloudcli.cloudcli_errors import CloudCLIError, CloudCLITimeout
     from cloudcli.cloudcli_protocol import (
         build_api_url,
         build_ws_url,
-        iter_sse,
         redact_error_text,
     )
-    from cloudcli.cloudcli_models import extract_recent_sessions
+    from cloudcli.cloudcli_rest import CloudCLIRestClient
     from cloudcli.cloudcli_transport import WaiterPredicate, WebSocketRequestMux
     from persistence.state_models import PendingApproval
 
@@ -80,6 +79,17 @@ class CloudCLIClient:
         self._auth = CloudCLIAuth(
             config=config,
             ensure_session=self._ensure_auth_http_session,
+            api_url=self._api_url,
+        )
+        self._rest = CloudCLIRestClient(
+            config=config,
+            auth=self._auth,
+            ensure_session=self._ensure_auth_http_session,
+            api_url=self._api_url,
+        )
+        self._agent = CloudCLIAgentClient(
+            config=config,
+            auth=self._auth,
             api_url=self._api_url,
         )
 
@@ -197,25 +207,7 @@ class CloudCLIClient:
         return result
 
     async def get_recent_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
-        await self._ensure_http_session()
-        token = await self._get_token()
-        headers = self._auth_headers(token)
-        params = {
-            "skipSynchronization": "false",
-            "sessionsLimit": str(max(1, min(limit, 100))),
-            "sessionsOffset": "0",
-        }
-        try:
-            data = await self._get_json_with_auth_retry("/api/projects", params, headers)
-        except CloudCLIError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise CloudCLIError(f"读取 CloudCLI 最近 session 失败：{exc}") from exc
-
-        try:
-            return extract_recent_sessions(data, limit)
-        except ValueError as exc:
-            raise CloudCLIError(str(exc)) from exc
+        return await self._rest.get_recent_sessions(limit)
 
     async def get_session_messages(
         self,
@@ -223,74 +215,11 @@ class CloudCLIClient:
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
-        await self._ensure_http_session()
-        token = await self._get_token()
-        params: dict[str, str] = {}
-        if limit >= 0:
-            params["limit"] = str(max(0, min(limit, 100)))
-            params["offset"] = str(max(0, offset))
-        path = f"/api/providers/sessions/{quote(session_id, safe='')}/messages"
-        try:
-            data = await self._get_json_with_auth_retry(path, params, self._auth_headers(token))
-        except CloudCLIError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise CloudCLIError(f"读取 CloudCLI session 消息失败：{exc}") from exc
-
-        if isinstance(data, dict):
-            return data
-        if isinstance(data, list):
-            return {
-                "messages": data,
-                "total": len(data),
-                "hasMore": False,
-                "offset": 0,
-                "limit": len(data),
-            }
-        raise CloudCLIError("无法解析 CloudCLI session 消息响应。")
+        return await self._rest.get_session_messages(session_id, limit, offset)
 
     async def stream_agent(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
-        headers = await self._agent_auth_headers()
-        request_payload = dict(payload)
-        request_payload["stream"] = True
-
-        timeout = aiohttp.ClientTimeout(
-            total=None,
-            sock_connect=max(3, self.config.timeout_seconds),
-            sock_read=max(10, self.config.agent_idle_timeout_seconds),
-        )
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    self._api_url("/api/agent"),
-                    json=request_payload,
-                    headers=headers,
-                ) as response:
-                    if response.status >= 400:
-                        body = await response.text()
-                        if response.status == 401 and not self.config.api_key:
-                            raise CloudCLIError(
-                                "CloudCLI agent API 认证失败：请在 cloudcli_api_key 填写 CloudCLI UI 生成的 API Key。"
-                            )
-                        raise CloudCLIError(
-                            f"CloudCLI agent API 请求失败：HTTP {response.status} {_redact_text(body)}"
-                        )
-
-                    content_type = response.headers.get("Content-Type", "")
-                    if "text/event-stream" not in content_type:
-                        data = await response.json(content_type=None)
-                        if isinstance(data, dict):
-                            yield {"type": "response", "data": data}
-                        else:
-                            yield {"type": "response", "data": {"raw": data}}
-                        return
-
-                    async for item in iter_sse(response.content):
-                        yield item
-        except CloudCLIError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise CloudCLIError(f"CloudCLI agent 任务执行失败：{_redact_text(str(exc))}") from exc
+        async for item in self._agent.stream_agent(payload):
+            yield item
 
     async def _agent_auth_headers(self) -> dict[str, str]:
         return await self._auth.agent_headers()
@@ -444,43 +373,6 @@ class CloudCLIClient:
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return self._auth.headers(token)
-
-    async def _get_json_with_auth_retry(
-        self,
-        path: str,
-        params: dict[str, str],
-        headers: dict[str, str],
-    ) -> Any:
-        data, unauthorized = await self._get_json(path, params, headers)
-        if not unauthorized:
-            return data
-        if self.config.jwt_token.strip() or not (self.config.username and self.config.password):
-            raise CloudCLIError("CloudCLI REST 认证失败，请检查 JWT token 或用户名/密码。")
-
-        await self._clear_cached_token()
-        token = await self._get_token()
-        data, unauthorized = await self._get_json(path, params, self._auth_headers(token))
-        if unauthorized:
-            raise CloudCLIError("CloudCLI REST 认证失败，请检查用户名/密码。")
-        return data
-
-    async def _get_json(
-        self,
-        path: str,
-        params: dict[str, str],
-        headers: dict[str, str],
-    ) -> tuple[Any, bool]:
-        async with self._session.get(  # type: ignore[union-attr]
-            self._api_url(path),
-            params=params,
-            headers=headers,
-        ) as response:
-            if response.status == 401:
-                return None, True
-            if response.status >= 400:
-                body = await response.text()
-                raise CloudCLIError(f"CloudCLI REST 请求失败：HTTP {response.status} {_redact_text(body)}")
-            return await response.json(content_type=None), False
 
     async def _request(
         self,

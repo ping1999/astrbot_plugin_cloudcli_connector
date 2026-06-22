@@ -13,21 +13,17 @@ try:
     from .state_models import (
         PendingApproval,
         UserRef,
-        is_valid_request_id,
         is_valid_session_id,
-        pending_storage_key,
-        safe_inline_text,
     )
+    from .pending_repository import PendingApprovalRepository, normalize_pending_records
     from .state_storage import JsonStateStore
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from core.sanitizer import compact_json, safe_json_value, safe_text
+    from persistence.pending_repository import PendingApprovalRepository, normalize_pending_records
     from persistence.state_models import (
         PendingApproval,
         UserRef,
-        is_valid_request_id,
         is_valid_session_id,
-        pending_storage_key,
-        safe_inline_text,
     )
     from persistence.state_storage import JsonStateStore
 
@@ -39,7 +35,6 @@ MAX_AUDIT_ITEMS = 500
 DEFAULT_MAX_RUN_HISTORY_PER_USER = 50
 DEFAULT_MAX_RUN_HISTORY_GLOBAL = 500
 MAX_STORED_TEXT = 1200
-PENDING_CLAIM_FIELDS = ("claimed_by", "claimed_action", "claimed_at")
 
 
 class PluginState:
@@ -67,7 +62,7 @@ class PluginState:
                 if isinstance(loaded, dict):
                     self._data["version"] = 3
                     self._data["users"] = _read_dict(loaded.get("users"))
-                    self._data["pending"] = _normalize_pending_records(_read_dict(loaded.get("pending")))
+                    self._data["pending"] = normalize_pending_records(_read_dict(loaded.get("pending")))
                     self._data["runs"] = _normalize_run_records(_read_dict(loaded.get("runs")))
                     self._data["audit"] = _normalize_audit_records(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
                     self._data["next_run_id"] = _read_positive_int(
@@ -314,59 +309,25 @@ class PluginState:
 
     async def upsert_pending(self, approval: PendingApproval) -> None:
         async with self._lock:
-            pending = _read_dict(self._data.get("pending"))
-            key = pending_storage_key(approval.session_id, approval.request_id)
-            if not key:
-                return
-            pending[key] = self._pending_record(approval, pending.get(key))
-            self._data["pending"] = pending
-            await self._save_locked()
+            if self._pending_repo_locked().upsert(approval):
+                await self._save_locked()
 
     async def remove_pending(self, session_id: str, request_id: str) -> None:
         async with self._lock:
-            pending = _read_dict(self._data.get("pending"))
-            pending.pop(pending_storage_key(session_id, request_id), None)
-            self._data["pending"] = pending
+            self._pending_repo_locked().remove(session_id, request_id)
             await self._save_locked()
 
     async def get_pending(self, session_id: str, request_id: str) -> PendingApproval | None:
         async with self._lock:
-            item = _read_dict(self._data.get("pending")).get(
-                pending_storage_key(session_id, request_id)
-            )
-            if not isinstance(item, dict) or item.get("resolved") is True:
-                return None
-            session_id = _read_str(item.get("session_id"))
-            if not is_valid_session_id(session_id):
-                return None
-            return PendingApproval(
-                request_id=_read_str(item.get("request_id")) or request_id,
-                session_id=session_id,
-                tool_name=_read_str(item.get("tool_name")) or "UnknownTool",
-                input_data=item.get("input_data"),
-                provider=_read_str(item.get("provider")) or "claude",
-                received_at=float(item.get("received_at") or 0),
-            )
+            return self._pending_repo_locked().get(session_id, request_id)
 
     async def list_pending(self) -> list[PendingApproval]:
         async with self._lock:
-            pending = _read_dict(self._data.get("pending"))
-            approvals: list[PendingApproval] = []
-            for item in pending.values():
-                approval = self._pending_from_record(item)
-                if approval is not None:
-                    approvals.append(approval)
-            approvals.sort(key=lambda item: (item.received_at, item.session_id, item.request_id))
-            return approvals
+            return self._pending_repo_locked().list()
 
     async def merge_pending(self, approvals: list[PendingApproval]) -> None:
         async with self._lock:
-            pending = _read_dict(self._data.get("pending"))
-            for approval in approvals:
-                key = pending_storage_key(approval.session_id, approval.request_id)
-                if key:
-                    pending[key] = self._pending_record(approval, pending.get(key))
-            self._data["pending"] = pending
+            self._pending_repo_locked().merge(approvals)
             await self._save_locked()
 
     async def replace_pending_for_session(
@@ -374,26 +335,8 @@ class PluginState:
         session_id: str,
         approvals: list[PendingApproval],
     ) -> list[str]:
-        if not is_valid_session_id(session_id):
-            return []
         async with self._lock:
-            pending = _read_dict(self._data.get("pending"))
-            incoming = {
-                pending_storage_key(approval.session_id, approval.request_id): approval
-                for approval in approvals
-                if approval.session_id == session_id and is_valid_request_id(approval.request_id)
-            }
-            removed: list[str] = []
-            for key, item in list(pending.items()):
-                if not isinstance(item, dict):
-                    continue
-                if _read_str(item.get("session_id")) == session_id and key not in incoming:
-                    removed.append(key)
-                    pending.pop(key, None)
-            for key, approval in incoming.items():
-                if key:
-                    pending[key] = self._pending_record(approval, pending.get(key))
-            self._data["pending"] = pending
+            removed = self._pending_repo_locked().replace_for_session(session_id, approvals)
             await self._save_locked()
             return removed
 
@@ -405,33 +348,7 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             bindings = _bindings_for_origin(entry, _origin_key(user))
-            if not bindings:
-                return []
-            pending = _read_dict(self._data.get("pending"))
-            approvals = []
-            for item in pending.values():
-                if not isinstance(item, dict):
-                    continue
-                session_id = _read_str(item.get("session_id"))
-                request_id = _read_str(item.get("request_id"))
-                if session_id not in bindings or not request_id:
-                    continue
-                if item.get("resolved") is True:
-                    continue
-                approvals.append(
-                    PendingApproval(
-                        request_id=request_id,
-                        session_id=session_id,
-                        tool_name=_read_str(item.get("tool_name")) or "UnknownTool",
-                        input_data=item.get("input_data"),
-                        provider=_read_str(item.get("provider")) or "claude",
-                        received_at=float(item.get("received_at") or 0),
-                    )
-                )
-            approvals.sort(key=lambda item: (item.received_at, item.request_id))
-            if max_items < 1:
-                max_items = 1
-            return approvals[:max_items]
+            return self._pending_repo_locked().visible_for_bindings(bindings, max_items)
 
     async def resolve_visible_request(
         self,
@@ -460,7 +377,8 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             bindings = _bindings_for_origin(entry, _origin_key(user))
-            visible = self._visible_pending_locked(bindings, max_items)
+            repo = self._pending_repo_locked()
+            visible = repo.visible_for_bindings(bindings, max_items)
             if not visible:
                 return None, "当前没有待审批权限。"
             if request_no is None:
@@ -471,12 +389,14 @@ class PluginState:
                 if request_no < 1 or request_no > len(visible):
                     return None, f"序号无效，请输入 1-{len(visible)}。"
                 approval = visible[request_no - 1]
-            return await self._claim_pending_locked(
+            result = repo.claim(
                 approval.session_id,
                 approval.request_id,
                 actor=user.user_key,
                 action=action,
             )
+            await self._save_locked()
+            return result
 
     async def claim_pending(
         self,
@@ -487,27 +407,19 @@ class PluginState:
         action: str,
     ) -> tuple[PendingApproval | None, str | None]:
         async with self._lock:
-            return await self._claim_pending_locked(
+            result = self._pending_repo_locked().claim(
                 session_id,
                 request_id,
                 actor=actor,
                 action=action,
             )
+            await self._save_locked()
+            return result
 
     async def release_pending_claim(self, session_id: str, request_id: str, actor: str) -> None:
         async with self._lock:
-            pending = _read_dict(self._data.get("pending"))
-            key = pending_storage_key(session_id, request_id)
-            item = pending.get(key)
-            if not isinstance(item, dict):
-                return
-            if _read_str(item.get("claimed_by")) != actor:
-                return
-            for field in PENDING_CLAIM_FIELDS:
-                item.pop(field, None)
-            pending[key] = item
-            self._data["pending"] = pending
-            await self._save_locked()
+            if self._pending_repo_locked().release_claim(session_id, request_id, actor):
+                await self._save_locked()
 
     async def create_run_task(
         self,
@@ -693,6 +605,9 @@ class PluginState:
             items.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
             return items[: max(1, min(limit, 50))]
 
+    def _pending_repo_locked(self) -> PendingApprovalRepository:
+        return PendingApprovalRepository(self._data)
+
     def _user_entry(self, user_key: str) -> dict[str, Any]:
         users = _read_dict(self._data.get("users"))
         self._data["users"] = users
@@ -750,81 +665,6 @@ class PluginState:
         ids = [int(key) for key in runs if isinstance(key, str) and RUN_ID_RE.fullmatch(key)]
         return max(ids, default=0) + 1
 
-    async def _claim_pending_locked(
-        self,
-        session_id: str,
-        request_id: str,
-        *,
-        actor: str,
-        action: str,
-    ) -> tuple[PendingApproval | None, str | None]:
-        pending = _read_dict(self._data.get("pending"))
-        key = pending_storage_key(session_id, request_id)
-        item = pending.get(key)
-        approval = self._pending_from_record(item)
-        if approval is None:
-            return None, "当前没有待审批权限，可能已经被处理。"
-        claimed_by = _read_str(item.get("claimed_by")) if isinstance(item, dict) else ""
-        if claimed_by:
-            return None, "该审批请求正在被处理，请稍后执行 /cloudcli pending 刷新。"
-        item["claimed_by"] = safe_text(actor, 200)
-        item["claimed_action"] = safe_text(action, 40)
-        item["claimed_at"] = time.time()
-        pending[key] = item
-        self._data["pending"] = pending
-        await self._save_locked()
-        return approval, None
-
-    def _visible_pending_locked(self, bindings: list[str], max_items: int) -> list[PendingApproval]:
-        if not bindings:
-            return []
-        pending = _read_dict(self._data.get("pending"))
-        approvals = []
-        for item in pending.values():
-            if not isinstance(item, dict):
-                continue
-            if _read_str(item.get("session_id")) not in bindings:
-                continue
-            approval = self._pending_from_record(item)
-            if approval is not None:
-                approvals.append(approval)
-        approvals.sort(key=lambda item: (item.received_at, item.request_id))
-        if max_items < 1:
-            max_items = 1
-        return approvals[:max_items]
-
-    def _pending_from_record(self, item: Any) -> PendingApproval | None:
-        if not isinstance(item, dict) or item.get("resolved") is True:
-            return None
-        session_id = _read_str(item.get("session_id"))
-        request_id = _read_str(item.get("request_id"))
-        if not is_valid_session_id(session_id) or not is_valid_request_id(request_id):
-            return None
-        return PendingApproval(
-            request_id=request_id,
-            session_id=session_id,
-            tool_name=_read_str(item.get("tool_name")) or "UnknownTool",
-            input_data=item.get("input_data"),
-            provider=_read_str(item.get("provider")) or "claude",
-            received_at=float(item.get("received_at") or 0),
-        )
-
-    def _pending_record(self, approval: PendingApproval, existing: Any = None) -> dict[str, Any]:
-        record = {
-            "request_id": approval.request_id,
-            "session_id": approval.session_id,
-            "tool_name": safe_inline_text(approval.tool_name, 120) or "UnknownTool",
-            "input_data": safe_json_value(approval.input_data),
-            "provider": safe_inline_text(approval.provider, 60) or "claude",
-            "received_at": approval.received_at or time.time(),
-            "resolved": False,
-        }
-        if isinstance(existing, dict):
-            for field in PENDING_CLAIM_FIELDS:
-                if existing.get(field):
-                    record[field] = existing[field]
-        return record
-
     def _prune_runs_locked(
         self,
         runs: dict[str, Any],
@@ -872,35 +712,6 @@ def resolve_data_path(plugin_file: str, plugin_name: str) -> Path:
             return parent / "plugin_data" / plugin_name
 
     return plugin_dir / ".runtime_data"
-
-
-def _normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, item in value.items():
-        if not isinstance(item, dict):
-            continue
-        session_id = _read_str(item.get("session_id"))
-        request_id = _read_str(item.get("request_id"))
-        if not request_id and isinstance(key, str):
-            request_id = key.split("|", 1)[-1]
-        storage_key = pending_storage_key(session_id, request_id)
-        if not storage_key:
-            continue
-        normalized = {
-            "request_id": request_id,
-            "session_id": session_id,
-            "tool_name": safe_inline_text(item.get("tool_name"), 120) or "UnknownTool",
-            "input_data": safe_json_value(item.get("input_data")),
-            "provider": safe_inline_text(item.get("provider"), 60) or "claude",
-            "received_at": _parse_timestamp(item.get("received_at")) or time.time(),
-            "resolved": bool(item.get("resolved") is True),
-        }
-        normalized["session_id"] = session_id
-        normalized["request_id"] = request_id
-        for field in PENDING_CLAIM_FIELDS:
-            normalized.pop(field, None)
-        result[storage_key] = normalized
-    return result
 
 
 def _normalize_run_records(value: dict[str, Any]) -> dict[str, Any]:

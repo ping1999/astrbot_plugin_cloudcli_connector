@@ -142,7 +142,7 @@ def format_chat_messages(session_id: str, payload: dict[str, Any], limit: int, t
     return clip_text("\n".join(lines), text_limit)
 
 
-def format_agent_start_message(payload: dict[str, Any], run_id: str = "") -> str:
+def format_agent_start_message(payload: dict[str, Any], run_id: str = "", text_limit: int = 1800) -> str:
     target = payload.get("projectPath") or payload.get("githubUrl") or payload.get("sessionId") or "(unknown)"
     provider = payload.get("provider") or "claude"
     extras = []
@@ -155,13 +155,16 @@ def format_agent_start_message(payload: dict[str, Any], run_id: str = "") -> str
     if payload.get("createPR"):
         extras.append("createPR=true")
     suffix = f"\n{', '.join(extras)}" if extras else ""
-    return f"已启动 CloudCLI agent 任务：\nprovider: {provider}\ntarget: {target}{suffix}"
+    return clip_text(
+        f"已启动 CloudCLI agent 任务：\nprovider: {provider}\ntarget: {target}{suffix}",
+        text_limit,
+    )
 
 
 def format_agent_status(event: dict[str, Any], text_limit: int) -> str:
     event_type = str(event.get("type") or event.get("event") or "")
     if event_type == "session-id":
-        return f"CloudCLI 任务 session：{event.get('sessionId')}"
+        return clip_text(f"CloudCLI 任务 session：{event.get('sessionId')}", text_limit)
     if event_type == "status":
         message = _read_str(event.get("message")) or "状态更新"
         project_path = _read_str(event.get("projectPath"))
@@ -169,9 +172,9 @@ def format_agent_status(event: dict[str, Any], text_limit: int) -> str:
             return clip_text(f"CloudCLI 任务状态：{message}\nproject: {project_path}", text_limit)
         return clip_text(f"CloudCLI 任务状态：{message}", text_limit)
     if event_type == "github-branch":
-        return f"CloudCLI 已创建/使用分支：{_render_compact_json(event.get('branch'))}"
+        return clip_text(f"CloudCLI 已创建/使用分支：{_render_compact_json(event.get('branch'))}", text_limit)
     if event_type == "github-pr":
-        return f"CloudCLI 已创建 PR：{_render_compact_json(event.get('pullRequest'))}"
+        return clip_text(f"CloudCLI 已创建 PR：{_render_compact_json(event.get('pullRequest'))}", text_limit)
     if event_type == "github-error":
         return clip_text(f"CloudCLI GitHub 操作失败：{_read_str(event.get('error'))}", text_limit)
     return ""

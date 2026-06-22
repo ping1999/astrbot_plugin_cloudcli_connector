@@ -112,7 +112,11 @@ class RunService:
             lambda _task, task_id=run_id, user_key=user.user_key: self._on_run_task_done(task_id, user_key)
         )
         self.track_task(task)
-        return format_agent_start_message(parsed.payload, run_id)
+        return format_agent_start_message(
+            parsed.payload,
+            run_id,
+            self.settings.max_push_text_length,
+        )
 
     async def handle_run_control(self, user: UserRef, args: list[str]) -> str:
         if not user.identity_verified:

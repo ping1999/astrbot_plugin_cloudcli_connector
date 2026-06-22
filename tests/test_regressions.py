@@ -14,7 +14,14 @@ from cloudcli.cloudcli_protocol import build_ws_url, parse_sse_event
 from cloudcli.cloudcli_transport import WebSocketRequestMux
 from commands.command_parser import ParsedCommand
 from commands.command_router import CommandRoute, CommandRouter
-from commands.formatting import format_health_report, format_pending, format_run_tasks, format_session_overview
+from commands.formatting import (
+    format_agent_start_message,
+    format_agent_status,
+    format_health_report,
+    format_pending,
+    format_run_tasks,
+    format_session_overview,
+)
 from commands.handlers import CloudCLICommandHandlers
 from core.config import load_connector_settings
 from core.redaction import redact_exception_text
@@ -229,7 +236,7 @@ class IdentityTests(unittest.TestCase):
             async def get_recent_sessions(self, limit: int = 100) -> list[dict[str, str]]:
                 return []
 
-        async def scenario() -> tuple[str, str]:
+        async def scenario() -> tuple[str, str, str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 settings = load_connector_settings(
                     {
@@ -252,6 +259,7 @@ class IdentityTests(unittest.TestCase):
                     client=FakeClient(),
                 )
                 blocked = await resolver.direct_bind_error(user, "1")
+                raw_cached_blocked = await resolver.direct_bind_error(user, "sess-1")
 
                 allowed_settings = load_connector_settings(
                     {
@@ -268,10 +276,11 @@ class IdentityTests(unittest.TestCase):
                     client=FakeClient(),
                 )
                 allowed = await allowed_resolver.direct_bind_error(user, "1")
-                return blocked, allowed
+                return blocked, raw_cached_blocked, allowed
 
-        blocked, allowed = asyncio.run(scenario())
+        blocked, raw_cached_blocked, allowed = asyncio.run(scenario())
         self.assertIn("不能直接使用未绑定的 sessionId", blocked)
+        self.assertIn("不能直接使用未绑定的 sessionId", raw_cached_blocked)
         self.assertEqual("", allowed)
 
 
@@ -637,6 +646,22 @@ class FormattingTests(unittest.TestCase):
         )
         self.assertLessEqual(len(rendered), 380)
         self.assertIn("已截断", rendered)
+
+    def test_agent_start_and_status_messages_are_clipped(self) -> None:
+        start = format_agent_start_message(
+            {"provider": "codex", "projectPath": "C:/repo/" + ("x" * 1000)},
+            "1",
+            240,
+        )
+        status = format_agent_status(
+            {"type": "github-branch", "branch": {"name": "x" * 1000}},
+            240,
+        )
+
+        self.assertLessEqual(len(start), 320)
+        self.assertLessEqual(len(status), 320)
+        self.assertIn("已截断", start)
+        self.assertIn("已截断", status)
 
 
 class StateTests(unittest.TestCase):
@@ -1108,31 +1133,27 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual("api-secret", headers.get("X-API-Key"))
 
     def test_recent_sessions_do_not_inherit_unauthenticated_ws_setting(self) -> None:
-        class TestClient(CloudCLIClient):
-            def __init__(self) -> None:
-                super().__init__(
-                    CloudCLIConfig(
-                        base_url="http://127.0.0.1:3001",
-                        allow_unauthenticated_ws=True,
-                    ),
-                    on_permission_request=lambda _approval: asyncio.sleep(0),
-                )
-                self.allow_anonymous_values: list[bool] = []
+        async def scenario() -> list[bool]:
+            client = CloudCLIClient(
+                CloudCLIConfig(
+                    base_url="http://127.0.0.1:3001",
+                    allow_unauthenticated_ws=True,
+                ),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            allow_anonymous_values: list[bool] = []
 
-            async def _ensure_http_session(self) -> None:
-                return None
-
-            async def _get_token(self, *, allow_anonymous: bool = False) -> str:
-                self.allow_anonymous_values.append(allow_anonymous)
+            async def get_token(*, allow_anonymous: bool = False) -> str:
+                allow_anonymous_values.append(allow_anonymous)
                 return "token"
 
-            async def _get_json_with_auth_retry(self, path, params, headers):
+            async def get_json_with_auth_retry(path, params, headers):
                 return {"projects": []}
 
-        async def scenario() -> list[bool]:
-            client = TestClient()
+            client._rest.auth.get_token = get_token  # type: ignore[method-assign]
+            client._rest._get_json_with_auth_retry = get_json_with_auth_retry  # type: ignore[method-assign]
             await client.get_recent_sessions(1)
-            return client.allow_anonymous_values
+            return allow_anonymous_values
 
         self.assertEqual([False], asyncio.run(scenario()))
 
@@ -1244,6 +1265,83 @@ class ApprovalServiceTests(unittest.TestCase):
         result, decision_sent = asyncio.run(scenario())
         self.assertIn("同步 CloudCLI 待审批权限失败", result)
         self.assertFalse(decision_sent)
+
+    def test_cancelled_allow_releases_pending_claim(self) -> None:
+        class CancellingClient:
+            async def get_pending_permissions(self, session_id: str):
+                return [PendingApproval("request-1", session_id, "Tool", {"value": 1})]
+
+            async def send_permission_decision(self, *args, **kwargs) -> None:
+                raise asyncio.CancelledError()
+
+        async def scenario() -> tuple[bool, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = load_connector_settings({})
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin", is_admin=True)
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+                service = ApprovalService(
+                    settings=settings,
+                    state=state,
+                    client=CancellingClient(),  # type: ignore[arg-type]
+                    notifications=ApprovalNotificationPolicy(
+                        approval_allowed_user_keys=frozenset(),
+                        approval_require_admin=True,
+                    ),
+                    send_proactive=lambda _origin, _text: asyncio.sleep(0),
+                    track_task=lambda _task: None,
+                )
+                try:
+                    await service.handle_allow(user, [])
+                except asyncio.CancelledError:
+                    pass
+                claimed, error = await state.claim_visible_request(user, None, 10, "deny")
+                return claimed is not None, error or ""
+
+        claimed, error = asyncio.run(scenario())
+        self.assertTrue(claimed)
+        self.assertEqual("", error)
+
+    def test_cancelled_timeout_worker_releases_pending_claim(self) -> None:
+        async def scenario() -> tuple[bool, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = load_connector_settings({"approval_allowed_user_keys": "test:u1"})
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+
+                async def send_proactive(_origin: str, _text: str) -> None:
+                    raise asyncio.CancelledError()
+
+                service = ApprovalService(
+                    settings=settings,
+                    state=state,
+                    client=object(),  # type: ignore[arg-type]
+                    notifications=ApprovalNotificationPolicy(
+                        approval_allowed_user_keys=frozenset({"test:u1"}),
+                        approval_require_admin=True,
+                    ),
+                    send_proactive=send_proactive,
+                    track_task=lambda _task: None,
+                )
+                try:
+                    await service._timeout_worker("sess-1", "request-1", 0, 1)
+                except asyncio.CancelledError:
+                    pass
+                claimed, error = await state.claim_visible_request(user, None, 10, "deny")
+                return claimed is not None, error or ""
+
+        claimed, error = asyncio.run(scenario())
+        self.assertTrue(claimed)
+        self.assertEqual("", error)
 
     def test_timeout_deny_retries_after_temporary_send_failure(self) -> None:
         class FlakyClient:
