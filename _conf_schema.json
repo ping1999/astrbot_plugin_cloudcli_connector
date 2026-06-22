@@ -27,7 +27,7 @@
     "description": "CloudCLI global API key",
     "type": "string",
     "default": "",
-    "hint": "Optional. Required only if CloudCLI server was started with API_KEY."
+    "hint": "Required for /cloudcli run. Also required for protected REST/WS endpoints when CloudCLI server was started with API_KEY."
   },
   "allow_unauthenticated_ws": {
     "description": "Allow unauthenticated WebSocket",

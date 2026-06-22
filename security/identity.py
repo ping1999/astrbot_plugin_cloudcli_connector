@@ -13,12 +13,15 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 async def build_user_ref(event: Any) -> UserRef:
     platform_id = await _call_or_attr(event, "get_platform_id") or "unknown-platform"
     sender_id = await _call_or_attr(event, "get_sender_id")
+    session_id = await _call_or_attr(event, "get_session_id")
     unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "")
+    if not unified_msg_origin:
+        unified_msg_origin = _fallback_origin(platform_id, session_id, sender_id)
     identity_verified = bool(sender_id)
 
     if not sender_id:
-        session_id = await _call_or_attr(event, "get_session_id") or unified_msg_origin or "unknown-session"
-        sender_id = f"unidentified:{_stable_digest(str(session_id))}"
+        identity_scope = session_id or unified_msg_origin or "unknown-session"
+        sender_id = f"unidentified:{_stable_digest(str(identity_scope))}"
 
     raw_display_name = await _call_or_attr(event, "get_sender_name") or str(sender_id)
     display_name = safe_inline_text(raw_display_name, 160) or str(sender_id)
@@ -67,3 +70,8 @@ async def _is_event_admin(event: Any) -> bool:
 
 def _stable_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _fallback_origin(platform_id: str, session_id: str, sender_id: str) -> str:
+    scope = session_id or sender_id or "unknown-session"
+    return f"{platform_id}:fallback:{_stable_digest(scope)}"

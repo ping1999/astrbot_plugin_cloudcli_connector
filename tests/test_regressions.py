@@ -117,6 +117,27 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(user.display_name, "Async User")
         self.assertTrue(user.identity_verified)
 
+    def test_missing_origin_uses_session_scoped_fallback(self) -> None:
+        class Event:
+            def __init__(self, session_id: str) -> None:
+                self._session_id = session_id
+
+            def get_platform_id(self) -> str:
+                return "test"
+
+            def get_sender_id(self) -> str:
+                return "u1"
+
+            def get_session_id(self) -> str:
+                return self._session_id
+
+        first = asyncio.run(build_user_ref(Event("group-1")))
+        second = asyncio.run(build_user_ref(Event("group-2")))
+
+        self.assertTrue(first.identity_verified)
+        self.assertTrue(first.unified_msg_origin.startswith("test:fallback:"))
+        self.assertNotEqual(first.unified_msg_origin, second.unified_msg_origin)
+
     def test_display_name_is_single_line(self) -> None:
         class Event:
             unified_msg_origin = "origin"
@@ -269,10 +290,10 @@ class ConfigTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_ws_url_keeps_base_path_and_escapes_token(self) -> None:
+    def test_ws_url_keeps_base_path_without_query_token(self) -> None:
         self.assertEqual(
             build_ws_url("https://example.com/cloudcli", "a b"),
-            "wss://example.com/cloudcli/ws?token=a+b",
+            "wss://example.com/cloudcli/ws",
         )
 
     def test_parse_sse_event(self) -> None:

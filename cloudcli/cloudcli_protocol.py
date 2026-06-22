@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from typing import Any
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     from ..core.redaction import redact_text
@@ -19,12 +19,11 @@ def build_api_url(base_url: str, path: str) -> str:
     return f"{base_url.rstrip('/')}{path}"
 
 
-def build_ws_url(base_url: str, token: str) -> str:
+def build_ws_url(base_url: str, _token: str = "") -> str:
     split = urlsplit(base_url.rstrip("/"))
     scheme = "wss" if split.scheme == "https" else "ws"
     path = f"{split.path.rstrip('/')}/ws"
-    query = urlencode({"token": token}) if token else ""
-    return urlunsplit((scheme, split.netloc, path, query, ""))
+    return urlunsplit((scheme, split.netloc, path, "", ""))
 
 
 def build_auth_headers(token: str, api_key: str) -> dict[str, str]:
