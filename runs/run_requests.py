@@ -149,9 +149,18 @@ class RunRequestBuilder:
         assert target is not None
 
         project_path = target.project_path if isinstance(target, (ProjectTarget, SessionTarget)) else ""
-        project_error = self.authz.validate_project_path(user, project_path)
-        if project_error:
-            return None, project_error
+        project_decision = self.authz.authorize_project_path(user, project_path)
+        if not project_decision.allowed:
+            return None, project_decision.message
+        if project_decision.path:
+            if isinstance(target, ProjectTarget):
+                target = ProjectTarget(project_decision.path)
+            elif isinstance(target, SessionTarget):
+                target = SessionTarget(
+                    session_id=target.session_id,
+                    project_path=project_decision.path,
+                    provider=target.provider,
+                )
 
         provider = options.provider
         if not provider and isinstance(target, SessionTarget):

@@ -250,12 +250,12 @@ class CloudCLICommandHandlers:
             return f"获取 CloudCLI session 消息失败：{exc}"
 
     async def handle_run(self, user: UserRef, args: list[str]) -> str:
-        if args and args[0] in {"list", "log", "cancel"}:
-            return await self.run_service.handle_run_control(user, args)
-
         decision = self.authz.can_run_agent(user)
         if not decision.allowed:
             return decision.message
+        if args and args[0] in {"list", "log", "cancel"}:
+            return await self.run_service.handle_run_control(user, args)
+
         return await self.run_service.handle_run(user, args)
 
     async def handle_pending(self, user: UserRef) -> str:

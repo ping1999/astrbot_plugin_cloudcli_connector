@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from cloudcli.cloudcli_transport import WebSocketRequestMux
 from commands.command_parser import ParsedCommand
 from commands.command_router import CommandRoute, CommandRouter
 from commands.formatting import format_health_report, format_pending, format_run_tasks, format_session_overview
+from commands.handlers import CloudCLICommandHandlers
 from core.config import load_connector_settings
 from core.redaction import redact_exception_text
 from persistence.state import PluginState
@@ -288,6 +290,23 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertNotIn("user:pass", rendered)
 
+    def test_plain_http_with_credentials_is_limited_to_loopback(self) -> None:
+        remote = load_connector_settings(
+            {
+                "cloudcli_base_url": "http://example.com:3001/cloudcli",
+                "cloudcli_api_key": "secret",
+            }
+        )
+        local = load_connector_settings(
+            {
+                "cloudcli_base_url": "http://localhost:3001/cloudcli",
+                "cloudcli_api_key": "secret",
+            }
+        )
+
+        self.assertEqual("http://127.0.0.1:3001", remote.cloudcli.base_url)
+        self.assertEqual("http://localhost:3001/cloudcli", local.cloudcli.base_url)
+
 
 class ProtocolTests(unittest.TestCase):
     def test_ws_url_keeps_base_path_without_query_token(self) -> None:
@@ -397,6 +416,42 @@ class CommandRouterTests(unittest.TestCase):
         self.assertIn("help text", asyncio.run(scenario()))
 
 
+class CommandHandlerTests(unittest.TestCase):
+    def test_run_control_requires_current_run_permission(self) -> None:
+        class FakeRunService:
+            called = False
+
+            async def handle_run_control(self, user: UserRef, args: list[str]) -> str:
+                self.called = True
+                return "control"
+
+            async def handle_run(self, user: UserRef, args: list[str]) -> str:
+                self.called = True
+                return "run"
+
+        async def scenario() -> tuple[str, bool]:
+            settings = load_connector_settings({"run_access_mode": "allowlist_only"})
+            run_service = FakeRunService()
+            handlers = CloudCLICommandHandlers(
+                settings=settings,
+                authz=AuthorizationPolicy(settings),
+                state=object(),  # type: ignore[arg-type]
+                client=object(),  # type: ignore[arg-type]
+                session_resolver=object(),  # type: ignore[arg-type]
+                run_service=run_service,  # type: ignore[arg-type]
+                approval_service=object(),  # type: ignore[arg-type]
+            )
+            result = await handlers.handle_run(
+                UserRef("test:u1", "User", "origin"),
+                ["list"],
+            )
+            return result, run_service.called
+
+        result, called = asyncio.run(scenario())
+        self.assertIn("CloudCLI agent", result)
+        self.assertFalse(called)
+
+
 class FakeSessions:
     def __init__(self, project_path: str, provider: str = "codex") -> None:
         self.project_path = project_path
@@ -446,6 +501,41 @@ class RunRequestTests(unittest.TestCase):
         parsed, error = asyncio.run(scenario())
         self.assertIsNone(parsed)
         self.assertIn("不能同时使用", error or "")
+
+    def test_run_project_target_sends_authorized_absolute_path(self) -> None:
+        async def scenario() -> tuple[str, str, str | None]:
+            original_cwd = Path.cwd()
+            with tempfile.TemporaryDirectory() as temp_dir:
+                project = Path(temp_dir) / "repo"
+                project.mkdir()
+                try:
+                    os.chdir(project)
+                    settings = load_connector_settings(
+                        {
+                            "run_access_mode": "authenticated",
+                            "allowed_project_roots": ".",
+                        }
+                    )
+                    builder = RunRequestBuilder(
+                        settings=settings,
+                        authz=AuthorizationPolicy(settings),
+                        sessions=FakeSessions("unused"),
+                    )
+                    parsed, error = await builder.parse(
+                        UserRef("test:u1", "User", "origin"),
+                        ["--project", ".", "doit"],
+                    )
+                    return (
+                        "" if parsed is None else str(parsed.payload.get("projectPath") or ""),
+                        str(project.resolve(strict=False)),
+                        error,
+                    )
+                finally:
+                    os.chdir(original_cwd)
+
+        project_path, expected_path, error = asyncio.run(scenario())
+        self.assertIsNone(error)
+        self.assertEqual(os.path.normcase(expected_path), os.path.normcase(project_path))
 
     def test_run_session_target_validates_resolved_project_path(self) -> None:
         async def scenario() -> tuple[object | None, str | None]:
@@ -1154,6 +1244,50 @@ class ApprovalServiceTests(unittest.TestCase):
         result, decision_sent = asyncio.run(scenario())
         self.assertIn("同步 CloudCLI 待审批权限失败", result)
         self.assertFalse(decision_sent)
+
+    def test_timeout_deny_retries_after_temporary_send_failure(self) -> None:
+        class FlakyClient:
+            attempts = 0
+
+            async def send_permission_decision(self, *args, **kwargs) -> None:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise CloudCLIError("temporary failure")
+
+        async def scenario() -> tuple[int, bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = load_connector_settings(
+                    {
+                        "approval_timeout_action": "deny",
+                        "approval_allowed_user_keys": "test:u1",
+                    }
+                )
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+                client = FlakyClient()
+                service = ApprovalService(
+                    settings=settings,
+                    state=state,
+                    client=client,  # type: ignore[arg-type]
+                    notifications=ApprovalNotificationPolicy(
+                        approval_allowed_user_keys=frozenset({"test:u1"}),
+                        approval_require_admin=True,
+                    ),
+                    send_proactive=lambda _origin, _text: asyncio.sleep(0),
+                    track_task=lambda _task: None,
+                )
+                service.timeout_deny_retry_initial_seconds = 0
+                await service._timeout_worker("sess-1", "request-1", 0, 1)
+                return client.attempts, await state.get_pending("sess-1", "request-1") is None
+
+        attempts, removed = asyncio.run(scenario())
+        self.assertEqual(2, attempts)
+        self.assertTrue(removed)
 
 
 class RedactionTests(unittest.TestCase):

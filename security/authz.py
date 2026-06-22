@@ -20,6 +20,13 @@ class Decision:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class ProjectPathDecision:
+    allowed: bool
+    path: str = ""
+    message: str = ""
+
+
 class AuthorizationPolicy:
     def __init__(self, settings: ConnectorSettings) -> None:
         self.settings = settings
@@ -110,23 +117,30 @@ class AuthorizationPolicy:
             "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 approval_allowed_user_keys。",
         )
 
-    def validate_project_path(self, user: UserRef, project_path: str) -> str:
+    def authorize_project_path(self, user: UserRef, project_path: str) -> ProjectPathDecision:
         if not project_path:
-            return ""
+            return ProjectPathDecision(True, "")
+
+        resolved_project = _resolve_path(project_path)
         roots = self.settings.allowed_project_roots
         if not roots:
             if user.is_admin or self.settings.allow_unrestricted_project_paths:
-                return ""
-            return (
+                return ProjectPathDecision(True, resolved_project)
+            return ProjectPathDecision(
+                False,
+                "",
                 "未配置 allowed_project_roots，非管理员不能使用本地 --project。"
                 "请让管理员配置允许的项目根目录，或改用 --github。"
             )
 
-        normalized_project = _normalize_path(project_path)
+        normalized_project = _normalize_path(resolved_project)
         for root in roots:
             if _is_path_within(normalized_project, _normalize_path(root)):
-                return ""
-        return "projectPath 不在 allowed_project_roots 允许的目录内。"
+                return ProjectPathDecision(True, resolved_project)
+        return ProjectPathDecision(False, "", "projectPath 不在 allowed_project_roots 允许的目录内。")
+
+    def validate_project_path(self, user: UserRef, project_path: str) -> str:
+        return self.authorize_project_path(user, project_path).message
 
     def _is_allowed(
         self,
@@ -149,13 +163,17 @@ class AuthorizationPolicy:
         return missing_identity_message(user)
 
 
-def _normalize_path(value: str) -> str:
+def _resolve_path(value: str) -> str:
     expanded = os.path.expandvars(os.path.expanduser(value))
     try:
         resolved = Path(expanded).resolve(strict=False)
     except (OSError, RuntimeError):
         resolved = Path(os.path.abspath(expanded))
-    return os.path.normcase(str(resolved))
+    return str(resolved)
+
+
+def _normalize_path(value: str) -> str:
+    return os.path.normcase(_resolve_path(value))
 
 
 def _is_path_within(path: str, root: str) -> bool:

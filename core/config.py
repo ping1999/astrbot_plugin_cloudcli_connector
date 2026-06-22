@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -47,16 +48,24 @@ class ConnectorSettings:
 
 def load_connector_settings(config: Any) -> ConnectorSettings:
     get = config.get if hasattr(config, "get") else lambda _key, default=None: default
+    jwt_token = _read_str(get("cloudcli_jwt_token"), "")
+    username = _read_str(get("cloudcli_username"), "")
+    password = _read_str(get("cloudcli_password"), "")
+    api_key = _read_str(get("cloudcli_api_key"), "")
     approval_require_admin = _read_bool(get("approval_require_admin"), True)
     session_require_admin = _read_bool(get("session_require_admin"), True)
     run_require_admin = _read_bool(get("run_require_admin"), True)
+    has_cloudcli_credentials = bool(jwt_token or api_key or (username and password))
     return ConnectorSettings(
         cloudcli=CloudCLIConfig(
-            base_url=_read_base_url(get("cloudcli_base_url")),
-            jwt_token=_read_str(get("cloudcli_jwt_token"), ""),
-            username=_read_str(get("cloudcli_username"), ""),
-            password=_read_str(get("cloudcli_password"), ""),
-            api_key=_read_str(get("cloudcli_api_key"), ""),
+            base_url=_read_base_url(
+                get("cloudcli_base_url"),
+                has_credentials=has_cloudcli_credentials,
+            ),
+            jwt_token=jwt_token,
+            username=username,
+            password=password,
+            api_key=api_key,
             allow_unauthenticated_ws=_read_bool(get("allow_unauthenticated_ws"), False),
             timeout_seconds=_read_limited_int(get("request_timeout_seconds"), 8, 2, 120),
             agent_idle_timeout_seconds=_read_limited_int(
@@ -116,7 +125,7 @@ def _read_str(value: Any, default: str) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else default
 
 
-def _read_base_url(value: Any) -> str:
+def _read_base_url(value: Any, *, has_credentials: bool = False) -> str:
     raw = _read_str(value, "http://127.0.0.1:3001")
     try:
         parsed = urlsplit(raw)
@@ -132,6 +141,12 @@ def _read_base_url(value: Any) -> str:
         return "http://127.0.0.1:3001"
     if not safe_netloc:
         return "http://127.0.0.1:3001"
+    if (
+        has_credentials
+        and parsed.scheme == "http"
+        and not _is_loopback_hostname(parsed.hostname or "")
+    ):
+        return "http://127.0.0.1:3001"
     return urlunsplit((parsed.scheme, safe_netloc, parsed.path.rstrip("/"), "", ""))
 
 
@@ -145,6 +160,16 @@ def _base_url_netloc(parsed: Any) -> str:
     if parsed.port is not None:
         return parsed.netloc
     return parsed.netloc
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    normalized = hostname.rstrip(".").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def _read_bool(value: Any, default: bool) -> bool:

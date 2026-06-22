@@ -11,9 +11,10 @@ from urllib.parse import quote
 import aiohttp
 
 try:
+    from .cloudcli_auth import CloudCLIAuth
+    from .cloudcli_errors import CloudCLIError, CloudCLITimeout
     from .cloudcli_protocol import (
         build_api_url,
-        build_auth_headers,
         build_ws_url,
         iter_sse,
         redact_error_text,
@@ -22,9 +23,10 @@ try:
     from .cloudcli_models import extract_recent_sessions
     from ..persistence.state_models import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from cloudcli.cloudcli_auth import CloudCLIAuth
+    from cloudcli.cloudcli_errors import CloudCLIError, CloudCLITimeout
     from cloudcli.cloudcli_protocol import (
         build_api_url,
-        build_auth_headers,
         build_ws_url,
         iter_sse,
         redact_error_text,
@@ -35,14 +37,6 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 logger = logging.getLogger(__name__)
-
-
-class CloudCLIError(RuntimeError):
-    pass
-
-
-class CloudCLITimeout(CloudCLIError):
-    pass
 
 
 @dataclass
@@ -83,7 +77,11 @@ class CloudCLIClient:
         self._permission_queue: asyncio.Queue[PendingApproval] = asyncio.Queue(maxsize=256)
         self._closing = False
         self._mux = WebSocketRequestMux()
-        self._cached_token = config.jwt_token.strip()
+        self._auth = CloudCLIAuth(
+            config=config,
+            ensure_session=self._ensure_auth_http_session,
+            api_url=self._api_url,
+        )
 
     def start(self, *, auto_connect: bool = True) -> None:
         if not self._permission_worker_task or self._permission_worker_task.done():
@@ -295,20 +293,7 @@ class CloudCLIClient:
             raise CloudCLIError(f"CloudCLI agent 任务执行失败：{_redact_text(str(exc))}") from exc
 
     async def _agent_auth_headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        token = ""
-        if self._cached_token:
-            token = self._cached_token
-        elif self.config.username and self.config.password:
-            await self._ensure_http_session()
-            try:
-                token = await self._get_token()
-            except CloudCLIError:
-                if not self.config.api_key:
-                    raise
-                token = ""
-        headers.update(self._auth_headers(token))
-        return headers
+        return await self._auth.agent_headers()
 
     async def get_pending_permissions(self, session_id: str) -> list[PendingApproval]:
         await self.ensure_connected()
@@ -445,53 +430,20 @@ class CloudCLIClient:
             timeout = aiohttp.ClientTimeout(total=max(3, self.config.timeout_seconds))
             self._session = aiohttp.ClientSession(timeout=timeout)
 
-    async def _get_token(self, *, allow_anonymous: bool = False) -> str:
-        if self._cached_token:
-            return self._cached_token
-        if not self.config.username or not self.config.password:
-            if allow_anonymous:
-                return ""
-            raise CloudCLIError("未配置 CloudCLI JWT token，也没有配置用户名/密码。")
+    async def _ensure_auth_http_session(self) -> aiohttp.ClientSession:
+        await self._ensure_http_session()
         if self._session is None:
             raise CloudCLIError("CloudCLI HTTP session 未初始化。")
+        return self._session
 
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key:
-            headers["X-API-Key"] = self.config.api_key
-        try:
-            async with self._session.post(
-                self._api_url("/api/auth/login"),
-                json={
-                    "username": self.config.username,
-                    "password": self.config.password,
-                },
-                headers=headers,
-            ) as response:
-                raw_body = await response.text()
-                try:
-                    data = json.loads(raw_body) if raw_body else {}
-                except json.JSONDecodeError:
-                    data = raw_body
-                if response.status >= 400:
-                    raise CloudCLIError(
-                        f"登录 CloudCLI 失败：HTTP {response.status} {_redact_text(raw_body)}"
-                    )
-        except Exception as exc:  # noqa: BLE001
-            if isinstance(exc, CloudCLIError):
-                raise
-            raise CloudCLIError(f"登录 CloudCLI 失败：{_redact_text(str(exc))}") from exc
-
-        if not isinstance(data, dict) or not data.get("token"):
-            raise CloudCLIError(f"登录 CloudCLI 失败：{_redact_text(str(data))}")
-        self._cached_token = str(data["token"])
-        return self._cached_token
+    async def _get_token(self, *, allow_anonymous: bool = False) -> str:
+        return await self._auth.get_token(allow_anonymous=allow_anonymous)
 
     async def _clear_cached_token(self) -> None:
-        if not self.config.jwt_token.strip():
-            self._cached_token = ""
+        await self._auth.clear_cached_token()
 
     def _auth_headers(self, token: str) -> dict[str, str]:
-        return build_auth_headers(token, self.config.api_key)
+        return self._auth.headers(token)
 
     async def _get_json_with_auth_retry(
         self,

@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 
 
 class ApprovalService:
+    timeout_deny_max_attempts = 3
+    timeout_deny_retry_initial_seconds = 5.0
+    timeout_deny_retry_max_seconds = 60.0
+
     def __init__(
         self,
         *,
@@ -276,29 +280,45 @@ class ApprovalService:
         try:
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
-            claim_action = "timeout-deny" if action == "deny" else "timeout-remind"
-            approval, error = await self.state.claim_pending(
-                session_id,
-                request_id,
-                actor=actor,
-                action=claim_action,
-            )
-            if error or approval is None:
+            attempts = 0
+            while True:
+                claim_action = "timeout-deny" if action == "deny" else "timeout-remind"
+                approval, error = await self.state.claim_pending(
+                    session_id,
+                    request_id,
+                    actor=actor,
+                    action=claim_action,
+                )
+                if error or approval is None:
+                    return
+                targets = self._approval_detail_targets(
+                    await self.state.users_bound_to_session(approval.session_id)
+                )
+                if action == "deny":
+                    attempts += 1
+                    sent = await self._deny_timed_out_approval(
+                        approval,
+                        timeout_seconds,
+                        targets,
+                    )
+                    if sent or attempts >= max(1, int(self.timeout_deny_max_attempts)):
+                        return
+                    retry_delay = min(
+                        float(self.timeout_deny_retry_max_seconds),
+                        float(self.timeout_deny_retry_initial_seconds) * (2 ** (attempts - 1)),
+                    )
+                    if retry_delay > 0:
+                        await asyncio.sleep(retry_delay)
+                    continue
+                text = (
+                    "CloudCLI 权限请求仍在等待审批：\n"
+                    f"session: {approval.session_id}\n"
+                    f"tool: {approval.tool_name}\n"
+                    "请使用 /cloudcli pending 查看，然后 /cloudcli allow 或 /cloudcli deny 处理。"
+                )
+                await self._send_to_targets(targets, text)
+                await self.state.release_pending_claim(approval.session_id, approval.request_id, actor)
                 return
-            targets = self._approval_detail_targets(
-                await self.state.users_bound_to_session(approval.session_id)
-            )
-            if action == "deny":
-                await self._deny_timed_out_approval(approval, timeout_seconds, targets)
-                return
-            text = (
-                "CloudCLI 权限请求仍在等待审批：\n"
-                f"session: {approval.session_id}\n"
-                f"tool: {approval.tool_name}\n"
-                "请使用 /cloudcli pending 查看，然后 /cloudcli allow 或 /cloudcli deny 处理。"
-            )
-            await self._send_to_targets(targets, text)
-            await self.state.release_pending_claim(approval.session_id, approval.request_id, actor)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -315,7 +335,7 @@ class ApprovalService:
         approval: PendingApproval,
         timeout_seconds: int,
         targets: tuple[dict[str, Any], ...],
-    ) -> None:
+    ) -> bool:
         reason = f"审批超时 {timeout_seconds} 秒，自动拒绝。"
         actor = "system"
         try:
@@ -349,7 +369,10 @@ class ApprovalService:
                 result=f"failed: {exc}",
             )
             text = f"CloudCLI 权限请求超时自动拒绝失败：{exc}"
+            await self._send_to_targets(targets, text)
+            return False
         await self._send_to_targets(targets, text)
+        return True
 
     async def _send_to_targets(self, targets: tuple[dict[str, Any], ...], text: str) -> None:
         for target in targets:
