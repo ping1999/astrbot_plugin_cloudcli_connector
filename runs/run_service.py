@@ -6,10 +6,9 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 try:
-    from .cloudcli_client import CloudCLIClient, CloudCLIError
-    from .command_parser import parse_positive_int
-    from .config import ConnectorSettings
-    from .formatting import (
+    from ..cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from ..commands.command_parser import parse_positive_int
+    from ..commands.formatting import (
         clip_text,
         extract_agent_text,
         format_agent_final,
@@ -18,15 +17,17 @@ try:
         format_run_log,
         format_run_tasks,
     )
-    from .identity import missing_identity_message
+    from ..core.config import ConnectorSettings
+    from ..core.redaction import redact_exception_text, redact_text
+    from ..persistence.state import PluginState
+    from ..persistence.state_models import UserRef, is_valid_session_id
+    from ..security.identity import missing_identity_message
     from .run_requests import RunRequestBuilder
     from .runtime import RunQuota
-    from .state import PluginState, UserRef, is_valid_session_id
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from cloudcli_client import CloudCLIClient, CloudCLIError
-    from command_parser import parse_positive_int
-    from config import ConnectorSettings
-    from formatting import (
+    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from commands.command_parser import parse_positive_int
+    from commands.formatting import (
         clip_text,
         extract_agent_text,
         format_agent_final,
@@ -35,10 +36,13 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         format_run_log,
         format_run_tasks,
     )
-    from identity import missing_identity_message
-    from run_requests import RunRequestBuilder
-    from runtime import RunQuota
-    from state import PluginState, UserRef, is_valid_session_id
+    from core.config import ConnectorSettings
+    from core.redaction import redact_exception_text, redact_text
+    from persistence.state import PluginState
+    from persistence.state_models import UserRef, is_valid_session_id
+    from runs.run_requests import RunRequestBuilder
+    from runs.runtime import RunQuota
+    from security.identity import missing_identity_message
 
 
 SendProactive = Callable[[str, str], Awaitable[None]]
@@ -71,6 +75,7 @@ class RunService:
         self.track_task = track_task
         self.run_tasks_by_id: dict[str, asyncio.Task] = {}
         self.cancel_requested_run_ids: set[str] = set()
+        self.abort_sent_run_ids: set[str] = set()
 
     async def handle_run(self, user: UserRef, args: list[str]) -> str:
         if args and args[0] in {"list", "log", "cancel"}:
@@ -121,7 +126,11 @@ class RunService:
                 limit, error = parse_positive_int(args[1], "数量", 1, 50)
                 if error:
                     return error
-            return format_run_tasks(await self.state.list_run_tasks(user, limit), limit)
+            return format_run_tasks(
+                await self.state.list_run_tasks(user, limit),
+                limit,
+                self.settings.max_push_text_length,
+            )
 
         if subcommand == "log":
             if len(args) != 2:
@@ -161,11 +170,11 @@ class RunService:
                 local_task.cancel()
 
             if has_session_id:
-                try:
-                    await self.client.abort_session(session_id, str(task.get("provider") or ""))
-                    abort_message = f"\n已向 CloudCLI 发送中止 session 请求：{session_id}"
-                except CloudCLIError as exc:
-                    abort_message = f"\n取消了本地任务，但中止 CloudCLI session 失败：{exc}"
+                abort_message = await self.abort_run_session(
+                    {"sessionId": session_id},
+                    {"provider": str(task.get("provider") or "")},
+                    run_id=run_id,
+                )
             await self.state.update_run_task(
                 run_id,
                 status="cancelled",
@@ -221,7 +230,7 @@ class RunService:
                     await self.state.update_run_task(run_id, session_id=str(summary["sessionId"]))
                     if run_id in self.cancel_requested_run_ids:
                         message = "用户取消任务。"
-                        message += await self.abort_run_session(summary, payload)
+                        message += await self.abort_run_session(summary, payload, run_id=run_id)
                         await finish_as_cancelled(message)
                         raise _RunCancelledByUser()
 
@@ -267,7 +276,7 @@ class RunService:
 
             if run_id in self.cancel_requested_run_ids:
                 message = "用户取消任务。"
-                message += await self.abort_run_session(summary, payload)
+                message += await self.abort_run_session(summary, payload, run_id=run_id)
                 await finish_as_cancelled(message)
                 return
 
@@ -289,7 +298,7 @@ class RunService:
             return
         except asyncio.TimeoutError:
             message = f"CloudCLI 任务超过最大运行时间 {max_duration} 秒，已停止等待。"
-            message += await self.abort_run_session(summary, payload)
+            message += await self.abort_run_session(summary, payload, run_id=run_id)
             await self.state.update_run_task(
                 run_id,
                 status="failed",
@@ -311,7 +320,7 @@ class RunService:
             await self.send_proactive(unified_msg_origin, f"CloudCLI 任务失败：{exc}")
         except asyncio.CancelledError:
             message = "本地任务已取消。"
-            message += await self.abort_run_session(summary, payload)
+            message += await self.abort_run_session(summary, payload, run_id=run_id)
             await self.state.update_run_task(
                 run_id,
                 status="cancelled",
@@ -321,29 +330,46 @@ class RunService:
             await self._prune_history()
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.exception("CloudCLI agent background task failed")
+            safe_error = redact_text(str(exc))
+            logger.error(
+                "CloudCLI agent background task failed:\n%s",
+                redact_exception_text(exc),
+            )
             await self.state.update_run_task(
                 run_id,
                 status="failed",
-                event=f"CloudCLI 任务异常：{exc}",
-                error=str(exc),
+                event=f"CloudCLI 任务异常：{safe_error}",
+                error=safe_error,
                 finished=True,
             )
             await self._prune_history()
-            await self.send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{exc}")
+            await self.send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{safe_error}")
         finally:
             self.cancel_requested_run_ids.discard(run_id)
+            self.abort_sent_run_ids.discard(run_id)
 
-    async def abort_run_session(self, summary: dict[str, Any], payload: dict[str, Any]) -> str:
+    async def abort_run_session(
+        self,
+        summary: dict[str, Any],
+        payload: dict[str, Any],
+        *,
+        run_id: str = "",
+    ) -> str:
         session_id = str(summary.get("sessionId") or payload.get("sessionId") or "")
         if not session_id:
             return "\n尚未获得 CloudCLI sessionId，无法主动发送中止请求。"
         if not is_valid_session_id(session_id):
             return "\nCloudCLI sessionId 格式异常，未发送中止请求。"
+        if run_id and run_id in self.abort_sent_run_ids:
+            return f"\n已向 CloudCLI 发送过中止 session 请求：{session_id}"
+        if run_id:
+            self.abort_sent_run_ids.add(run_id)
         try:
             await self.client.abort_session(session_id, str(payload.get("provider") or ""))
             return f"\n已向 CloudCLI 发送中止 session 请求：{session_id}"
         except CloudCLIError as exc:
+            if run_id:
+                self.abort_sent_run_ids.discard(run_id)
             return f"\n尝试中止 CloudCLI session 失败：{exc}"
 
     def merge_agent_event(self, summary: dict[str, Any], event: dict[str, Any]) -> None:

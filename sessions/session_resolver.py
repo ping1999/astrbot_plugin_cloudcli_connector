@@ -3,17 +3,19 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from .authz import AuthorizationPolicy
-    from .cloudcli_client import CloudCLIClient, CloudCLIError
-    from .config import ConnectorSettings
-    from .run_validation import is_index_session_ref
-    from .state import PluginState, UserRef, is_valid_session_id
+    from ..cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from ..core.config import ConnectorSettings
+    from ..persistence.state import PluginState
+    from ..persistence.state_models import UserRef, is_valid_session_id
+    from ..security.authz import AuthorizationPolicy
+    from ..security.run_validation import is_index_session_ref
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from authz import AuthorizationPolicy
-    from cloudcli_client import CloudCLIClient, CloudCLIError
-    from config import ConnectorSettings
-    from run_validation import is_index_session_ref
-    from state import PluginState, UserRef, is_valid_session_id
+    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from core.config import ConnectorSettings
+    from persistence.state import PluginState
+    from persistence.state_models import UserRef, is_valid_session_id
+    from security.authz import AuthorizationPolicy
+    from security.run_validation import is_index_session_ref
 
 
 class SessionResolver:
@@ -60,7 +62,7 @@ class SessionResolver:
         indexed = await self.state.find_session_index_item(user, ref.strip())
         if indexed:
             return ""
-        decision = self.authz.can_use_direct_session_id(user)
+        decision = self.authz.can_bind_direct_session_for_approval(user)
         return "" if decision.allowed else decision.message
 
     async def direct_session_ref_error(self, user: UserRef, ref: str) -> str:

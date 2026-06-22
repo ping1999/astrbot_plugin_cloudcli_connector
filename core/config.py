@@ -5,9 +5,9 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 try:
-    from .cloudcli_client import CloudCLIConfig
+    from ..cloudcli.cloudcli_client import CloudCLIConfig
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from cloudcli_client import CloudCLIConfig
+    from cloudcli.cloudcli_client import CloudCLIConfig
 
 
 @dataclass(frozen=True)
@@ -25,14 +25,18 @@ class ConnectorSettings:
     max_pending_display: int
     approval_allowed_user_keys: frozenset[str]
     approval_require_admin: bool
+    approval_access_mode: str
+    approval_allow_direct_session_bind: bool
     approval_timeout_seconds: int
     approval_timeout_action: str
     max_push_text_length: int
     session_allowed_user_keys: frozenset[str]
     session_require_admin: bool
+    session_access_mode: str
     allow_direct_session_id: bool
     run_allowed_user_keys: frozenset[str]
     run_require_admin: bool
+    run_access_mode: str
     allowed_project_roots: tuple[str, ...]
     allow_unrestricted_project_paths: bool
     max_active_runs_per_user: int
@@ -43,6 +47,9 @@ class ConnectorSettings:
 
 def load_connector_settings(config: Any) -> ConnectorSettings:
     get = config.get if hasattr(config, "get") else lambda _key, default=None: default
+    approval_require_admin = _read_bool(get("approval_require_admin"), True)
+    session_require_admin = _read_bool(get("session_require_admin"), True)
+    run_require_admin = _read_bool(get("run_require_admin"), True)
     return ConnectorSettings(
         cloudcli=CloudCLIConfig(
             base_url=_read_base_url(get("cloudcli_base_url")),
@@ -74,15 +81,28 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
         ),
         max_pending_display=_read_limited_int(get("max_pending_display"), 30, 1, 100),
         approval_allowed_user_keys=frozenset(_read_str_list(get("approval_allowed_user_keys"))),
-        approval_require_admin=_read_bool(get("approval_require_admin"), True),
+        approval_require_admin=approval_require_admin,
+        approval_access_mode=_read_access_mode(
+            get("approval_access_mode"),
+            legacy_require_admin=approval_require_admin,
+        ),
+        approval_allow_direct_session_bind=_read_bool(get("approval_allow_direct_session_bind"), False),
         approval_timeout_seconds=_read_nonnegative_limited_int(get("approval_timeout_seconds"), 300, 86400),
         approval_timeout_action=_read_choice(get("approval_timeout_action"), "remind", {"remind", "deny"}),
         max_push_text_length=_read_limited_int(get("max_push_text_length"), 1800, 200, 8000),
         session_allowed_user_keys=frozenset(_read_str_list(get("session_allowed_user_keys"))),
-        session_require_admin=_read_bool(get("session_require_admin"), True),
+        session_require_admin=session_require_admin,
+        session_access_mode=_read_access_mode(
+            get("session_access_mode"),
+            legacy_require_admin=session_require_admin,
+        ),
         allow_direct_session_id=_read_bool(get("allow_direct_session_id"), False),
         run_allowed_user_keys=frozenset(_read_str_list(get("run_allowed_user_keys"))),
-        run_require_admin=_read_bool(get("run_require_admin"), True),
+        run_require_admin=run_require_admin,
+        run_access_mode=_read_access_mode(
+            get("run_access_mode"),
+            legacy_require_admin=run_require_admin,
+        ),
         allowed_project_roots=tuple(_read_str_list(get("allowed_project_roots"))),
         allow_unrestricted_project_paths=_read_bool(get("allow_unrestricted_project_paths"), False),
         max_active_runs_per_user=_read_nonnegative_limited_int(get("max_active_runs_per_user"), 1, 50),
@@ -151,3 +171,21 @@ def _read_choice(value: Any, default: str, choices: set[str]) -> str:
         if normalized in choices:
             return normalized
     return default
+
+
+def _read_access_mode(value: Any, *, legacy_require_admin: bool) -> str:
+    choices = {"admin_or_allowlist", "allowlist_only", "authenticated"}
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("-", "_")
+        aliases = {
+            "admin": "admin_or_allowlist",
+            "admin_only": "admin_or_allowlist",
+            "allowlist": "allowlist_only",
+            "allowlisted": "allowlist_only",
+            "authenticated_users": "authenticated",
+            "all_authenticated": "authenticated",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized in choices:
+            return normalized
+    return "admin_or_allowlist" if legacy_require_admin else "allowlist_only"

@@ -54,13 +54,17 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - `/cloudcli run` uses CloudCLI's external agent API, so `cloudcli_api_key` must contain an API key generated in CloudCLI Settings → API & Tokens.
 - If CloudCLI is started with a global `API_KEY`, protected endpoints also need `cloudcli_api_key`.
 - Users only receive push notifications for sessions they have bound.
+- Session bindings, session indexes, pending approvals, audit entries, and run logs are scoped to the current chat origin by default. A private-chat binding is not automatically visible in a group chat for the same user.
+- The WebSocket connection is supervised and reconnects with backoff after CloudCLI restarts or transient network failures.
 - By default, only AstrBot admins or users in `session_allowed_user_keys` can list, bind, read, or stop CloudCLI sessions.
 - By default, only AstrBot admins or users in `run_allowed_user_keys` can start `/cloudcli run` agent tasks.
 - For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
 - Non-admin users cannot directly type an unbound raw sessionId by default. They should use an index from `/cloudcli session`, or an admin can enable `allow_direct_session_id`.
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
-- To avoid leaking sensitive approval input through stale stored admin state, proactive approval detail pushes only go to the chat origin that bound that session. When `approval_require_admin=true`, detailed proactive pushes are sent only to users in `approval_allowed_user_keys`; admins can still run `/cloudcli pending` to view and handle requests.
+- Users in `approval_allowed_user_keys` can handle approvals for sessions they have bound. Binding arbitrary raw session IDs for approval-only users is disabled by default; set `approval_allow_direct_session_bind=true` only in trusted chats.
+- To avoid leaking sensitive approval input through stale stored admin state, proactive approval detail pushes only go to the chat origin that bound that session. Detailed proactive pushes are sent only to `approval_allowed_user_keys`, unless `approval_access_mode=authenticated` is explicitly configured; admins can still run `/cloudcli pending` to view and handle requests.
 - `/cloudcli pending` refreshes the local pending approval cache from CloudCLI and removes approvals that no longer exist upstream.
+- `/cloudcli allow` and `/cloudcli deny` stop when the pending approval refresh fails instead of acting on stale cache.
 - Approval timeout defaults to reminders only. Automatic denial happens only when `approval_timeout_action` is set to `deny`.
 
 ## CloudCLI setup
@@ -72,13 +76,15 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `cloudcli_username` / `cloudcli_password`: alternative to a pasted JWT token
 - `cloudcli_api_key`: used for `/api/agent`; generate it in CloudCLI Settings → API & Tokens
 - `session_allowed_user_keys`: comma-separated allowlist for session commands
-- `session_require_admin`: require AstrBot admin for session commands, except allowlisted users
+- `session_access_mode`: session access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
+- `session_require_admin`: legacy compatibility flag. Prefer `session_access_mode`; setting this to `false` without an access mode now means allowlist-only, not all users.
 - `allow_direct_session_id`: allow non-admin users to use raw session IDs that are not bound and not in their current session index
 - `recent_sessions_limit`: number of recent sessions shown by `/cloudcli session`
 - `chat_messages_limit`: default recent message count shown by `/cloudcli chat`
 - `max_run_message_length`: maximum task text length accepted by `/cloudcli run`
 - `run_allowed_user_keys`: comma-separated allowlist for `/cloudcli run`
-- `run_require_admin`: require AstrBot admin for `/cloudcli run`, except allowlisted users
+- `run_access_mode`: run access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
+- `run_require_admin`: legacy compatibility flag. Prefer `run_access_mode`; setting this to `false` without an access mode now means allowlist-only, not all users.
 - `allowed_project_roots`: comma-separated local roots allowed for `/cloudcli run --project`
 - `allow_unrestricted_project_paths`: allow non-admin users to use arbitrary local paths when `allowed_project_roots` is empty
 - `max_active_runs_per_user` / `max_active_runs_global`: concurrent `/cloudcli run` limits; `0` disables a limit
@@ -88,7 +94,9 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `run_list_limit`: default task count shown by `/cloudcli run list`
 - `run_status_interval_seconds` / `max_run_status_pushes`: control background run status push frequency
 - `approval_allowed_user_keys`: comma-separated approval allowlist; use `/cloudcli whoami` to get the current user key
-- `approval_require_admin`: when enabled, approvals require an AstrBot admin unless the user is allowlisted; add admins to `approval_allowed_user_keys` when they should receive proactive approval details
+- `approval_access_mode`: approval access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
+- `approval_require_admin`: legacy compatibility flag. Prefer `approval_access_mode`; setting this to `false` without an access mode now means allowlist-only, not all users.
+- `approval_allow_direct_session_bind`: allow approval users to bind raw known session IDs without session browsing access; default `false`
 - `approval_timeout_seconds`: seconds before timeout handling; `0` disables it
 - `approval_timeout_action`: timeout action, `remind` or `deny`
 

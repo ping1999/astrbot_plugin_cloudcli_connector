@@ -74,6 +74,12 @@
     "default": true,
     "hint": "When enabled, only AstrBot admins or session_allowed_user_keys can list, bind, read, or stop sessions."
   },
+  "session_access_mode": {
+    "description": "Session command access mode",
+    "type": "string",
+    "default": "admin_or_allowlist",
+    "hint": "Supported values: admin_or_allowlist, allowlist_only, authenticated. This explicit mode is preferred over session_require_admin."
+  },
   "allow_direct_session_id": {
     "description": "Allow direct raw sessionId usage",
     "type": "bool",
@@ -106,6 +112,12 @@
     "type": "bool",
     "default": true,
     "hint": "When enabled, only AstrBot admins or run_allowed_user_keys can start CloudCLI agent tasks."
+  },
+  "run_access_mode": {
+    "description": "Run command access mode",
+    "type": "string",
+    "default": "admin_or_allowlist",
+    "hint": "Supported values: admin_or_allowlist, allowlist_only, authenticated. This explicit mode is preferred over run_require_admin."
   },
   "allowed_project_roots": {
     "description": "Comma-separated local project roots allowed for /cloudcli run --project",
@@ -165,13 +177,25 @@
     "description": "Comma-separated AstrBot user keys allowed to approve permissions",
     "type": "string",
     "default": "",
-    "hint": "Users in this list can approve even if they are not AstrBot admins and can receive proactive approval details. Use /cloudcli whoami to get the key."
+    "hint": "Users in this list can approve even if they are not AstrBot admins and can receive proactive approval details. They may bind a known sessionId for approval handling without getting session browsing access. Use /cloudcli whoami to get the key."
   },
   "approval_require_admin": {
     "description": "Require AstrBot admin for approvals",
     "type": "bool",
     "default": true,
     "hint": "When enabled, only AstrBot admins or approval_allowed_user_keys can view, approve, or deny requests. Proactive approval details are sent only to approval_allowed_user_keys."
+  },
+  "approval_access_mode": {
+    "description": "Approval command access mode",
+    "type": "string",
+    "default": "admin_or_allowlist",
+    "hint": "Supported values: admin_or_allowlist, allowlist_only, authenticated. This explicit mode is preferred over approval_require_admin."
+  },
+  "approval_allow_direct_session_bind": {
+    "description": "Allow approval users to bind raw session IDs",
+    "type": "bool",
+    "default": false,
+    "hint": "When false, approval allowlist users cannot bind arbitrary raw sessionId values unless they are admins or direct session usage is separately allowed."
   },
   "approval_timeout_seconds": {
     "description": "Seconds before pending approval timeout action; 0 disables it",

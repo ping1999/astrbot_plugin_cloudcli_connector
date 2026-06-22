@@ -4,11 +4,11 @@ import json
 from typing import Any
 
 try:
-    from .redaction import redact_text
-    from .state import PendingApproval
+    from ..core.redaction import redact_text
+    from ..persistence.state_models import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from redaction import redact_text
-    from state import PendingApproval
+    from core.redaction import redact_text
+    from persistence.state_models import PendingApproval
 
 
 HELP_TEXT = """CloudCLI Connector 指令：
@@ -200,7 +200,7 @@ def format_agent_final(summary: dict[str, Any], text_limit: int) -> str:
     return clip_text("\n".join(lines), text_limit)
 
 
-def format_run_tasks(tasks: list[dict[str, Any]], limit: int) -> str:
+def format_run_tasks(tasks: list[dict[str, Any]], limit: int, text_limit: int = 1800) -> str:
     if not tasks:
         return "当前用户还没有 CloudCLI 任务。"
     lines = ["CloudCLI 任务："]
@@ -213,7 +213,7 @@ def format_run_tasks(tasks: list[dict[str, Any]], limit: int) -> str:
         suffix = f" session={session_id}" if session_id else ""
         lines.append(f"#{run_id} [{status}] {provider} -> {target}{suffix}")
     lines.append("查看日志：/cloudcli run log <任务编号>；取消：/cloudcli run cancel <任务编号>")
-    return "\n".join(lines)
+    return clip_text("\n".join(lines), text_limit)
 
 
 def format_run_log(task: dict[str, Any], text_limit: int) -> str:
@@ -242,7 +242,7 @@ def format_run_log(task: dict[str, Any], text_limit: int) -> str:
     return clip_text("\n".join(lines), text_limit)
 
 
-def format_audit(items: list[dict[str, Any]], limit: int) -> str:
+def format_audit(items: list[dict[str, Any]], limit: int, text_limit: int = 1800) -> str:
     if not items:
         return "当前没有可见的审批审计记录。"
     lines = ["审批审计记录："]
@@ -257,7 +257,7 @@ def format_audit(items: list[dict[str, Any]], limit: int) -> str:
         if reason:
             line += f" reason={clip_text(str(reason), 160)}"
         lines.append(line)
-    return "\n".join(lines)
+    return clip_text("\n".join(lines), text_limit)
 
 
 def format_pending(approvals: list[PendingApproval], limit: int) -> str:
@@ -268,14 +268,15 @@ def format_pending(approvals: list[PendingApproval], limit: int) -> str:
         body = format_approval_body(approval, limit)
         lines.append(f"{index}. {body}")
     lines.append("使用 /cloudcli allow <序号> 或 /cloudcli deny <序号> <原因> 处理。")
-    return "\n\n".join(lines)
+    return clip_text("\n\n".join(lines), limit)
 
 
 def format_push_message(approval: PendingApproval, limit: int) -> str:
-    return (
+    return clip_text(
         "CloudCLI 有新的权限审批请求：\n"
         f"{format_approval_body(approval, limit)}\n"
-        "请使用 /cloudcli pending 查看序号，然后 /cloudcli allow 或 /cloudcli deny 处理。"
+        "请使用 /cloudcli pending 查看序号，然后 /cloudcli allow 或 /cloudcli deny 处理。",
+        limit,
     )
 
 

@@ -5,17 +5,32 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 try:
-    from .sanitizer import compact_json, safe_json_value, safe_text
+    from ..core.sanitizer import compact_json, safe_json_value, safe_text
+    from .state_models import (
+        PendingApproval,
+        UserRef,
+        is_valid_request_id,
+        is_valid_session_id,
+        pending_storage_key,
+        safe_inline_text,
+    )
+    from .state_storage import JsonStateStore
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from sanitizer import compact_json, safe_json_value, safe_text
+    from core.sanitizer import compact_json, safe_json_value, safe_text
+    from persistence.state_models import (
+        PendingApproval,
+        UserRef,
+        is_valid_request_id,
+        is_valid_session_id,
+        pending_storage_key,
+        safe_inline_text,
+    )
+    from persistence.state_storage import JsonStateStore
 
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
-REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 RUN_ID_RE = re.compile(r"^[0-9]{1,12}$")
 
 MAX_SESSION_INDEX_ITEMS = 100
@@ -27,48 +42,13 @@ MAX_STORED_TEXT = 1200
 PENDING_CLAIM_FIELDS = ("claimed_by", "claimed_action", "claimed_at")
 
 
-@dataclass(frozen=True)
-class UserRef:
-    user_key: str
-    display_name: str
-    unified_msg_origin: str
-    is_admin: bool = False
-    identity_verified: bool = True
-
-
-@dataclass
-class PendingApproval:
-    request_id: str
-    session_id: str
-    tool_name: str
-    input_data: Any
-    provider: str = "claude"
-    received_at: float = 0
-
-    @classmethod
-    def from_cloudcli(cls, payload: dict[str, Any]) -> "PendingApproval | None":
-        request_id = _read_str(payload.get("requestId") or payload.get("request_id"))
-        session_id = _read_str(payload.get("sessionId") or payload.get("session_id"))
-        if not request_id or not session_id:
-            return None
-        if not REQUEST_ID_RE.fullmatch(request_id) or not SESSION_ID_RE.fullmatch(session_id):
-            return None
-        return cls(
-            request_id=request_id,
-            session_id=session_id,
-            tool_name=_read_str(payload.get("toolName") or payload.get("tool_name")) or "UnknownTool",
-            input_data=safe_json_value(payload.get("input")),
-            provider=_read_str(payload.get("provider")) or "claude",
-            received_at=_parse_timestamp(payload.get("receivedAt")) or time.time(),
-        )
-
-
 class PluginState:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.store = JsonStateStore(path)
         self._lock = asyncio.Lock()
         self._data: dict[str, Any] = {
-            "version": 2,
+            "version": 3,
             "users": {},
             "pending": {},
             "runs": {},
@@ -83,25 +63,21 @@ class PluginState:
                 await self._save_locked()
                 return
             try:
-                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                loaded = self.store.read()
                 if isinstance(loaded, dict):
-                    self._data["version"] = 2
+                    self._data["version"] = 3
                     self._data["users"] = _read_dict(loaded.get("users"))
                     self._data["pending"] = _normalize_pending_records(_read_dict(loaded.get("pending")))
-                    self._data["runs"] = _read_dict(loaded.get("runs"))
-                    self._data["audit"] = _read_dict_list(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
+                    self._data["runs"] = _normalize_run_records(_read_dict(loaded.get("runs")))
+                    self._data["audit"] = _normalize_audit_records(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
                     self._data["next_run_id"] = _read_positive_int(
                         loaded.get("next_run_id"),
                         self._guess_next_run_id(self._data["runs"]),
                     )
-            except (OSError, json.JSONDecodeError):
-                backup = self.path.with_suffix(f".bad-{int(time.time())}.json")
-                try:
-                    self.path.replace(backup)
-                except OSError:
-                    pass
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                self.store.backup_bad_file()
                 self._data = {
-                    "version": 2,
+                    "version": 3,
                     "users": {},
                     "pending": {},
                     "runs": {},
@@ -115,8 +91,9 @@ class PluginState:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
             origins = _read_list(entry.get("origins"))
-            if user.unified_msg_origin not in origins:
-                origins.append(user.unified_msg_origin)
+            origin = _origin_key(user)
+            if origin not in origins:
+                origins.append(origin)
             entry["origins"] = origins[-5:]
             entry["last_seen_at"] = time.time()
             await self._save_locked()
@@ -135,14 +112,15 @@ class PluginState:
             entry = self._user_entry(user.user_key)
             entry["display_name"] = user.display_name
             origins = _read_list(entry.get("origins"))
-            if user.unified_msg_origin not in origins:
-                origins.append(user.unified_msg_origin)
+            origin = _origin_key(user)
+            if origin not in origins:
+                origins.append(origin)
             entry["origins"] = origins[-5:]
             binding_origins = _read_origin_map(entry.get("binding_origins"))
             session_origins = binding_origins.get(session_id, [])
             origin_added = False
-            if user.unified_msg_origin not in session_origins:
-                session_origins.append(user.unified_msg_origin)
+            if origin not in session_origins:
+                session_origins.append(origin)
                 binding_origins[session_id] = session_origins[-5:]
                 entry["binding_origins"] = binding_origins
                 origin_added = True
@@ -166,12 +144,18 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             bindings = _read_list(entry.get("bindings"))
-            if session_id not in bindings:
-                return False, f"未绑定 session：{session_id}"
-            bindings.remove(session_id)
-            entry["bindings"] = sorted(bindings)
             binding_origins = _read_origin_map(entry.get("binding_origins"))
-            binding_origins.pop(session_id, None)
+            origins = binding_origins.get(session_id, [])
+            origin = _origin_key(user)
+            if session_id not in bindings or origin not in origins:
+                return False, f"未绑定 session：{session_id}"
+            origins.remove(origin)
+            if origins:
+                binding_origins[session_id] = origins
+            else:
+                binding_origins.pop(session_id, None)
+                bindings.remove(session_id)
+            entry["bindings"] = sorted(bindings)
             entry["binding_origins"] = binding_origins
             await self._save_locked()
             return True, f"已解绑 session：{session_id}"
@@ -179,9 +163,23 @@ class PluginState:
     async def unbind_all(self, user: UserRef) -> tuple[bool, str]:
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            count = len(_read_list(entry.get("bindings")))
-            entry["bindings"] = []
-            entry["binding_origins"] = {}
+            bindings = _read_list(entry.get("bindings"))
+            binding_origins = _read_origin_map(entry.get("binding_origins"))
+            origin = _origin_key(user)
+            current = _bindings_for_origin(entry, origin)
+            count = len(current)
+            for session_id in current:
+                origins = binding_origins.get(session_id, [])
+                if origin in origins:
+                    origins.remove(origin)
+                if origins:
+                    binding_origins[session_id] = origins
+                else:
+                    binding_origins.pop(session_id, None)
+                    if session_id in bindings:
+                        bindings.remove(session_id)
+            entry["bindings"] = sorted(bindings)
+            entry["binding_origins"] = binding_origins
             await self._save_locked()
             if count == 0:
                 return False, "当前没有绑定任何 session。"
@@ -190,14 +188,14 @@ class PluginState:
     async def list_bindings(self, user: UserRef) -> list[str]:
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            return sorted(_read_list(entry.get("bindings")))
+            return _bindings_for_origin(entry, _origin_key(user))
 
     async def has_binding(self, user: UserRef, session_id: str) -> bool:
         if not is_valid_session_id(session_id):
             return False
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            return session_id in _read_list(entry.get("bindings"))
+            return session_id in _bindings_for_origin(entry, _origin_key(user))
 
     async def remember_session_index(
         self,
@@ -230,8 +228,17 @@ class PluginState:
                 )
                 if len(normalized) >= max(1, min(max_items, MAX_SESSION_INDEX_ITEMS)):
                     break
-            entry["session_index"] = normalized
-            entry["session_index_at"] = time.time()
+            session_indexes = _read_session_indexes(entry.get("session_indexes"))
+            session_indexes[_origin_key(user)] = {
+                "items": normalized,
+                "at": time.time(),
+            }
+            known_origins = set(_read_list(entry.get("origins"))[-5:])
+            entry["session_indexes"] = {
+                origin: value
+                for origin, value in session_indexes.items()
+                if origin in known_origins or origin == _origin_key(user)
+            }
             await self._save_locked()
 
     async def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
@@ -239,7 +246,7 @@ class PluginState:
             return None
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            for item in _read_dict_list(entry.get("session_index")):
+            for item in _session_index_for_origin(entry, _origin_key(user)):
                 if _read_str(item.get("id")) == session_id:
                     return {
                         "id": session_id,
@@ -268,7 +275,7 @@ class PluginState:
 
         async with self._lock:
             entry = self._user_entry(user.user_key)
-            cached = _read_dict_list(entry.get("session_index"))
+            cached = _session_index_for_origin(entry, _origin_key(user))
             if not cached:
                 return None, "没有可用的 session 序号缓存，请先执行 /cloudcli session。"
             if index < 1 or index > len(cached):
@@ -311,7 +318,7 @@ class PluginState:
             key = pending_storage_key(approval.session_id, approval.request_id)
             if not key:
                 return
-            pending[key] = self._pending_record(approval)
+            pending[key] = self._pending_record(approval, pending.get(key))
             self._data["pending"] = pending
             await self._save_locked()
 
@@ -396,7 +403,8 @@ class PluginState:
         max_items: int,
     ) -> list[PendingApproval]:
         async with self._lock:
-            bindings = _read_list(self._user_entry(user.user_key).get("bindings"))
+            entry = self._user_entry(user.user_key)
+            bindings = _bindings_for_origin(entry, _origin_key(user))
             if not bindings:
                 return []
             pending = _read_dict(self._data.get("pending"))
@@ -450,7 +458,8 @@ class PluginState:
         action: str,
     ) -> tuple[PendingApproval | None, str | None]:
         async with self._lock:
-            bindings = _read_list(self._user_entry(user.user_key).get("bindings"))
+            entry = self._user_entry(user.user_key)
+            bindings = _bindings_for_origin(entry, _origin_key(user))
             visible = self._visible_pending_locked(bindings, max_items)
             if not visible:
                 return None, "当前没有待审批权限。"
@@ -517,7 +526,7 @@ class PluginState:
                 "id": run_id,
                 "user_key": user.user_key,
                 "display_name": user.display_name,
-                "origin": user.unified_msg_origin,
+                "origin": _origin_key(user),
                 "status": "running",
                 "provider": safe_text(payload.get("provider"), 60) or "claude",
                 "session_id": safe_text(payload.get("sessionId"), 200),
@@ -589,7 +598,9 @@ class PluginState:
             items = [
                 dict(item)
                 for item in runs.values()
-                if isinstance(item, dict) and item.get("user_key") == user.user_key
+                if isinstance(item, dict)
+                and item.get("user_key") == user.user_key
+                and _run_visible_in_origin(item, user)
             ]
             items.sort(key=lambda item: float(item.get("started_at") or 0), reverse=True)
             return items[: max(1, min(limit, 50))]
@@ -603,6 +614,8 @@ class PluginState:
                 return None, f"没有找到任务 #{run_id}。"
             if item.get("user_key") != user.user_key:
                 return None, "只能查看或操作自己发起的 CloudCLI 任务。"
+            if not _run_visible_in_origin(item, user):
+                return None, "只能在发起任务的聊天会话中查看或操作该任务。"
             return dict(item), None
 
     async def mark_interrupted_runs(self, reason: str) -> int:
@@ -644,6 +657,7 @@ class PluginState:
                     "ts": time.time(),
                     "user_key": user.user_key if user else "system",
                     "display_name": user.display_name if user else "system",
+                    "origin": _origin_key(user) if user else "",
                     "action": safe_text(action, 40),
                     "result": safe_text(result, 80),
                     "request_id": approval.request_id,
@@ -659,13 +673,22 @@ class PluginState:
 
     async def list_audit(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
         async with self._lock:
-            bindings = set(_read_list(self._user_entry(user.user_key).get("bindings")))
+            entry = self._user_entry(user.user_key)
+            origin = _origin_key(user)
+            bindings = set(_bindings_for_origin(entry, origin))
             audit = _read_dict_list(self._data.get("audit"))
             items = [
                 dict(item)
                 for item in audit
-                if item.get("user_key") == user.user_key
-                or (bindings and item.get("session_id") in bindings)
+                if (
+                    item.get("user_key") == user.user_key
+                    and _audit_origin_visible(item, entry, origin)
+                )
+                or (
+                    item.get("user_key") == "system"
+                    and bindings
+                    and item.get("session_id") in bindings
+                )
             ]
             items.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
             return items[: max(1, min(limit, 50))]
@@ -683,6 +706,7 @@ class PluginState:
                 "last_seen_at": 0,
                 "session_index": [],
                 "session_index_at": 0,
+                "session_indexes": {},
             },
         )
         if not isinstance(entry, dict):
@@ -694,6 +718,7 @@ class PluginState:
                 "last_seen_at": 0,
                 "session_index": [],
                 "session_index_at": 0,
+                "session_indexes": {},
             }
             users[user_key] = entry
         if "binding_origins" not in entry:
@@ -707,6 +732,18 @@ class PluginState:
                 }
             else:
                 entry["binding_origins"] = {}
+        if "session_indexes" not in entry:
+            origins = _read_list(entry.get("origins"))
+            legacy_items = _read_dict_list(entry.get("session_index"))
+            if len(origins) == 1 and legacy_items:
+                entry["session_indexes"] = {
+                    origins[0]: {
+                        "items": legacy_items,
+                        "at": _parse_timestamp(entry.get("session_index_at")),
+                    }
+                }
+            else:
+                entry["session_indexes"] = {}
         return entry
 
     def _guess_next_run_id(self, runs: dict[str, Any]) -> int:
@@ -776,9 +813,9 @@ class PluginState:
         record = {
             "request_id": approval.request_id,
             "session_id": approval.session_id,
-            "tool_name": safe_text(approval.tool_name, 120) or "UnknownTool",
+            "tool_name": safe_inline_text(approval.tool_name, 120) or "UnknownTool",
             "input_data": safe_json_value(approval.input_data),
-            "provider": safe_text(approval.provider, 60) or "claude",
+            "provider": safe_inline_text(approval.provider, 60) or "claude",
             "received_at": approval.received_at or time.time(),
             "resolved": False,
         }
@@ -821,29 +858,7 @@ class PluginState:
                 runs.pop(run_id, None)
 
     async def _save_locked(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(".tmp")
-        tmp_path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        _restrict_file_permissions(tmp_path)
-        os.replace(tmp_path, self.path)
-        _restrict_file_permissions(self.path)
-
-
-def is_valid_session_id(value: str) -> bool:
-    return bool(SESSION_ID_RE.fullmatch(value or ""))
-
-
-def is_valid_request_id(value: str) -> bool:
-    return bool(REQUEST_ID_RE.fullmatch(value or ""))
-
-
-def pending_storage_key(session_id: str, request_id: str) -> str:
-    if not is_valid_session_id(session_id) or not is_valid_request_id(request_id):
-        return ""
-    return f"{session_id}|{request_id}"
+        self.store.write(self._data)
 
 
 def resolve_data_path(plugin_file: str, plugin_name: str) -> Path:
@@ -871,13 +886,85 @@ def _normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
         storage_key = pending_storage_key(session_id, request_id)
         if not storage_key:
             continue
-        normalized = dict(item)
+        normalized = {
+            "request_id": request_id,
+            "session_id": session_id,
+            "tool_name": safe_inline_text(item.get("tool_name"), 120) or "UnknownTool",
+            "input_data": safe_json_value(item.get("input_data")),
+            "provider": safe_inline_text(item.get("provider"), 60) or "claude",
+            "received_at": _parse_timestamp(item.get("received_at")) or time.time(),
+            "resolved": bool(item.get("resolved") is True),
+        }
         normalized["session_id"] = session_id
         normalized["request_id"] = request_id
         for field in PENDING_CLAIM_FIELDS:
             normalized.pop(field, None)
         result[storage_key] = normalized
     return result
+
+
+def _normalize_run_records(value: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        run_id = _read_str(key)
+        if not RUN_ID_RE.fullmatch(run_id) or not isinstance(item, dict):
+            continue
+        normalized = {
+            "id": run_id,
+            "user_key": safe_text(item.get("user_key"), 200),
+            "display_name": safe_text(item.get("display_name"), 160),
+            "origin": safe_text(item.get("origin"), 500),
+            "status": safe_text(item.get("status"), 40) or "unknown",
+            "provider": safe_text(item.get("provider"), 60) or "claude",
+            "session_id": safe_text(item.get("session_id"), 200),
+            "project_path": safe_text(item.get("project_path"), 500),
+            "github_url": safe_text(item.get("github_url"), 500),
+            "target": safe_text(item.get("target"), 500),
+            "message": safe_text(item.get("message"), MAX_STORED_TEXT),
+            "started_at": _parse_timestamp(item.get("started_at")),
+            "updated_at": _parse_timestamp(item.get("updated_at")),
+            "finished_at": _parse_timestamp(item.get("finished_at")),
+            "log": _normalize_run_log(item.get("log")),
+            "summary": safe_json_value(item.get("summary")),
+        }
+        if item.get("error"):
+            normalized["error"] = safe_text(item.get("error"), MAX_STORED_TEXT)
+        result[run_id] = normalized
+    return result
+
+
+def _normalize_run_log(value: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for item in _read_dict_list(value):
+        items.append(
+            {
+                "ts": _parse_timestamp(item.get("ts")),
+                "text": safe_text(item.get("text"), MAX_STORED_TEXT),
+            }
+        )
+    return items[-MAX_RUN_LOG_ITEMS:]
+
+
+def _normalize_audit_records(value: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for item in _read_dict_list(value):
+        records.append(
+            {
+                "ts": _parse_timestamp(item.get("ts")),
+                "user_key": safe_text(item.get("user_key"), 200),
+                "display_name": safe_text(item.get("display_name"), 160),
+                "origin": safe_text(item.get("origin"), 500),
+                "action": safe_text(item.get("action"), 40),
+                "result": safe_text(item.get("result"), 80),
+                "request_id": safe_text(item.get("request_id"), 200),
+                "session_id": safe_text(item.get("session_id"), 200),
+                "tool_name": safe_text(item.get("tool_name"), 120),
+                "provider": safe_text(item.get("provider"), 60) or "claude",
+                "reason": safe_text(item.get("reason"), 500),
+                "input_summary": safe_text(item.get("input_summary"), 500),
+            }
+        )
+    return records
 
 
 def _read_str(value: Any) -> str:
@@ -892,6 +979,54 @@ def _read_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str)]
+
+
+def _origin_key(user: UserRef | None) -> str:
+    if user is None:
+        return ""
+    return user.unified_msg_origin or "__default__"
+
+
+def _bindings_for_origin(entry: dict[str, Any], origin: str) -> list[str]:
+    binding_origins = _read_origin_map(entry.get("binding_origins"))
+    return sorted(
+        session_id
+        for session_id, origins in binding_origins.items()
+        if origin in origins
+    )
+
+
+def _read_session_indexes(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for origin, raw in value.items():
+        if not isinstance(origin, str) or not isinstance(raw, dict):
+            continue
+        result[origin] = {
+            "items": _read_dict_list(raw.get("items")),
+            "at": _parse_timestamp(raw.get("at")),
+        }
+    return result
+
+
+def _session_index_for_origin(entry: dict[str, Any], origin: str) -> list[dict[str, Any]]:
+    scoped = _read_session_indexes(entry.get("session_indexes")).get(origin)
+    if isinstance(scoped, dict):
+        return _read_dict_list(scoped.get("items"))
+    return []
+
+
+def _run_visible_in_origin(item: dict[str, Any], user: UserRef) -> bool:
+    return _read_str(item.get("origin")) == _origin_key(user)
+
+
+def _audit_origin_visible(item: dict[str, Any], entry: dict[str, Any], origin: str) -> bool:
+    item_origin = _read_str(item.get("origin"))
+    if item_origin:
+        return item_origin == origin
+    origins = _read_list(entry.get("origins"))
+    return len(origins) == 1 and origins[0] == origin
 
 
 def _read_origin_map(value: Any) -> dict[str, list[str]]:
@@ -933,10 +1068,3 @@ def _parse_timestamp(value: Any) -> float:
         except ValueError:
             return 0
     return 0
-
-
-def _restrict_file_permissions(path: Path) -> None:
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass

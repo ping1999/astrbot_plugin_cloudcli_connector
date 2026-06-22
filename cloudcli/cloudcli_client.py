@@ -19,17 +19,19 @@ try:
         redact_error_text,
     )
     from .cloudcli_transport import WaiterPredicate, WebSocketRequestMux
-    from .state import PendingApproval
+    from .cloudcli_models import extract_recent_sessions
+    from ..persistence.state_models import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from cloudcli_protocol import (
+    from cloudcli.cloudcli_protocol import (
         build_api_url,
         build_auth_headers,
         build_ws_url,
         iter_sse,
         redact_error_text,
     )
-    from cloudcli_transport import WaiterPredicate, WebSocketRequestMux
-    from state import PendingApproval
+    from cloudcli.cloudcli_models import extract_recent_sessions
+    from cloudcli.cloudcli_transport import WaiterPredicate, WebSocketRequestMux
+    from persistence.state_models import PendingApproval
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,9 @@ PermissionCallback = Callable[[PendingApproval], Awaitable[None]]
 
 
 class CloudCLIClient:
+    reconnect_initial_seconds = 1.0
+    reconnect_max_seconds = 30.0
+
     def __init__(
         self,
         config: CloudCLIConfig,
@@ -69,12 +74,39 @@ class CloudCLIClient:
         self._session: aiohttp.ClientSession | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._reader_task: asyncio.Task | None = None
+        self._supervisor_task: asyncio.Task | None = None
+        self._permission_worker_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         self._send_lock = asyncio.Lock()
+        self._reconnect_event = asyncio.Event()
+        self._reconnect_after_disconnect = False
+        self._permission_queue: asyncio.Queue[PendingApproval] = asyncio.Queue(maxsize=256)
+        self._closing = False
         self._mux = WebSocketRequestMux()
         self._cached_token = config.jwt_token.strip()
 
+    def start(self, *, auto_connect: bool = True) -> None:
+        if not self._permission_worker_task or self._permission_worker_task.done():
+            self._permission_worker_task = asyncio.create_task(self._permission_worker())
+        if self._supervisor_task and not self._supervisor_task.done():
+            if auto_connect:
+                self._reconnect_event.set()
+            return
+        self._closing = False
+        self._supervisor_task = asyncio.create_task(self._connection_supervisor())
+        if auto_connect:
+            self._reconnect_event.set()
+
     async def close(self) -> None:
+        self._closing = True
+        self._reconnect_event.set()
+        if self._supervisor_task:
+            self._supervisor_task.cancel()
+            try:
+                await self._supervisor_task
+            except asyncio.CancelledError:
+                pass
+            self._supervisor_task = None
         if self._reader_task:
             self._reader_task.cancel()
             try:
@@ -82,12 +114,21 @@ class CloudCLIClient:
             except asyncio.CancelledError:
                 pass
             self._reader_task = None
+        if self._permission_worker_task:
+            self._permission_worker_task.cancel()
+            try:
+                await self._permission_worker_task
+            except asyncio.CancelledError:
+                pass
+            self._permission_worker_task = None
         if self._ws and not self._ws.closed:
             await self._ws.close()
         self._ws = None
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+        self._reconnect_after_disconnect = False
+        self._reconnect_event.clear()
         self._mux.fail_waiters(CloudCLIError("CloudCLI connection closed."))
 
     async def ensure_connected(self) -> None:
@@ -127,7 +168,7 @@ class CloudCLIClient:
             else:
                 result["auth"] = {"ok": False, "message": str(exc)}
         except Exception as exc:  # noqa: BLE001
-            result["auth"] = {"ok": False, "message": f"认证检查失败：{exc}"}
+            result["auth"] = {"ok": False, "message": f"认证检查失败：{_redact_text(str(exc))}"}
 
         try:
             await self.ensure_connected()
@@ -135,7 +176,10 @@ class CloudCLIClient:
         except CloudCLIError as exc:
             result["websocket"] = {"ok": False, "message": str(exc)}
         except Exception as exc:  # noqa: BLE001
-            result["websocket"] = {"ok": False, "message": f"WebSocket 检查失败：{exc}"}
+            result["websocket"] = {
+                "ok": False,
+                "message": f"WebSocket 检查失败：{_redact_text(str(exc))}",
+            }
 
         try:
             sessions = await self.get_recent_sessions(1)
@@ -146,7 +190,7 @@ class CloudCLIClient:
         except CloudCLIError as exc:
             result["rest"] = {"ok": False, "message": str(exc)}
         except Exception as exc:  # noqa: BLE001
-            result["rest"] = {"ok": False, "message": f"REST 检查失败：{exc}"}
+            result["rest"] = {"ok": False, "message": f"REST 检查失败：{_redact_text(str(exc))}"}
 
         if self.config.api_key:
             result["agent"]["message"] = "已配置 cloudcli_api_key；为避免启动真实任务，未主动调用 /api/agent。"
@@ -156,7 +200,7 @@ class CloudCLIClient:
 
     async def get_recent_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
         await self._ensure_http_session()
-        token = await self._get_token(allow_anonymous=self.config.allow_unauthenticated_ws)
+        token = await self._get_token()
         headers = self._auth_headers(token)
         params = {
             "skipSynchronization": "false",
@@ -170,7 +214,10 @@ class CloudCLIClient:
         except Exception as exc:  # noqa: BLE001
             raise CloudCLIError(f"读取 CloudCLI 最近 session 失败：{exc}") from exc
 
-        return self._extract_recent_sessions(data, limit)
+        try:
+            return extract_recent_sessions(data, limit)
+        except ValueError as exc:
+            raise CloudCLIError(str(exc)) from exc
 
     async def get_session_messages(
         self,
@@ -205,9 +252,7 @@ class CloudCLIClient:
         raise CloudCLIError("无法解析 CloudCLI session 消息响应。")
 
     async def stream_agent(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key:
-            headers["X-API-Key"] = self.config.api_key
+        headers = await self._agent_auth_headers()
         request_payload = dict(payload)
         request_payload["stream"] = True
 
@@ -248,6 +293,22 @@ class CloudCLIClient:
             raise
         except Exception as exc:  # noqa: BLE001
             raise CloudCLIError(f"CloudCLI agent 任务执行失败：{_redact_text(str(exc))}") from exc
+
+    async def _agent_auth_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        token = ""
+        if self._cached_token:
+            token = self._cached_token
+        elif self.config.username and self.config.password:
+            await self._ensure_http_session()
+            try:
+                token = await self._get_token()
+            except CloudCLIError:
+                if not self.config.api_key:
+                    raise
+                token = ""
+        headers.update(self._auth_headers(token))
+        return headers
 
     async def get_pending_permissions(self, session_id: str) -> list[PendingApproval]:
         await self.ensure_connected()
@@ -305,10 +366,12 @@ class CloudCLIClient:
 
         token = await self._get_token(allow_anonymous=self.config.allow_unauthenticated_ws)
         ws_url = self._ws_url(token)
+        headers = self._auth_headers(token)
         try:
             ws = await self._session.ws_connect(
                 ws_url,
                 heartbeat=25,
+                headers=headers,
             )
             self._ws = ws
         except Exception as exc:  # noqa: BLE001
@@ -316,9 +379,11 @@ class CloudCLIClient:
                 await self._clear_cached_token()
                 try:
                     token = await self._get_token()
+                    headers = self._auth_headers(token)
                     ws = await self._session.ws_connect(
                         self._ws_url(token),
                         heartbeat=25,
+                        headers=headers,
                     )
                     self._ws = ws
                 except Exception as retry_exc:  # noqa: BLE001
@@ -326,11 +391,52 @@ class CloudCLIClient:
                         f"无法连接 CloudCLI WebSocket，重新登录后仍失败：{_redact_text(str(retry_exc))}"
                     ) from retry_exc
                 else:
-                    self._reader_task = asyncio.create_task(self._reader_loop(ws))
+                    self._start_reader(ws)
                     return
             raise CloudCLIError(f"无法连接 CloudCLI WebSocket：{_redact_text(str(exc))}") from exc
 
-        self._reader_task = asyncio.create_task(self._reader_loop(ws))
+        self._start_reader(ws)
+
+    def _start_reader(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        task = asyncio.create_task(self._reader_loop(ws))
+        self._reader_task = task
+        task.add_done_callback(self._on_reader_done)
+
+    def _on_reader_done(self, task: asyncio.Task) -> None:
+        if self._reader_task is task:
+            self._reader_task = None
+        if not self._closing:
+            self._reconnect_after_disconnect = True
+            self._reconnect_event.set()
+
+    async def _connection_supervisor(self) -> None:
+        delay = max(0.01, float(self.reconnect_initial_seconds))
+        max_delay = max(delay, float(self.reconnect_max_seconds))
+        while not self._closing:
+            try:
+                await self._reconnect_event.wait()
+                self._reconnect_event.clear()
+                if self._closing:
+                    return
+                if self._ws and not self._ws.closed:
+                    delay = max(0.01, float(self.reconnect_initial_seconds))
+                    continue
+                if self._reconnect_after_disconnect:
+                    self._reconnect_after_disconnect = False
+                    await asyncio.sleep(delay)
+                await self.ensure_connected()
+                delay = max(0.01, float(self.reconnect_initial_seconds))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "CloudCLI WebSocket reconnect failed: %s; retrying in %.1fs",
+                    _redact_text(str(exc)),
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(max_delay, delay * 2)
+                self._reconnect_event.set()
 
     async def _ensure_http_session(self) -> None:
         if self._session and self._session.closed:
@@ -489,10 +595,30 @@ class CloudCLIClient:
 
         approval = self._extract_permission_request(data)
         if approval:
+            if self._permission_worker_task and not self._permission_worker_task.done():
+                try:
+                    self._permission_queue.put_nowait(approval)
+                    return
+                except asyncio.QueueFull:
+                    logger.warning("CloudCLI permission queue is full; handling inline.")
+            await self._deliver_permission_request(approval)
+
+    async def _permission_worker(self) -> None:
+        while True:
+            approval = await self._permission_queue.get()
             try:
-                await self._on_permission_request(approval)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to handle CloudCLI permission request: %s", exc)
+                await self._deliver_permission_request(approval)
+            finally:
+                self._permission_queue.task_done()
+
+    async def _deliver_permission_request(self, approval: PendingApproval) -> None:
+        try:
+            await self._on_permission_request(approval)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to handle CloudCLI permission request: %s",
+                _redact_text(str(exc)),
+            )
 
     def _extract_permission_request(self, data: dict[str, Any]) -> PendingApproval | None:
         message_type = str(data.get("type") or data.get("kind") or "")
@@ -507,92 +633,6 @@ class CloudCLIClient:
 
     def _ws_url(self, token: str) -> str:
         return build_ws_url(self.config.base_url, token)
-
-    def _extract_recent_sessions(self, data: Any, limit: int) -> list[dict[str, Any]]:
-        if isinstance(data, dict):
-            projects = data.get("projects") or data.get("data") or data.get("items")
-        else:
-            projects = data
-        if not isinstance(projects, list):
-            raise CloudCLIError("无法解析 CloudCLI 最近 session 响应。")
-
-        provider_fields = (
-            ("claude", "sessions"),
-            ("codex", "codexSessions"),
-            ("cursor", "cursorSessions"),
-            ("gemini", "geminiSessions"),
-            ("opencode", "opencodeSessions"),
-        )
-        result: list[dict[str, Any]] = []
-        for project in projects:
-            if not isinstance(project, dict):
-                continue
-            project_name = (
-                project.get("displayName")
-                or project.get("name")
-                or project.get("projectId")
-                or project.get("path")
-                or ""
-            )
-            project_path = project.get("fullPath") or project.get("path") or ""
-            for provider, field_name in provider_fields:
-                sessions = project.get(field_name)
-                if not isinstance(sessions, list):
-                    continue
-                for session in sessions:
-                    item = self._normalize_recent_session(
-                        session,
-                        provider,
-                        str(project_name),
-                        str(project_path),
-                    )
-                    if item:
-                        result.append(item)
-
-        result.sort(key=lambda item: str(item.get("lastActivity") or ""), reverse=True)
-        return result[: max(1, min(limit, 100))]
-
-    def _normalize_recent_session(
-        self,
-        session: Any,
-        provider: str,
-        project_name: str,
-        project_path: str,
-    ) -> dict[str, Any] | None:
-        if isinstance(session, str):
-            session_id = session
-            summary = ""
-            message_count = None
-            last_activity = ""
-        elif isinstance(session, dict):
-            session_id = (
-                session.get("id")
-                or session.get("sessionId")
-                or session.get("session_id")
-                or session.get("conversationId")
-            )
-            summary = session.get("summary") or session.get("title") or ""
-            message_count = session.get("messageCount") or session.get("message_count")
-            last_activity = (
-                session.get("lastActivity")
-                or session.get("updatedAt")
-                or session.get("createdAt")
-                or ""
-            )
-        else:
-            return None
-        if not session_id:
-            return None
-        return {
-            "provider": provider,
-            "id": str(session_id),
-            "summary": str(summary) if summary else "",
-            "messageCount": message_count,
-            "lastActivity": str(last_activity) if last_activity else "",
-            "projectName": project_name,
-            "projectPath": project_path,
-        }
-
 
 def _redact_text(value: str) -> str:
     return redact_error_text(value)

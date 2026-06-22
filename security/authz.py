@@ -5,13 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from .config import ConnectorSettings
+    from ..core.config import ConnectorSettings
     from .identity import missing_identity_message
-    from .state import UserRef
+    from ..persistence.state_models import UserRef
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from config import ConnectorSettings
-    from identity import missing_identity_message
-    from state import UserRef
+    from core.config import ConnectorSettings
+    from persistence.state_models import UserRef
+    from security.identity import missing_identity_message
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class AuthorizationPolicy:
         if self._is_allowed(
             user,
             allowed_keys=self.settings.session_allowed_user_keys,
-            require_admin=self.settings.session_require_admin,
+            access_mode=self.settings.session_access_mode,
         ):
             return Decision(True)
         return Decision(
@@ -40,6 +40,27 @@ class AuthorizationPolicy:
             f"当前用户标识：{user.user_key}\n"
             "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 session_allowed_user_keys。",
         )
+
+    def can_bind_sessions(self, user: UserRef) -> Decision:
+        session_decision = self.can_access_sessions(user)
+        if session_decision.allowed:
+            return session_decision
+        approval_decision = self.can_manage_approvals(user)
+        if approval_decision.allowed:
+            return Decision(True)
+        return session_decision
+
+    def can_bind_direct_session_for_approval(self, user: UserRef) -> Decision:
+        identity_error = self._identity_error(user)
+        if identity_error:
+            return Decision(False, identity_error)
+        if user.is_admin:
+            return Decision(True)
+        if self.settings.approval_allow_direct_session_bind:
+            approval_decision = self.can_manage_approvals(user)
+            if approval_decision.allowed:
+                return Decision(True)
+        return self.can_use_direct_session_id(user)
 
     def can_use_direct_session_id(self, user: UserRef) -> Decision:
         identity_error = self._identity_error(user)
@@ -62,7 +83,7 @@ class AuthorizationPolicy:
         if self._is_allowed(
             user,
             allowed_keys=self.settings.run_allowed_user_keys,
-            require_admin=self.settings.run_require_admin,
+            access_mode=self.settings.run_access_mode,
         ):
             return Decision(True)
         return Decision(
@@ -79,7 +100,7 @@ class AuthorizationPolicy:
         if self._is_allowed(
             user,
             allowed_keys=self.settings.approval_allowed_user_keys,
-            require_admin=self.settings.approval_require_admin,
+            access_mode=self.settings.approval_access_mode,
         ):
             return Decision(True)
         return Decision(
@@ -112,11 +133,15 @@ class AuthorizationPolicy:
         user: UserRef,
         *,
         allowed_keys: frozenset[str],
-        require_admin: bool,
+        access_mode: str,
     ) -> bool:
         if user.user_key in allowed_keys:
             return True
-        return bool(user.is_admin) if require_admin else True
+        if access_mode == "authenticated":
+            return True
+        if access_mode == "allowlist_only":
+            return False
+        return bool(user.is_admin)
 
     def _identity_error(self, user: UserRef) -> str:
         if getattr(user, "identity_verified", True):

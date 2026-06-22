@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import traceback
 
 
 DEFAULT_MAX_REDACTED_TEXT_CHARS = 2000
@@ -39,3 +40,8 @@ def redact_text(value: str, max_chars: int = DEFAULT_MAX_REDACTED_TEXT_CHARS) ->
     if max_chars > 0 and len(text) > max_chars:
         text = text[:max_chars] + "...[truncated]"
     return text
+
+
+def redact_exception_text(exc: BaseException, max_chars: int = 8000) -> str:
+    rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return redact_text(rendered, max_chars)

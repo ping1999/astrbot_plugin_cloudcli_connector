@@ -11,3 +11,4 @@ build/
 .runtime_data/
 data/
 *.log
+tests/config.yaml

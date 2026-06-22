@@ -3,7 +3,7 @@ display_name: CloudCLI Connector
 author: Codex
 desc: Connect AstrBot commands to CloudCLI sessions, messages, agent tasks, and permission approvals.
 short_desc: Control CloudCLI sessions, tasks, and approvals from AstrBot.
-version: 0.3.0
+version: 0.4.0
 repo: "https://github.com/ping1999/astrbot_plugin_cloudcli_connector"
 astrbot_version: ">=4.16,<5"
 support_platforms:

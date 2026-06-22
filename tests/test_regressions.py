@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from authz import AuthorizationPolicy
-from cloudcli_client import CloudCLIClient, CloudCLIConfig
-from cloudcli_protocol import build_ws_url, parse_sse_event
-from cloudcli_transport import WebSocketRequestMux
-from config import load_connector_settings
-from identity import build_user_ref
-from run_requests import RunRequestBuilder
-from formatting import format_session_overview
-from run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
-from state import PendingApproval, PluginState, UserRef
+from approvals.approval_notifications import ApprovalNotificationPolicy
+from approvals.approval_service import ApprovalService
+from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIConfig, CloudCLIError
+from cloudcli.cloudcli_protocol import build_ws_url, parse_sse_event
+from cloudcli.cloudcli_transport import WebSocketRequestMux
+from commands.command_parser import ParsedCommand
+from commands.command_router import CommandRoute, CommandRouter
+from commands.formatting import format_pending, format_run_tasks, format_session_overview
+from core.config import load_connector_settings
+from core.redaction import redact_exception_text
+from persistence.state import PluginState
+from persistence.state_models import PendingApproval, UserRef
+from runs.run_requests import RunRequestBuilder
+from security.authz import AuthorizationPolicy
+from security.identity import build_user_ref
+from security.run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
 
 
 class ValidationTests(unittest.TestCase):
@@ -115,6 +122,9 @@ class IdentityTests(unittest.TestCase):
                 "session_require_admin": False,
                 "run_require_admin": False,
                 "approval_require_admin": False,
+                "session_access_mode": "authenticated",
+                "run_access_mode": "authenticated",
+                "approval_access_mode": "authenticated",
             }
         )
         authz = AuthorizationPolicy(settings)
@@ -127,6 +137,52 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(authz.can_access_sessions(user).allowed)
         self.assertFalse(authz.can_run_agent(user).allowed)
         self.assertFalse(authz.can_manage_approvals(user).allowed)
+
+    def test_legacy_require_admin_false_is_allowlist_only(self) -> None:
+        settings = load_connector_settings(
+            {
+                "session_require_admin": False,
+                "run_require_admin": False,
+                "approval_require_admin": False,
+            }
+        )
+        authz = AuthorizationPolicy(settings)
+        user = UserRef("test:u1", "User", "origin")
+
+        self.assertFalse(authz.can_access_sessions(user).allowed)
+        self.assertFalse(authz.can_run_agent(user).allowed)
+        self.assertFalse(authz.can_manage_approvals(user).allowed)
+
+    def test_approval_allowlist_can_bind_without_session_read_access(self) -> None:
+        settings = load_connector_settings(
+            {
+                "session_require_admin": True,
+                "approval_require_admin": True,
+                "approval_allowed_user_keys": "test:u1",
+            }
+        )
+        authz = AuthorizationPolicy(settings)
+        user = UserRef("test:u1", "User", "origin")
+
+        self.assertFalse(authz.can_access_sessions(user).allowed)
+        self.assertFalse(authz.can_use_direct_session_id(user).allowed)
+        self.assertTrue(authz.can_manage_approvals(user).allowed)
+        self.assertTrue(authz.can_bind_sessions(user).allowed)
+        self.assertFalse(authz.can_bind_direct_session_for_approval(user).allowed)
+
+    def test_approval_direct_bind_requires_explicit_flag(self) -> None:
+        settings = load_connector_settings(
+            {
+                "session_require_admin": True,
+                "approval_require_admin": True,
+                "approval_allowed_user_keys": "test:u1",
+                "approval_allow_direct_session_bind": True,
+            }
+        )
+        authz = AuthorizationPolicy(settings)
+        user = UserRef("test:u1", "User", "origin")
+
+        self.assertTrue(authz.can_bind_direct_session_for_approval(user).allowed)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -184,6 +240,40 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(2, second_result["value"])
 
 
+class CommandRouterTests(unittest.TestCase):
+    def test_no_arg_route_rejects_extra_args(self) -> None:
+        async def handler(user: UserRef, args: list[str]) -> str:
+            return "ok"
+
+        async def scenario() -> str:
+            router = CommandRouter(
+                help_text="help",
+                routes={
+                    "status": CommandRoute(
+                        handler=handler,
+                        usage="用法：/cloudcli status",
+                        no_args=True,
+                    )
+                },
+            )
+            return await router.dispatch(
+                ParsedCommand("status", ["extra"], ""),
+                UserRef("test:u1", "User", "origin"),
+            )
+
+        self.assertEqual("用法：/cloudcli status", asyncio.run(scenario()))
+
+    def test_unknown_route_returns_help(self) -> None:
+        async def scenario() -> str:
+            router = CommandRouter(help_text="help text", routes={})
+            return await router.dispatch(
+                ParsedCommand("missing", [], ""),
+                UserRef("test:u1", "User", "origin"),
+            )
+
+        self.assertIn("help text", asyncio.run(scenario()))
+
+
 class FakeSessions:
     def __init__(self, project_path: str, provider: str = "codex") -> None:
         self.project_path = project_path
@@ -214,11 +304,11 @@ class RunRequestTests(unittest.TestCase):
     def test_run_rejects_mixed_targets(self) -> None:
         async def scenario() -> tuple[object | None, str | None]:
             settings = load_connector_settings(
-                {
-                    "run_require_admin": False,
-                    "session_require_admin": False,
-                    "allowed_project_roots": "C:/allowed",
-                }
+                    {
+                        "run_access_mode": "authenticated",
+                        "session_access_mode": "authenticated",
+                        "allowed_project_roots": "C:/allowed",
+                    }
             )
             builder = RunRequestBuilder(
                 settings=settings,
@@ -243,11 +333,11 @@ class RunRequestTests(unittest.TestCase):
                 allowed.mkdir()
                 outside.mkdir()
                 settings = load_connector_settings(
-                    {
-                        "run_require_admin": False,
-                        "session_require_admin": False,
-                        "allowed_project_roots": str(allowed),
-                    }
+                        {
+                            "run_access_mode": "authenticated",
+                            "session_access_mode": "authenticated",
+                            "allowed_project_roots": str(allowed),
+                        }
                 )
                 builder = RunRequestBuilder(
                     settings=settings,
@@ -268,11 +358,11 @@ class RunRequestTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp_dir:
                 allowed = Path(temp_dir)
                 settings = load_connector_settings(
-                    {
-                        "run_require_admin": False,
-                        "session_require_admin": False,
-                        "allowed_project_roots": str(allowed),
-                    }
+                        {
+                            "run_access_mode": "authenticated",
+                            "session_access_mode": "authenticated",
+                            "allowed_project_roots": str(allowed),
+                        }
                 )
                 builder = RunRequestBuilder(
                     settings=settings,
@@ -307,8 +397,133 @@ class FormattingTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 280)
         self.assertIn("已截断", rendered)
 
+    def test_pending_list_is_clipped_after_all_items_are_rendered(self) -> None:
+        rendered = format_pending(
+            [
+                PendingApproval(f"request-{index}", "sess-1", "Tool", {"text": "x" * 1000})
+                for index in range(20)
+            ],
+            300,
+        )
+        self.assertLessEqual(len(rendered), 380)
+        self.assertIn("已截断", rendered)
+
+    def test_run_task_list_is_clipped(self) -> None:
+        rendered = format_run_tasks(
+            [
+                {
+                    "id": str(index),
+                    "status": "completed",
+                    "provider": "codex",
+                    "target": "C:/repo/" + ("x" * 500),
+                }
+                for index in range(20)
+            ],
+            20,
+            300,
+        )
+        self.assertLessEqual(len(rendered), 380)
+        self.assertIn("已截断", rendered)
+
 
 class StateTests(unittest.TestCase):
+    def test_legacy_single_origin_state_migrates_to_scoped_data(self) -> None:
+        async def scenario() -> tuple[list[str], bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 2,
+                            "users": {
+                                "test:u1": {
+                                    "origins": ["origin"],
+                                    "bindings": ["sess-1"],
+                                    "session_index": [
+                                        {
+                                            "id": "sess-1",
+                                            "provider": "codex",
+                                            "projectPath": "C:/repo",
+                                        }
+                                    ],
+                                    "session_index_at": 1,
+                                }
+                            },
+                            "pending": {},
+                            "runs": {},
+                            "audit": [],
+                            "next_run_id": 1,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                indexed = await state.find_session_index_item(user, "sess-1")
+                return await state.list_bindings(user), indexed is not None
+
+        bindings, has_index = asyncio.run(scenario())
+        self.assertEqual(["sess-1"], bindings)
+        self.assertTrue(has_index)
+
+    def test_bindings_pending_runs_and_audit_are_origin_scoped(self) -> None:
+        async def scenario() -> tuple[list[str], int, int, int, bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                private_user = UserRef("test:u1", "User", "private-origin")
+                group_user = UserRef("test:u1", "User", "group-origin")
+                await state.bind_session(private_user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+                await state.create_run_task(
+                    private_user,
+                    {"provider": "codex", "projectPath": "C:/repo", "message": "doit"},
+                    "C:/repo",
+                )
+                await state.append_audit(
+                    user=private_user,
+                    action="allow",
+                    approval=PendingApproval("request-2", "sess-1", "Tool", {}),
+                )
+                await state.remember_session_index(
+                    private_user,
+                    [{"id": "sess-1", "provider": "codex", "projectPath": "C:/repo"}],
+                )
+                indexed = await state.find_session_index_item(group_user, "sess-1")
+                return (
+                    await state.list_bindings(group_user),
+                    len(await state.visible_pending_for_user(group_user, 10)),
+                    len(await state.list_run_tasks(group_user, 10)),
+                    len(await state.list_audit(group_user, 10)),
+                    indexed is None,
+                )
+
+        bindings, pending_count, run_count, audit_count, index_isolated = asyncio.run(scenario())
+        self.assertEqual([], bindings)
+        self.assertEqual(0, pending_count)
+        self.assertEqual(0, run_count)
+        self.assertEqual(0, audit_count)
+        self.assertTrue(index_isolated)
+
+    def test_unbind_removes_only_current_origin_binding(self) -> None:
+        async def scenario() -> tuple[list[str], list[str]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                private_user = UserRef("test:u1", "User", "private-origin")
+                group_user = UserRef("test:u1", "User", "group-origin")
+                await state.bind_session(private_user, "sess-1", 10)
+                await state.bind_session(group_user, "sess-1", 10)
+                await state.unbind_session(group_user, "sess-1")
+                return await state.list_bindings(private_user), await state.list_bindings(group_user)
+
+        private_bindings, group_bindings = asyncio.run(scenario())
+        self.assertEqual(["sess-1"], private_bindings)
+        self.assertEqual([], group_bindings)
+
     def test_pending_input_redacts_common_secret_key_shapes(self) -> None:
         async def scenario() -> dict[str, object]:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -363,6 +578,44 @@ class StateTests(unittest.TestCase):
         self.assertIn("正在被处理", second_error)
         self.assertTrue(third_claimed)
 
+    def test_pending_upsert_preserves_active_claim(self) -> None:
+        async def scenario() -> tuple[bool, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                first_user = UserRef("test:u1", "User 1", "origin-1")
+                second_user = UserRef("test:u2", "User 2", "origin-2")
+                await state.bind_session(first_user, "sess-1", 10)
+                await state.bind_session(second_user, "sess-1", 10)
+                approval = PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                await state.upsert_pending(approval)
+                claimed, first_error = await state.claim_visible_request(first_user, None, 10, "allow")
+                self.assertIsNone(first_error)
+                self.assertIsNotNone(claimed)
+
+                await state.upsert_pending(approval)
+                second_claim, second_error = await state.claim_visible_request(second_user, None, 10, "deny")
+                return second_claim is not None, second_error or ""
+
+        second_claimed, second_error = asyncio.run(scenario())
+        self.assertFalse(second_claimed)
+        self.assertIn("正在被处理", second_error)
+
+    def test_permission_request_tool_name_is_single_line(self) -> None:
+        approval = PendingApproval.from_cloudcli(
+            {
+                "requestId": "request-1",
+                "sessionId": "sess-1",
+                "toolName": "Tool\nrequest: forged",
+                "provider": "claude\nfake",
+                "input": {},
+            }
+        )
+        self.assertIsNotNone(approval)
+        assert approval is not None
+        self.assertEqual("Tool request: forged", approval.tool_name)
+        self.assertEqual("claude fake", approval.provider)
+
     def test_stale_pending_claim_is_cleared_on_load(self) -> None:
         async def scenario() -> bool:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -381,6 +634,86 @@ class StateTests(unittest.TestCase):
                 return claimed is not None
 
         self.assertTrue(asyncio.run(scenario()))
+
+    def test_loaded_legacy_sensitive_state_is_redacted(self) -> None:
+        async def scenario() -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 3,
+                            "users": {
+                                "test:u1": {
+                                    "origins": ["origin"],
+                                    "bindings": ["sess-1"],
+                                    "binding_origins": {"sess-1": ["origin"]},
+                                }
+                            },
+                            "pending": {
+                                "sess-1|request-1": {
+                                    "request_id": "request-1",
+                                    "session_id": "sess-1",
+                                    "tool_name": "Tool",
+                                    "input_data": {"api_key": "pending-secret"},
+                                    "provider": "claude",
+                                    "received_at": 1,
+                                }
+                            },
+                            "runs": {
+                                "1": {
+                                    "id": "1",
+                                    "user_key": "test:u1",
+                                    "display_name": "User",
+                                    "origin": "origin",
+                                    "status": "completed",
+                                    "provider": "codex",
+                                    "target": "C:/repo",
+                                    "message": "password=run-secret",
+                                    "log": [{"ts": 1, "text": "token=log-secret"}],
+                                    "summary": {"api_key": "summary-secret"},
+                                }
+                            },
+                            "audit": [
+                                {
+                                    "ts": 1,
+                                    "user_key": "test:u1",
+                                    "display_name": "User",
+                                    "origin": "origin",
+                                    "action": "allow",
+                                    "result": "failed: token=audit-secret",
+                                    "request_id": "request-1",
+                                    "session_id": "sess-1",
+                                    "tool_name": "Tool",
+                                    "provider": "claude",
+                                    "input_summary": '{"password":"audit-input-secret"}',
+                                }
+                            ],
+                            "next_run_id": 2,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                pending = await state.visible_pending_for_user(user, 10)
+                run, error = await state.get_run_task(user, "1")
+                self.assertIsNone(error)
+                assert run is not None
+                return pending[0].input_data, run, await state.list_audit(user, 10)
+
+        pending_input, run, audit = asyncio.run(scenario())
+        rendered = json.dumps(
+            {"pending": pending_input, "run": run, "audit": audit},
+            ensure_ascii=False,
+        )
+        self.assertNotIn("pending-secret", rendered)
+        self.assertNotIn("run-secret", rendered)
+        self.assertNotIn("log-secret", rendered)
+        self.assertNotIn("summary-secret", rendered)
+        self.assertNotIn("audit-secret", rendered)
+        self.assertNotIn("audit-input-secret", rendered)
 
     def test_pending_request_ids_are_scoped_by_session(self) -> None:
         async def scenario() -> list[PendingApproval]:
@@ -450,6 +783,22 @@ class StateTests(unittest.TestCase):
 
 
 class CloudCLIClientTests(unittest.TestCase):
+    def test_agent_headers_include_jwt_and_api_key(self) -> None:
+        async def scenario() -> dict[str, str]:
+            client = CloudCLIClient(
+                CloudCLIConfig(
+                    base_url="http://127.0.0.1:3001",
+                    jwt_token="jwt-token",
+                    api_key="api-secret",
+                ),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            return await client._agent_auth_headers()
+
+        headers = asyncio.run(scenario())
+        self.assertEqual("Bearer jwt-token", headers.get("Authorization"))
+        self.assertEqual("api-secret", headers.get("X-API-Key"))
+
     def test_unauthenticated_ws_does_not_require_token(self) -> None:
         class FakeWebSocket:
             closed = False
@@ -469,7 +818,7 @@ class CloudCLIClientTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.connected_url = ""
 
-            async def ws_connect(self, url: str, heartbeat: int):
+            async def ws_connect(self, url: str, heartbeat: int, headers=None):
                 self.connected_url = url
                 return FakeWebSocket()
 
@@ -495,6 +844,203 @@ class CloudCLIClientTests(unittest.TestCase):
             return getattr(session, "connected_url", "")
 
         self.assertEqual("ws://127.0.0.1:3001/ws", asyncio.run(scenario()))
+
+    def test_websocket_connect_sends_api_key_header(self) -> None:
+        class FakeWebSocket:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class FakeSession:
+            closed = False
+
+            def __init__(self) -> None:
+                self.connected_headers: dict[str, str] = {}
+
+            async def ws_connect(self, url: str, heartbeat: int, headers=None):
+                self.connected_headers = dict(headers or {})
+                return FakeWebSocket()
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class TestClient(CloudCLIClient):
+            async def _ensure_http_session(self) -> None:
+                if self._session is None:
+                    self._session = FakeSession()  # type: ignore[assignment]
+
+        async def scenario() -> dict[str, str]:
+            client = TestClient(
+                CloudCLIConfig(
+                    base_url="http://127.0.0.1:3001",
+                    jwt_token="jwt-token",
+                    api_key="api-secret",
+                ),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            await client.ensure_connected()
+            session = client._session
+            await client.close()
+            return getattr(session, "connected_headers", {})
+
+        headers = asyncio.run(scenario())
+        self.assertEqual("Bearer jwt-token", headers.get("Authorization"))
+        self.assertEqual("api-secret", headers.get("X-API-Key"))
+
+    def test_recent_sessions_do_not_inherit_unauthenticated_ws_setting(self) -> None:
+        class TestClient(CloudCLIClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    CloudCLIConfig(
+                        base_url="http://127.0.0.1:3001",
+                        allow_unauthenticated_ws=True,
+                    ),
+                    on_permission_request=lambda _approval: asyncio.sleep(0),
+                )
+                self.allow_anonymous_values: list[bool] = []
+
+            async def _ensure_http_session(self) -> None:
+                return None
+
+            async def _get_token(self, *, allow_anonymous: bool = False) -> str:
+                self.allow_anonymous_values.append(allow_anonymous)
+                return "token"
+
+            async def _get_json_with_auth_retry(self, path, params, headers):
+                return {"projects": []}
+
+        async def scenario() -> list[bool]:
+            client = TestClient()
+            await client.get_recent_sessions(1)
+            return client.allow_anonymous_values
+
+        self.assertEqual([False], asyncio.run(scenario()))
+
+    def test_supervisor_reconnects_after_websocket_disconnect(self) -> None:
+        class FakeWebSocket:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(0)
+                raise StopAsyncIteration
+
+            async def close(self) -> None:
+                self.closed = True
+
+            async def send_json(self, payload: dict[str, object]) -> None:
+                return None
+
+        class FakeSession:
+            closed = False
+
+            def __init__(self) -> None:
+                self.connect_count = 0
+
+            async def ws_connect(self, url: str, heartbeat: int, headers=None):
+                self.connect_count += 1
+                return FakeWebSocket()
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class TestClient(CloudCLIClient):
+            reconnect_initial_seconds = 0.01
+            reconnect_max_seconds = 0.02
+
+            async def _ensure_http_session(self) -> None:
+                if self._session is None:
+                    self._session = FakeSession()  # type: ignore[assignment]
+
+        async def scenario() -> int:
+            client = TestClient(
+                CloudCLIConfig(
+                    base_url="http://127.0.0.1:3001",
+                    allow_unauthenticated_ws=True,
+                ),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            client.start(auto_connect=True)
+            for _ in range(100):
+                session = client._session
+                if getattr(session, "connect_count", 0) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            session = client._session
+            count = getattr(session, "connect_count", 0)
+            await client.close()
+            return count
+
+        self.assertGreaterEqual(asyncio.run(scenario()), 2)
+
+
+class ApprovalServiceTests(unittest.TestCase):
+    def test_legacy_approval_require_admin_false_does_not_push_to_everyone(self) -> None:
+        policy = ApprovalNotificationPolicy(
+            approval_allowed_user_keys=frozenset(),
+            approval_require_admin=False,
+            approval_access_mode="allowlist_only",
+        )
+
+        self.assertFalse(policy.can_receive_details("test:u1"))
+
+    def test_decision_is_blocked_when_pending_refresh_fails(self) -> None:
+        class FailingClient:
+            decision_sent = False
+
+            async def get_pending_permissions(self, session_id: str):
+                raise CloudCLIError("temporary failure")
+
+            async def send_permission_decision(self, *args, **kwargs) -> None:
+                self.decision_sent = True
+
+        async def scenario() -> tuple[str, bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = load_connector_settings({})
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin", is_admin=True)
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+                client = FailingClient()
+                service = ApprovalService(
+                    settings=settings,
+                    state=state,
+                    client=client,  # type: ignore[arg-type]
+                    notifications=ApprovalNotificationPolicy(
+                        approval_allowed_user_keys=frozenset(),
+                        approval_require_admin=True,
+                    ),
+                    send_proactive=lambda _origin, _text: asyncio.sleep(0),
+                    track_task=lambda _task: None,
+                )
+                result = await service.handle_allow(user, [])
+                return result, client.decision_sent
+
+        result, decision_sent = asyncio.run(scenario())
+        self.assertIn("同步 CloudCLI 待审批权限失败", result)
+        self.assertFalse(decision_sent)
+
+
+class RedactionTests(unittest.TestCase):
+    def test_exception_traceback_is_redacted(self) -> None:
+        try:
+            raise ValueError("client_secret=secret-value token=token-value")
+        except ValueError as exc:
+            rendered = redact_exception_text(exc)
+        self.assertNotIn("secret-value", rendered)
+        self.assertNotIn("token-value", rendered)
 
 
 if __name__ == "__main__":
