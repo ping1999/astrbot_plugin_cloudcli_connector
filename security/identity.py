@@ -5,9 +5,9 @@ import inspect
 from typing import Any
 
 try:
-    from ..persistence.state_models import UserRef
+    from ..persistence.state_models import UserRef, safe_inline_text
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from persistence.state_models import UserRef
+    from persistence.state_models import UserRef, safe_inline_text
 
 
 async def build_user_ref(event: Any) -> UserRef:
@@ -20,7 +20,8 @@ async def build_user_ref(event: Any) -> UserRef:
         session_id = await _call_or_attr(event, "get_session_id") or unified_msg_origin or "unknown-session"
         sender_id = f"unidentified:{_stable_digest(str(session_id))}"
 
-    display_name = await _call_or_attr(event, "get_sender_name") or str(sender_id)
+    raw_display_name = await _call_or_attr(event, "get_sender_name") or str(sender_id)
+    display_name = safe_inline_text(raw_display_name, 160) or str(sender_id)
     is_admin = await _is_event_admin(event) if identity_verified else False
     return UserRef(
         user_key=f"{platform_id}:{sender_id}",

@@ -94,7 +94,8 @@ def format_session_overview(
 
 
 def format_health_report(report: dict[str, Any]) -> str:
-    lines = [f"CloudCLI 状态：{report.get('base_url') or '(未配置)'}"]
+    base_url = redact_text(str(report.get("base_url") or "(未配置)"))
+    lines = [f"CloudCLI 状态：{base_url}"]
     for key, label in (
         ("auth", "认证"),
         ("websocket", "WebSocket"),

@@ -13,7 +13,7 @@ from cloudcli.cloudcli_protocol import build_ws_url, parse_sse_event
 from cloudcli.cloudcli_transport import WebSocketRequestMux
 from commands.command_parser import ParsedCommand
 from commands.command_router import CommandRoute, CommandRouter
-from commands.formatting import format_pending, format_run_tasks, format_session_overview
+from commands.formatting import format_health_report, format_pending, format_run_tasks, format_session_overview
 from core.config import load_connector_settings
 from core.redaction import redact_exception_text
 from persistence.state import PluginState
@@ -22,6 +22,7 @@ from runs.run_requests import RunRequestBuilder
 from security.authz import AuthorizationPolicy
 from security.identity import build_user_ref
 from security.run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
+from sessions.session_resolver import SessionResolver
 
 
 class ValidationTests(unittest.TestCase):
@@ -116,6 +117,22 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(user.display_name, "Async User")
         self.assertTrue(user.identity_verified)
 
+    def test_display_name_is_single_line(self) -> None:
+        class Event:
+            unified_msg_origin = "origin"
+
+            def get_platform_id(self) -> str:
+                return "test"
+
+            def get_sender_id(self) -> str:
+                return "u3"
+
+            def get_sender_name(self) -> str:
+                return "Alice\nAstrBot 管理员：是"
+
+        user = asyncio.run(build_user_ref(Event()))
+        self.assertEqual(user.display_name, "Alice AstrBot 管理员：是")
+
     def test_authorization_fails_closed_for_unverified_identity(self) -> None:
         settings = load_connector_settings(
             {
@@ -184,6 +201,72 @@ class IdentityTests(unittest.TestCase):
 
         self.assertTrue(authz.can_bind_direct_session_for_approval(user).allowed)
 
+    def test_approval_allowlist_cannot_bind_cached_index_without_direct_flag(self) -> None:
+        class FakeClient:
+            async def get_recent_sessions(self, limit: int = 100) -> list[dict[str, str]]:
+                return []
+
+        async def scenario() -> tuple[str, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = load_connector_settings(
+                    {
+                        "session_require_admin": True,
+                        "approval_require_admin": True,
+                        "approval_allowed_user_keys": "test:u1",
+                    }
+                )
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.remember_session_index(
+                    user,
+                    [{"id": "sess-1", "provider": "codex", "projectPath": "C:/repo"}],
+                )
+                resolver = SessionResolver(
+                    settings=settings,
+                    authz=AuthorizationPolicy(settings),
+                    state=state,
+                    client=FakeClient(),
+                )
+                blocked = await resolver.direct_bind_error(user, "1")
+
+                allowed_settings = load_connector_settings(
+                    {
+                        "session_require_admin": True,
+                        "approval_require_admin": True,
+                        "approval_allowed_user_keys": "test:u1",
+                        "approval_allow_direct_session_bind": True,
+                    }
+                )
+                allowed_resolver = SessionResolver(
+                    settings=allowed_settings,
+                    authz=AuthorizationPolicy(allowed_settings),
+                    state=state,
+                    client=FakeClient(),
+                )
+                allowed = await allowed_resolver.direct_bind_error(user, "1")
+                return blocked, allowed
+
+        blocked, allowed = asyncio.run(scenario())
+        self.assertIn("不能直接使用未绑定的 sessionId", blocked)
+        self.assertEqual("", allowed)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_base_url_strips_userinfo_and_health_report_redacts(self) -> None:
+        settings = load_connector_settings(
+            {"cloudcli_base_url": "http://user:pass@example.com:3001/cloudcli"}
+        )
+        self.assertEqual("http://example.com:3001/cloudcli", settings.cloudcli.base_url)
+
+        rendered = format_health_report(
+            {
+                "base_url": "http://user:pass@example.com:3001/cloudcli",
+                "auth": {"ok": True, "message": ""},
+            }
+        )
+        self.assertNotIn("user:pass", rendered)
+
 
 class ProtocolTests(unittest.TestCase):
     def test_ws_url_keeps_base_path_and_escapes_token(self) -> None:
@@ -238,6 +321,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(1, sent_before_reply)
         self.assertEqual(1, first_result["value"])
         self.assertEqual(2, second_result["value"])
+
+    def test_request_mux_cleans_up_request_locks(self) -> None:
+        async def scenario() -> int:
+            mux = WebSocketRequestMux()
+
+            async def send_json(payload: dict[str, object]) -> None:
+                await mux.handle_message({"type": "response", "key": payload["key"]})
+
+            for index in range(20):
+                await mux.request(
+                    payload={"key": f"request-{index}"},
+                    predicate=lambda item, key=f"request-{index}": item.get("key") == key,
+                    send_json=send_json,
+                    timeout_seconds=1,
+                    request_key=f"pending-permissions:session-{index}",
+                )
+            return len(mux._request_locks)
+
+        self.assertEqual(0, asyncio.run(scenario()))
 
 
 class CommandRouterTests(unittest.TestCase):

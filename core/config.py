@@ -126,7 +126,25 @@ def _read_base_url(value: Any) -> str:
         return "http://127.0.0.1:3001"
     if any(ord(char) < 32 or ord(char) == 127 for char in raw):
         return "http://127.0.0.1:3001"
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+    try:
+        safe_netloc = _base_url_netloc(parsed)
+    except ValueError:
+        return "http://127.0.0.1:3001"
+    if not safe_netloc:
+        return "http://127.0.0.1:3001"
+    return urlunsplit((parsed.scheme, safe_netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _base_url_netloc(parsed: Any) -> str:
+    if parsed.username or parsed.password:
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return ""
+        host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        return f"{host}:{parsed.port}" if parsed.port is not None else host
+    if parsed.port is not None:
+        return parsed.netloc
+    return parsed.netloc
 
 
 def _read_bool(value: Any, default: bool) -> bool:

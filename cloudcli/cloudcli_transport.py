@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -9,12 +10,18 @@ WaiterPredicate = Callable[[dict[str, Any]], bool]
 SendJson = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+@dataclass
+class _RequestLockSlot:
+    lock: asyncio.Lock
+    ref_count: int = 0
+
+
 class WebSocketRequestMux:
     """Match WebSocket responses to requests and serialize ambiguous request groups."""
 
     def __init__(self) -> None:
         self._waiters: list[tuple[WaiterPredicate, asyncio.Future]] = []
-        self._request_locks: dict[str, asyncio.Lock] = {}
+        self._request_locks: dict[str, _RequestLockSlot] = {}
 
     async def request(
         self,
@@ -26,14 +33,24 @@ class WebSocketRequestMux:
         request_key: str = "",
     ) -> dict[str, Any]:
         if request_key:
-            lock = self._request_locks.setdefault(request_key, asyncio.Lock())
-            async with lock:
-                return await self._request_once(
-                    payload=payload,
-                    predicate=predicate,
-                    send_json=send_json,
-                    timeout_seconds=timeout_seconds,
-                )
+            slot = self._request_locks.get(request_key)
+            if slot is None:
+                slot = _RequestLockSlot(asyncio.Lock())
+                self._request_locks[request_key] = slot
+            slot.ref_count += 1
+            try:
+                async with slot.lock:
+                    return await self._request_once(
+                        payload=payload,
+                        predicate=predicate,
+                        send_json=send_json,
+                        timeout_seconds=timeout_seconds,
+                    )
+            finally:
+                slot.ref_count -= 1
+                if slot.ref_count <= 0 and not slot.lock.locked():
+                    if self._request_locks.get(request_key) is slot:
+                        self._request_locks.pop(request_key, None)
         return await self._request_once(
             payload=payload,
             predicate=predicate,

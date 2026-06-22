@@ -56,7 +56,10 @@ class SessionResolver:
 
     async def direct_bind_error(self, user: UserRef, ref: str) -> str:
         if is_index_session_ref(ref):
-            return ""
+            if self.authz.can_access_sessions(user).allowed:
+                return ""
+            decision = self.authz.can_bind_direct_session_for_approval(user)
+            return "" if decision.allowed else decision.message
         if not is_valid_session_id(ref.strip()):
             return ""
         indexed = await self.state.find_session_index_item(user, ref.strip())

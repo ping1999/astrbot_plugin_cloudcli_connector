@@ -7,6 +7,7 @@ import traceback
 DEFAULT_MAX_REDACTED_TEXT_CHARS = 2000
 
 _SECRET_SUBSTITUTIONS = (
+    (r"(?i)\b(https?://)[^/\s@]+@", r"\1[redacted]@"),
     (
         r"(?i)((?:\"|')?(?:authorization|x-api-key|api[_-]?key|apikey|jwt[_-]?token|"
         r"access[_-]?token|refresh[_-]?token|token|password|passwd|secret|"
