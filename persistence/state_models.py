@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
-    from .sanitizer import safe_json_value, safe_text
+    from ..core.sanitizer import safe_json_value, safe_text
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from sanitizer import safe_json_value, safe_text
+    from core.sanitizer import safe_json_value, safe_text
 
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")

@@ -20,18 +20,18 @@ try:
     )
     from .cloudcli_transport import WaiterPredicate, WebSocketRequestMux
     from .cloudcli_models import extract_recent_sessions
-    from .state_models import PendingApproval
+    from ..persistence.state_models import PendingApproval
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from cloudcli_protocol import (
+    from cloudcli.cloudcli_protocol import (
         build_api_url,
         build_auth_headers,
         build_ws_url,
         iter_sse,
         redact_error_text,
     )
-    from cloudcli_transport import WaiterPredicate, WebSocketRequestMux
-    from cloudcli_models import extract_recent_sessions
-    from state_models import PendingApproval
+    from cloudcli.cloudcli_models import extract_recent_sessions
+    from cloudcli.cloudcli_transport import WaiterPredicate, WebSocketRequestMux
+    from persistence.state_models import PendingApproval
 
 
 logger = logging.getLogger(__name__)
@@ -252,9 +252,7 @@ class CloudCLIClient:
         raise CloudCLIError("无法解析 CloudCLI session 消息响应。")
 
     async def stream_agent(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_key:
-            headers["X-API-Key"] = self.config.api_key
+        headers = await self._agent_auth_headers()
         request_payload = dict(payload)
         request_payload["stream"] = True
 
@@ -295,6 +293,22 @@ class CloudCLIClient:
             raise
         except Exception as exc:  # noqa: BLE001
             raise CloudCLIError(f"CloudCLI agent 任务执行失败：{_redact_text(str(exc))}") from exc
+
+    async def _agent_auth_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        token = ""
+        if self._cached_token:
+            token = self._cached_token
+        elif self.config.username and self.config.password:
+            await self._ensure_http_session()
+            try:
+                token = await self._get_token()
+            except CloudCLIError:
+                if not self.config.api_key:
+                    raise
+                token = ""
+        headers.update(self._auth_headers(token))
+        return headers
 
     async def get_pending_permissions(self, session_id: str) -> list[PendingApproval]:
         await self.ensure_connected()

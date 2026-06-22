@@ -7,7 +7,7 @@ from typing import Any
 try:
     from .redaction import redact_text
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from redaction import redact_text
+    from core.redaction import redact_text
 
 
 MAX_STORED_TEXT = 1200

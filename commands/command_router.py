@@ -5,10 +5,10 @@ from dataclasses import dataclass
 
 try:
     from .command_parser import ParsedCommand
-    from .state_models import UserRef
+    from ..persistence.state_models import UserRef
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from command_parser import ParsedCommand
-    from state_models import UserRef
+    from commands.command_parser import ParsedCommand
+    from persistence.state_models import UserRef
 
 
 CommandHandler = Callable[[UserRef, list[str]], Awaitable[str]]

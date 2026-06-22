@@ -14,11 +14,7 @@ from typing import Any
 
 TEST_DIR = Path(__file__).resolve().parent
 PLUGIN_ROOT = TEST_DIR.parent
-WORKSPACE_ROOT = PLUGIN_ROOT.parent
-CONFIG_PATH = Path(os.environ.get("CLOUDCLI_TEST_CONFIG", TEST_DIR / "config.yaml"))
-LEGACY_CONFIG_PATH = WORKSPACE_ROOT / "integration_tests" / "config.yaml"
-if not CONFIG_PATH.exists() and LEGACY_CONFIG_PATH.exists():
-    CONFIG_PATH = LEGACY_CONFIG_PATH
+CONFIG_PATH = TEST_DIR / "config.yaml"
 if not (PLUGIN_ROOT / "main.py").exists():
     raise SystemExit(f"Plugin source not found: {PLUGIN_ROOT}")
 if str(PLUGIN_ROOT) not in sys.path:
@@ -83,8 +79,7 @@ def parse_simple_yaml_value(value: str) -> str:
 
 CONFIG = load_config(CONFIG_PATH)
 PRINT_OUTPUT_LIMIT = int(
-    os.environ.get("CLOUDCLI_TEST_PRINT_OUTPUT_LIMIT")
-    or CONFIG.get("print_output_limit")
+    CONFIG.get("print_output_limit")
     or 1200
 )
 
@@ -174,10 +169,10 @@ def install_fake_astrbot_modules() -> None:
 install_fake_astrbot_modules()
 
 from main import CloudCLIConnectorPlugin  # noqa: E402
-from command_parser import parse_command  # noqa: E402
-from redaction import redact_text  # noqa: E402
-from run_validation import looks_like_github_url  # noqa: E402
-from state_models import PendingApproval, UserRef  # noqa: E402
+from commands.command_parser import parse_command  # noqa: E402
+from core.redaction import redact_text  # noqa: E402
+from persistence.state_models import PendingApproval, UserRef  # noqa: E402
+from security.run_validation import looks_like_github_url  # noqa: E402
 
 
 class FakePlatformMeta:
@@ -209,12 +204,7 @@ class FakeContext:
         self.platform_manager = FakePlatformManager(self.outbox, self.sent_origins)
 
 
-def setting(config_key: str | tuple[str, ...], env_names: tuple[str, ...], default: str = "") -> str:
-    for env_name in env_names:
-        env_value = os.environ.get(env_name)
-        if env_value is not None and env_value.strip():
-            return env_value.strip()
-
+def setting(config_key: str | tuple[str, ...], default: str = "") -> str:
     keys = (config_key,) if isinstance(config_key, str) else config_key
     for key in keys:
         value = CONFIG.get(key)
@@ -223,22 +213,22 @@ def setting(config_key: str | tuple[str, ...], env_names: tuple[str, ...], defau
     return default
 
 
-def bool_setting(config_key: str | tuple[str, ...], env_names: tuple[str, ...], default: bool = False) -> bool:
-    value = setting(config_key, env_names, "true" if default else "false")
+def bool_setting(config_key: str | tuple[str, ...], default: bool = False) -> bool:
+    value = setting(config_key, "true" if default else "false")
     return value.lower() in {"1", "true", "yes", "on"}
 
 
 def real_cloudcli_enabled() -> bool:
-    return bool_setting("real_enabled", ("CLOUDCLI_TEST_REAL_ENABLED",))
+    return bool_setting("real_enabled")
 
 
 def has_real_cloudcli_config() -> bool:
     if not real_cloudcli_enabled():
         return False
-    has_token = bool(setting(("jwt_token", "cloudcli_jwt_token"), ("CLOUDCLI_TEST_JWT_TOKEN", "CLOUDCLI_JWT_TOKEN")))
+    has_token = bool(setting(("jwt_token", "cloudcli_jwt_token")))
     has_login = bool(
-        setting(("username", "cloudcli_username"), ("CLOUDCLI_TEST_USERNAME", "CLOUDCLI_USERNAME"))
-        and setting(("password", "cloudcli_password"), ("CLOUDCLI_TEST_PASSWORD", "CLOUDCLI_PASSWORD"))
+        setting(("username", "cloudcli_username"))
+        and setting(("password", "cloudcli_password"))
     )
     return has_token or has_login
 
@@ -258,22 +248,26 @@ def format_command_output(command: str, result: str) -> str:
 
 def plugin_config(**overrides: Any) -> dict[str, Any]:
     config = {
-        "cloudcli_base_url": setting("base_url", ("CLOUDCLI_TEST_BASE_URL", "CLOUDCLI_BASE_URL"), "http://127.0.0.1:13002"),
-        "cloudcli_jwt_token": setting(("jwt_token", "cloudcli_jwt_token"), ("CLOUDCLI_TEST_JWT_TOKEN", "CLOUDCLI_JWT_TOKEN")),
-        "cloudcli_username": setting(("username", "cloudcli_username"), ("CLOUDCLI_TEST_USERNAME", "CLOUDCLI_USERNAME")),
-        "cloudcli_password": setting(("password", "cloudcli_password"), ("CLOUDCLI_TEST_PASSWORD", "CLOUDCLI_PASSWORD")),
-        "cloudcli_api_key": setting(("api_key", "cloudcli_api_key"), ("CLOUDCLI_TEST_API_KEY", "CLOUDCLI_API_KEY")),
+        "cloudcli_base_url": setting("base_url", "http://127.0.0.1:13002"),
+        "cloudcli_jwt_token": setting(("jwt_token", "cloudcli_jwt_token")),
+        "cloudcli_username": setting(("username", "cloudcli_username")),
+        "cloudcli_password": setting(("password", "cloudcli_password")),
+        "cloudcli_api_key": setting(("api_key", "cloudcli_api_key")),
         "auto_connect": False,
-        "request_timeout_seconds": int(setting(("timeout", "request_timeout_seconds"), ("CLOUDCLI_TEST_TIMEOUT",), "12")),
-        "recent_sessions_limit": int(setting("recent_sessions_limit", ("CLOUDCLI_TEST_RECENT_LIMIT",), "20")),
-        "chat_messages_limit": int(setting("chat_messages_limit", ("CLOUDCLI_TEST_CHAT_LIMIT",), "8")),
+        "request_timeout_seconds": int(setting(("timeout", "request_timeout_seconds"), "12")),
+        "recent_sessions_limit": int(setting("recent_sessions_limit", "20")),
+        "chat_messages_limit": int(setting("chat_messages_limit", "8")),
         "run_status_interval_seconds": 1,
         "max_run_status_pushes": 5,
         "run_list_limit": 10,
-        "approval_timeout_seconds": int(setting("approval_timeout_seconds", ("CLOUDCLI_TEST_APPROVAL_TIMEOUT",), "0")),
-        "approval_timeout_action": setting("approval_timeout_action", ("CLOUDCLI_TEST_APPROVAL_TIMEOUT_ACTION",), "remind"),
-        "approval_allowed_user_keys": setting("approval_allowed_user_keys", ("CLOUDCLI_TEST_APPROVAL_ALLOWED_USER_KEYS",)),
-        "allowed_project_roots": setting("allowed_project_roots", ("CLOUDCLI_TEST_ALLOWED_PROJECT_ROOTS",)),
+        "approval_timeout_seconds": int(setting("approval_timeout_seconds", "0")),
+        "approval_timeout_action": setting("approval_timeout_action", "remind"),
+        "approval_allowed_user_keys": setting("approval_allowed_user_keys"),
+        "approval_access_mode": setting("approval_access_mode", "admin_or_allowlist"),
+        "approval_allow_direct_session_bind": setting("approval_allow_direct_session_bind", "false").lower() == "true",
+        "session_access_mode": setting("session_access_mode", "admin_or_allowlist"),
+        "run_access_mode": setting("run_access_mode", "admin_or_allowlist"),
+        "allowed_project_roots": setting("allowed_project_roots"),
         "max_push_text_length": 3000,
     }
     config.update(overrides)
@@ -314,7 +308,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         return result
 
     async def pick_session_id(self) -> str:
-        configured = setting("session_id", ("CLOUDCLI_TEST_SESSION_ID",))
+        configured = setting("session_id")
         if configured:
             return configured
 
@@ -322,7 +316,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         if not sessions:
             self.fail(
                 "CloudCLI 没有返回最近 session。请先在 CloudCLI Web UI 创建一个会话，"
-                "或设置 CLOUDCLI_TEST_SESSION_ID。"
+                "或在 tests/config.yaml 设置 session_id。"
         )
         return str(sessions[0]["id"])
 
@@ -454,8 +448,8 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
     async def test_real_cloudcli_command_flow(self) -> None:
         if not has_real_cloudcli_config():
             self.skipTest(
-                "Set CLOUDCLI_TEST_REAL_ENABLED=1 plus CLOUDCLI_TEST_JWT_TOKEN or "
-                "CLOUDCLI_TEST_USERNAME/CLOUDCLI_TEST_PASSWORD to run the real CloudCLI command flow."
+                "Set real_enabled=true plus jwt_token or username/password in tests/config.yaml "
+                "to run the real CloudCLI command flow."
             )
 
         help_text = await self.command("/cloudcli help")
@@ -485,7 +479,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CloudCLI 活跃 session", session_text)
         self.assertIn("最近可绑定 session", session_text)
 
-        configured_session_id = setting("session_id", ("CLOUDCLI_TEST_SESSION_ID",))
+        configured_session_id = setting("session_id")
         if configured_session_id:
             session_id = configured_session_id
             bind_ref = configured_session_id
@@ -551,18 +545,17 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已解绑 session", unbind_text)
 
     async def test_real_cloudcli_run_command_when_enabled(self) -> None:
-        if not bool_setting("run_enabled", ("CLOUDCLI_TEST_RUN_ENABLED",)):
-            self.skipTest("Set CLOUDCLI_TEST_RUN_ENABLED=1 to run /cloudcli run against real CloudCLI.")
+        if not bool_setting("run_enabled"):
+            self.skipTest("Set run_enabled=true in tests/config.yaml to run /cloudcli run against real CloudCLI.")
         if not has_real_cloudcli_config():
             self.skipTest("Real /cloudcli run needs CloudCLI credentials.")
 
-        project = setting("run_project", ("CLOUDCLI_TEST_RUN_PROJECT",))
-        github_url = setting("run_github", ("CLOUDCLI_TEST_RUN_GITHUB",))
-        session_id = setting("session_id", ("CLOUDCLI_TEST_SESSION_ID",))
-        provider = setting("run_provider", ("CLOUDCLI_TEST_RUN_PROVIDER",), "claude")
+        project = setting("run_project")
+        github_url = setting("run_github")
+        session_id = setting("session_id")
+        provider = setting("run_provider", "claude")
         message = setting(
             "run_message",
-            ("CLOUDCLI_TEST_RUN_MESSAGE",),
             "请只回复一句话：CloudCLI AstrBot 插件真实集成测试完成。不要修改任何文件。",
         )
 
@@ -574,8 +567,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
             command = f"/cloudcli run --session {session_id} --provider {provider} {message}"
         else:
             self.fail(
-                "CLOUDCLI_TEST_RUN_ENABLED=1 时需要设置 CLOUDCLI_TEST_RUN_PROJECT、"
-                "CLOUDCLI_TEST_RUN_GITHUB 或 CLOUDCLI_TEST_SESSION_ID。"
+                "run_enabled=true 时需要在 tests/config.yaml 设置 run_project、run_github 或 session_id。"
             )
 
         start_text = await self.command(command)
@@ -589,7 +581,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         run_log_text = await self.command(f"/cloudcli run log {task_id}")
         self.assertIn(f"任务 #{task_id} 日志", run_log_text)
 
-        if bool_setting("run_cancel_enabled", ("CLOUDCLI_TEST_RUN_CANCEL_ENABLED",)):
+        if bool_setting("run_cancel_enabled"):
             cancel_text = await self.command(f"/cloudcli run cancel {task_id}")
             self.assertTrue(
                 "已取消 CloudCLI 任务" in cancel_text or "已经是" in cancel_text,
@@ -597,7 +589,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
             )
             return
 
-        timeout_seconds = int(setting("run_wait", ("CLOUDCLI_TEST_RUN_WAIT",), "120"))
+        timeout_seconds = int(setting("run_wait", "120"))
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while self.plugin._background_tasks and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.5)
@@ -611,14 +603,14 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"任务 #{task_id} 日志", final_log_text)
 
     async def test_real_cloudcli_stop_command_when_enabled(self) -> None:
-        if not bool_setting("stop_enabled", ("CLOUDCLI_TEST_STOP_ENABLED",)):
-            self.skipTest("Set CLOUDCLI_TEST_STOP_ENABLED=1 to send abort-session to real CloudCLI.")
+        if not bool_setting("stop_enabled"):
+            self.skipTest("Set stop_enabled=true in tests/config.yaml to send abort-session to real CloudCLI.")
         if not has_real_cloudcli_config():
             self.skipTest("Real /cloudcli stop needs CloudCLI credentials.")
 
         await self.command("/cloudcli session")
-        session_ref = setting(("stop_session_ref", "stop_session_id", "session_id"), ("CLOUDCLI_TEST_STOP_SESSION_REF", "CLOUDCLI_TEST_STOP_SESSION_ID", "CLOUDCLI_TEST_SESSION_ID"), "1")
-        provider = setting("stop_provider", ("CLOUDCLI_TEST_STOP_PROVIDER",), "")
+        session_ref = setting(("stop_session_ref", "stop_session_id", "session_id"), "1")
+        provider = setting("stop_provider")
         command = f"/cloudcli stop {session_ref}"
         if provider:
             command += f" {provider}"

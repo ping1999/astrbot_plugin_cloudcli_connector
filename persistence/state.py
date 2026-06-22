@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .sanitizer import compact_json, safe_json_value, safe_text
+    from ..core.sanitizer import compact_json, safe_json_value, safe_text
     from .state_models import (
         PendingApproval,
         UserRef,
@@ -20,8 +20,8 @@ try:
     )
     from .state_storage import JsonStateStore
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from sanitizer import compact_json, safe_json_value, safe_text
-    from state_models import (
+    from core.sanitizer import compact_json, safe_json_value, safe_text
+    from persistence.state_models import (
         PendingApproval,
         UserRef,
         is_valid_request_id,
@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         pending_storage_key,
         safe_inline_text,
     )
-    from state_storage import JsonStateStore
+    from persistence.state_storage import JsonStateStore
 
 RUN_ID_RE = re.compile(r"^[0-9]{1,12}$")
 

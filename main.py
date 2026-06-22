@@ -10,19 +10,16 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
 
 try:
-    from .approval_notifications import ApprovalNotificationPolicy
-    from .approval_service import ApprovalService
-    from .authz import AuthorizationPolicy
-    from .cloudcli_client import CloudCLIClient, CloudCLIError
-    from .command_parser import (
+    from .approvals.approval_notifications import ApprovalNotificationPolicy
+    from .approvals.approval_service import ApprovalService
+    from .cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from .commands.command_parser import (
         ParsedCommand,
         parse_command,
         parse_positive_int,
     )
-    from .command_router import CommandHandler, CommandRoute, CommandRouter
-    from .config import load_connector_settings
-    from .constants import PLUGIN_NAME, SESSION_PROVIDERS
-    from .formatting import (
+    from .commands.command_router import CommandHandler, CommandRoute, CommandRouter
+    from .commands.formatting import (
         HELP_TEXT,
         clip_text,
         format_bindings,
@@ -30,28 +27,28 @@ try:
         format_health_report,
         format_session_overview,
     )
-    from .identity import build_user_ref, missing_identity_message
-    from .redaction import redact_exception_text, redact_text
-    from .run_requests import RunRequestBuilder
-    from .run_service import RunService
-    from .session_resolver import SessionResolver
-    from .state import PluginState, resolve_data_path
-    from .state_models import PendingApproval, UserRef, is_valid_session_id
-    from .runtime import RunQuota
+    from .core.config import load_connector_settings
+    from .core.constants import PLUGIN_NAME, SESSION_PROVIDERS
+    from .core.redaction import redact_exception_text, redact_text
+    from .persistence.state import PluginState, resolve_data_path
+    from .persistence.state_models import PendingApproval, UserRef, is_valid_session_id
+    from .runs.run_requests import RunRequestBuilder
+    from .runs.run_service import RunService
+    from .runs.runtime import RunQuota
+    from .security.authz import AuthorizationPolicy
+    from .security.identity import build_user_ref, missing_identity_message
+    from .sessions.session_resolver import SessionResolver
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from approval_notifications import ApprovalNotificationPolicy
-    from approval_service import ApprovalService
-    from authz import AuthorizationPolicy
-    from cloudcli_client import CloudCLIClient, CloudCLIError
-    from command_parser import (
+    from approvals.approval_notifications import ApprovalNotificationPolicy
+    from approvals.approval_service import ApprovalService
+    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from commands.command_parser import (
         ParsedCommand,
         parse_command,
         parse_positive_int,
     )
-    from command_router import CommandHandler, CommandRoute, CommandRouter
-    from config import load_connector_settings
-    from constants import PLUGIN_NAME, SESSION_PROVIDERS
-    from formatting import (
+    from commands.command_router import CommandHandler, CommandRoute, CommandRouter
+    from commands.formatting import (
         HELP_TEXT,
         clip_text,
         format_bindings,
@@ -59,14 +56,17 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         format_health_report,
         format_session_overview,
     )
-    from identity import build_user_ref, missing_identity_message
-    from redaction import redact_exception_text, redact_text
-    from run_requests import RunRequestBuilder
-    from run_service import RunService
-    from session_resolver import SessionResolver
-    from state import PluginState, resolve_data_path
-    from state_models import PendingApproval, UserRef, is_valid_session_id
-    from runtime import RunQuota
+    from core.config import load_connector_settings
+    from core.constants import PLUGIN_NAME, SESSION_PROVIDERS
+    from core.redaction import redact_exception_text, redact_text
+    from persistence.state import PluginState, resolve_data_path
+    from persistence.state_models import PendingApproval, UserRef, is_valid_session_id
+    from runs.run_requests import RunRequestBuilder
+    from runs.run_service import RunService
+    from runs.runtime import RunQuota
+    from security.authz import AuthorizationPolicy
+    from security.identity import build_user_ref, missing_identity_message
+    from sessions.session_resolver import SessionResolver
 
 
 @register(
@@ -84,6 +84,7 @@ class CloudCLIConnectorPlugin(Star):
         self.approval_notifications = ApprovalNotificationPolicy(
             approval_allowed_user_keys=self.settings.approval_allowed_user_keys,
             approval_require_admin=self.settings.approval_require_admin,
+            approval_access_mode=self.settings.approval_access_mode,
         )
         self.state = PluginState(
             resolve_data_path(__file__, PLUGIN_NAME) / "state.json"

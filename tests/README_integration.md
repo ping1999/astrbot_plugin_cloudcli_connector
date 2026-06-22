@@ -8,25 +8,25 @@ Run from the plugin root:
 python -m unittest discover -s tests -v
 ```
 
-`test_real_cloudcli_command.py` can read credentials from environment variables, `tests/config.yaml`, or the legacy `..\integration_tests\config.yaml` path when it exists locally. Do not commit a real `config.yaml`.
+`test_real_cloudcli_command.py` reads test settings only from `tests/config.yaml`. It does not read `config.example.yaml`, environment-variable credential overrides, or the legacy `..\integration_tests\config.yaml` path. Do not commit a real `config.yaml`.
 
-Useful environment variables:
+Create `tests/config.yaml` from the example and edit the values there:
 
-```powershell
-$env:CLOUDCLI_TEST_REAL_ENABLED = "1"
-$env:CLOUDCLI_TEST_BASE_URL = "http://127.0.0.1:13002"
-$env:CLOUDCLI_TEST_USERNAME = "your username"
-$env:CLOUDCLI_TEST_PASSWORD = "your password"
+```yaml
+real_enabled: true
+base_url: "http://127.0.0.1:13002"
+username: "your username"
+password: "your password"
 # or:
-$env:CLOUDCLI_TEST_JWT_TOKEN = "your JWT"
+jwt_token: "your JWT"
 ```
 
 Real `/cloudcli run` and `/cloudcli stop` tests are skipped unless explicitly enabled:
 
-```powershell
-$env:CLOUDCLI_TEST_RUN_ENABLED = "1"
-$env:CLOUDCLI_TEST_RUN_PROJECT = "F:\work\repo"
+```yaml
+run_enabled: true
+run_project: "F:\\work\\repo"
 
-$env:CLOUDCLI_TEST_STOP_ENABLED = "1"
-$env:CLOUDCLI_TEST_STOP_SESSION_REF = "1"
+stop_enabled: true
+stop_session_ref: "1"
 ```

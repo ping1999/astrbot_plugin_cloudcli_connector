@@ -4,29 +4,29 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
-    from .authz import AuthorizationPolicy
-    from .config import ConnectorSettings
-    from .constants import RUN_PROVIDERS
-    from .run_validation import (
+    from ..core.config import ConnectorSettings
+    from ..core.constants import RUN_PROVIDERS
+    from ..persistence.state_models import UserRef, is_valid_session_id
+    from ..security.authz import AuthorizationPolicy
+    from ..security.run_validation import (
         has_control_chars,
         is_safe_git_branch_name,
         is_safe_model_name,
         looks_like_github_url,
     )
-    from .session_resolver import SessionResolver
-    from .state_models import UserRef, is_valid_session_id
+    from ..sessions.session_resolver import SessionResolver
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from authz import AuthorizationPolicy
-    from config import ConnectorSettings
-    from constants import RUN_PROVIDERS
-    from run_validation import (
+    from core.config import ConnectorSettings
+    from core.constants import RUN_PROVIDERS
+    from persistence.state_models import UserRef, is_valid_session_id
+    from security.authz import AuthorizationPolicy
+    from security.run_validation import (
         has_control_chars,
         is_safe_git_branch_name,
         is_safe_model_name,
         looks_like_github_url,
     )
-    from session_resolver import SessionResolver
-    from state_models import UserRef, is_valid_session_id
+    from sessions.session_resolver import SessionResolver
 
 
 FLAG_OPTIONS = frozenset({"create-branch", "pr", "no-cleanup", "cleanup"})

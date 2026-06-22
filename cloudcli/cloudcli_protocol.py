@@ -6,9 +6,9 @@ from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 try:
-    from .redaction import redact_text
+    from ..core.redaction import redact_text
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from redaction import redact_text
+    from core.redaction import redact_text
 
 
 MAX_ERROR_BODY_CHARS = 2000

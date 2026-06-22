@@ -8,24 +8,24 @@ from typing import Any
 
 try:
     from .approval_notifications import ApprovalNotificationPolicy
-    from .cloudcli_client import CloudCLIClient, CloudCLIError
-    from .command_parser import parse_optional_request_no, parse_positive_int
-    from .config import ConnectorSettings
-    from .constants import MAX_DENY_REASON_LEN
-    from .formatting import format_audit, format_pending, format_push_message
-    from .redaction import redact_exception_text
-    from .state import PluginState
-    from .state_models import PendingApproval, UserRef, pending_storage_key
+    from ..cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from ..commands.command_parser import parse_optional_request_no, parse_positive_int
+    from ..commands.formatting import format_audit, format_pending, format_push_message
+    from ..core.config import ConnectorSettings
+    from ..core.constants import MAX_DENY_REASON_LEN
+    from ..core.redaction import redact_exception_text
+    from ..persistence.state import PluginState
+    from ..persistence.state_models import PendingApproval, UserRef, pending_storage_key
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from approval_notifications import ApprovalNotificationPolicy
-    from cloudcli_client import CloudCLIClient, CloudCLIError
-    from command_parser import parse_optional_request_no, parse_positive_int
-    from config import ConnectorSettings
-    from constants import MAX_DENY_REASON_LEN
-    from formatting import format_audit, format_pending, format_push_message
-    from redaction import redact_exception_text
-    from state import PluginState
-    from state_models import PendingApproval, UserRef, pending_storage_key
+    from approvals.approval_notifications import ApprovalNotificationPolicy
+    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from commands.command_parser import parse_optional_request_no, parse_positive_int
+    from commands.formatting import format_audit, format_pending, format_push_message
+    from core.config import ConnectorSettings
+    from core.constants import MAX_DENY_REASON_LEN
+    from core.redaction import redact_exception_text
+    from persistence.state import PluginState
+    from persistence.state_models import PendingApproval, UserRef, pending_storage_key
 
 
 SendProactive = Callable[[str, str], Awaitable[None]]

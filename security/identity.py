@@ -5,9 +5,9 @@ import inspect
 from typing import Any
 
 try:
-    from .state_models import UserRef
+    from ..persistence.state_models import UserRef
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from state_models import UserRef
+    from persistence.state_models import UserRef
 
 
 async def build_user_ref(event: Any) -> UserRef:

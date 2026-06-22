@@ -6,23 +6,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from authz import AuthorizationPolicy
-from approval_notifications import ApprovalNotificationPolicy
-from approval_service import ApprovalService
-from cloudcli_client import CloudCLIClient, CloudCLIConfig
-from cloudcli_client import CloudCLIError
-from command_parser import ParsedCommand
-from command_router import CommandRoute, CommandRouter
-from cloudcli_protocol import build_ws_url, parse_sse_event
-from cloudcli_transport import WebSocketRequestMux
-from config import load_connector_settings
-from identity import build_user_ref
-from redaction import redact_exception_text
-from run_requests import RunRequestBuilder
-from formatting import format_pending, format_run_tasks, format_session_overview
-from run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
-from state import PluginState
-from state_models import PendingApproval, UserRef
+from approvals.approval_notifications import ApprovalNotificationPolicy
+from approvals.approval_service import ApprovalService
+from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIConfig, CloudCLIError
+from cloudcli.cloudcli_protocol import build_ws_url, parse_sse_event
+from cloudcli.cloudcli_transport import WebSocketRequestMux
+from commands.command_parser import ParsedCommand
+from commands.command_router import CommandRoute, CommandRouter
+from commands.formatting import format_pending, format_run_tasks, format_session_overview
+from core.config import load_connector_settings
+from core.redaction import redact_exception_text
+from persistence.state import PluginState
+from persistence.state_models import PendingApproval, UserRef
+from runs.run_requests import RunRequestBuilder
+from security.authz import AuthorizationPolicy
+from security.identity import build_user_ref
+from security.run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
 
 
 class ValidationTests(unittest.TestCase):
@@ -123,6 +122,9 @@ class IdentityTests(unittest.TestCase):
                 "session_require_admin": False,
                 "run_require_admin": False,
                 "approval_require_admin": False,
+                "session_access_mode": "authenticated",
+                "run_access_mode": "authenticated",
+                "approval_access_mode": "authenticated",
             }
         )
         authz = AuthorizationPolicy(settings)
@@ -132,6 +134,21 @@ class IdentityTests(unittest.TestCase):
             unified_msg_origin="origin",
             identity_verified=False,
         )
+        self.assertFalse(authz.can_access_sessions(user).allowed)
+        self.assertFalse(authz.can_run_agent(user).allowed)
+        self.assertFalse(authz.can_manage_approvals(user).allowed)
+
+    def test_legacy_require_admin_false_is_allowlist_only(self) -> None:
+        settings = load_connector_settings(
+            {
+                "session_require_admin": False,
+                "run_require_admin": False,
+                "approval_require_admin": False,
+            }
+        )
+        authz = AuthorizationPolicy(settings)
+        user = UserRef("test:u1", "User", "origin")
+
         self.assertFalse(authz.can_access_sessions(user).allowed)
         self.assertFalse(authz.can_run_agent(user).allowed)
         self.assertFalse(authz.can_manage_approvals(user).allowed)
@@ -151,6 +168,20 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(authz.can_use_direct_session_id(user).allowed)
         self.assertTrue(authz.can_manage_approvals(user).allowed)
         self.assertTrue(authz.can_bind_sessions(user).allowed)
+        self.assertFalse(authz.can_bind_direct_session_for_approval(user).allowed)
+
+    def test_approval_direct_bind_requires_explicit_flag(self) -> None:
+        settings = load_connector_settings(
+            {
+                "session_require_admin": True,
+                "approval_require_admin": True,
+                "approval_allowed_user_keys": "test:u1",
+                "approval_allow_direct_session_bind": True,
+            }
+        )
+        authz = AuthorizationPolicy(settings)
+        user = UserRef("test:u1", "User", "origin")
+
         self.assertTrue(authz.can_bind_direct_session_for_approval(user).allowed)
 
 
@@ -273,11 +304,11 @@ class RunRequestTests(unittest.TestCase):
     def test_run_rejects_mixed_targets(self) -> None:
         async def scenario() -> tuple[object | None, str | None]:
             settings = load_connector_settings(
-                {
-                    "run_require_admin": False,
-                    "session_require_admin": False,
-                    "allowed_project_roots": "C:/allowed",
-                }
+                    {
+                        "run_access_mode": "authenticated",
+                        "session_access_mode": "authenticated",
+                        "allowed_project_roots": "C:/allowed",
+                    }
             )
             builder = RunRequestBuilder(
                 settings=settings,
@@ -302,11 +333,11 @@ class RunRequestTests(unittest.TestCase):
                 allowed.mkdir()
                 outside.mkdir()
                 settings = load_connector_settings(
-                    {
-                        "run_require_admin": False,
-                        "session_require_admin": False,
-                        "allowed_project_roots": str(allowed),
-                    }
+                        {
+                            "run_access_mode": "authenticated",
+                            "session_access_mode": "authenticated",
+                            "allowed_project_roots": str(allowed),
+                        }
                 )
                 builder = RunRequestBuilder(
                     settings=settings,
@@ -327,11 +358,11 @@ class RunRequestTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp_dir:
                 allowed = Path(temp_dir)
                 settings = load_connector_settings(
-                    {
-                        "run_require_admin": False,
-                        "session_require_admin": False,
-                        "allowed_project_roots": str(allowed),
-                    }
+                        {
+                            "run_access_mode": "authenticated",
+                            "session_access_mode": "authenticated",
+                            "allowed_project_roots": str(allowed),
+                        }
                 )
                 builder = RunRequestBuilder(
                     settings=settings,
@@ -752,6 +783,22 @@ class StateTests(unittest.TestCase):
 
 
 class CloudCLIClientTests(unittest.TestCase):
+    def test_agent_headers_include_jwt_and_api_key(self) -> None:
+        async def scenario() -> dict[str, str]:
+            client = CloudCLIClient(
+                CloudCLIConfig(
+                    base_url="http://127.0.0.1:3001",
+                    jwt_token="jwt-token",
+                    api_key="api-secret",
+                ),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            return await client._agent_auth_headers()
+
+        headers = asyncio.run(scenario())
+        self.assertEqual("Bearer jwt-token", headers.get("Authorization"))
+        self.assertEqual("api-secret", headers.get("X-API-Key"))
+
     def test_unauthenticated_ws_does_not_require_token(self) -> None:
         class FakeWebSocket:
             closed = False
@@ -937,6 +984,15 @@ class CloudCLIClientTests(unittest.TestCase):
 
 
 class ApprovalServiceTests(unittest.TestCase):
+    def test_legacy_approval_require_admin_false_does_not_push_to_everyone(self) -> None:
+        policy = ApprovalNotificationPolicy(
+            approval_allowed_user_keys=frozenset(),
+            approval_require_admin=False,
+            approval_access_mode="allowlist_only",
+        )
+
+        self.assertFalse(policy.can_receive_details("test:u1"))
+
     def test_decision_is_blocked_when_pending_refresh_fails(self) -> None:
         class FailingClient:
             decision_sent = False
