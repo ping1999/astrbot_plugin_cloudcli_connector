@@ -139,6 +139,7 @@ class CloudCLIConnectorPlugin(Star):
                 await task
             except asyncio.CancelledError:
                 pass
+        await self.state.flush()
         await self.client.close()
 
     @filter.command("cloudcli")

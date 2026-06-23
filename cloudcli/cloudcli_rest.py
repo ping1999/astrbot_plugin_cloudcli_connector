@@ -7,6 +7,7 @@ from urllib.parse import quote
 try:
     from .cloudcli_auth import CloudCLIAuth
     from .cloudcli_errors import CloudCLIError
+    from .cloudcli_http import raise_for_redirect
     from .cloudcli_models import extract_recent_sessions
     from .cloudcli_protocol import (
         MAX_ERROR_BODY_CHARS,
@@ -17,6 +18,7 @@ try:
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_auth import CloudCLIAuth
     from cloudcli.cloudcli_errors import CloudCLIError
+    from cloudcli.cloudcli_http import raise_for_redirect
     from cloudcli.cloudcli_models import extract_recent_sessions
     from cloudcli.cloudcli_protocol import (
         MAX_ERROR_BODY_CHARS,
@@ -125,7 +127,9 @@ class CloudCLIRestClient:
             self.api_url(path),
             params=params,
             headers=headers,
+            allow_redirects=False,
         ) as response:
+            raise_for_redirect(response, "CloudCLI REST request")
             if response.status == 401:
                 return None, True
             if response.status >= 400:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,8 @@ OMITTED_SENSITIVE_TEXT = "[omitted by persist_sensitive_state=false]"
 OMITTED_SENSITIVE_INPUT = {
     "notice": "approval input is kept only in memory unless persist_sensitive_state is enabled"
 }
+DEFAULT_SAVE_BATCH_DELAY_SECONDS = 1.0
+logger = logging.getLogger(__name__)
 
 
 class PluginState:
@@ -71,6 +74,9 @@ class PluginState:
         self.persist_sensitive_state = persist_sensitive_state
         self._pending_input_cache: dict[str, Any] = {}
         self._lock = asyncio.Lock()
+        self._save_pending = False
+        self._scheduled_save_task: asyncio.Task | None = None
+        self._save_batch_delay_seconds = DEFAULT_SAVE_BATCH_DELAY_SECONDS
         self._data: dict[str, Any] = {
             "version": 3,
             "users": {},
@@ -112,6 +118,20 @@ class PluginState:
                     "next_run_id": 1,
                 }
                 await self._save_locked()
+
+    async def flush(self) -> None:
+        task = self._scheduled_save_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        async with self._lock:
+            self._scheduled_save_task = None
+            if self._save_pending:
+                self.store.write(self._data)
+                self._save_pending = False
 
     async def remember_user(self, user: UserRef) -> None:
         async with self._lock:
@@ -164,7 +184,11 @@ class PluginState:
         max_items: int = MAX_SESSION_INDEX_ITEMS,
     ) -> None:
         async with self._lock:
-            self._users_locked().remember_session_index(user, sessions, max_items)
+            self._users_locked().remember_session_index(
+                user,
+                self._session_index_for_storage(sessions),
+                max_items,
+            )
             await self._save_locked()
 
     async def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
@@ -385,7 +409,16 @@ class PluginState:
                 error=error,
                 finished=finished,
             ):
-                await self._save_locked()
+                await self._save_locked(
+                    defer=self._can_defer_run_update(
+                        status=status,
+                        event=event,
+                        session_id=session_id,
+                        summary=summary,
+                        error=error,
+                        finished=finished,
+                    )
+                )
 
     async def prune_run_history(self, max_history_per_user: int, max_history_global: int) -> None:
         async with self._lock:
@@ -494,6 +527,22 @@ class PluginState:
             stored["assistantText"] = OMITTED_SENSITIVE_TEXT
         return stored
 
+    def _session_index_for_storage(self, sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if self.persist_sensitive_state:
+            return sessions
+        stored_sessions: list[dict[str, Any]] = []
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            stored_sessions.append(
+                {
+                    "id": item.get("id") or item.get("sessionId") or item.get("session_id") or "",
+                    "provider": item.get("provider") or "",
+                    "lastActivity": item.get("lastActivity") or "",
+                }
+            )
+        return stored_sessions
+
     def _scrub_sensitive_state_locked(self) -> None:
         pending = _read_dict(self._data.get("pending"))
         for item in pending.values():
@@ -516,8 +565,58 @@ class PluginState:
     def _audit_locked(self) -> AuditRepository:
         return AuditRepository(self._data)
 
-    async def _save_locked(self) -> None:
+    def _can_defer_run_update(
+        self,
+        *,
+        status: str | None,
+        event: str | None,
+        session_id: str | None,
+        summary: dict[str, Any] | None,
+        error: str | None,
+        finished: bool,
+    ) -> bool:
+        return (
+            not finished
+            and status is None
+            and summary is None
+            and error is None
+            and (event is not None or session_id is not None)
+        )
+
+    async def _save_locked(self, *, defer: bool = False) -> None:
+        if defer:
+            self._schedule_save_locked()
+            return
+        if self._scheduled_save_task and not self._scheduled_save_task.done():
+            self._scheduled_save_task.cancel()
+        self._scheduled_save_task = None
         self.store.write(self._data)
+        self._save_pending = False
+
+    def _schedule_save_locked(self) -> None:
+        self._save_pending = True
+        task = self._scheduled_save_task
+        if task and not task.done():
+            return
+        self._scheduled_save_task = asyncio.create_task(self._delayed_save())
+
+    async def _delayed_save(self) -> None:
+        try:
+            delay = max(0.0, float(self._save_batch_delay_seconds))
+            if delay > 0:
+                await asyncio.sleep(delay)
+            async with self._lock:
+                if self._save_pending:
+                    self.store.write(self._data)
+                    self._save_pending = False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Delayed CloudCLI connector state save failed.")
+        finally:
+            current = asyncio.current_task()
+            if self._scheduled_save_task is current:
+                self._scheduled_save_task = None
 
 
 def resolve_data_path(plugin_file: str, plugin_name: str) -> Path:

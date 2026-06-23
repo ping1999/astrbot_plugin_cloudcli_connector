@@ -6,6 +6,7 @@ from typing import Any
 
 try:
     from .cloudcli_errors import CloudCLIError
+    from .cloudcli_http import raise_for_redirect
     from .cloudcli_protocol import (
         MAX_HTTP_RESPONSE_CHARS,
         build_auth_headers,
@@ -14,6 +15,7 @@ try:
     )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_errors import CloudCLIError
+    from cloudcli.cloudcli_http import raise_for_redirect
     from cloudcli.cloudcli_protocol import (
         MAX_HTTP_RESPONSE_CHARS,
         build_auth_headers,
@@ -63,11 +65,13 @@ class CloudCLIAuth:
                     "password": self.config.password,
                 },
                 headers=headers,
+                allow_redirects=False,
             ) as response:
                 raw_body = await read_response_text_limited(
                     response,
                     MAX_HTTP_RESPONSE_CHARS,
                 )
+                raise_for_redirect(response, "CloudCLI login")
                 try:
                     data = json.loads(raw_body) if raw_body else {}
                 except json.JSONDecodeError:

@@ -13,6 +13,7 @@ try:
     from .cloudcli_agent import CloudCLIAgentClient
     from .cloudcli_auth import CloudCLIAuth
     from .cloudcli_errors import CloudCLIError, CloudCLITimeout
+    from .cloudcli_http import create_http_session
     from .cloudcli_models import AbortSessionResult, active_sessions_contains
     from .cloudcli_protocol import (
         build_api_url,
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_agent import CloudCLIAgentClient
     from cloudcli.cloudcli_auth import CloudCLIAuth
     from cloudcli.cloudcli_errors import CloudCLIError, CloudCLITimeout
+    from cloudcli.cloudcli_http import create_http_session
     from cloudcli.cloudcli_models import AbortSessionResult, active_sessions_contains
     from cloudcli.cloudcli_protocol import (
         build_api_url,
@@ -391,7 +393,7 @@ class CloudCLIClient:
             self._session = None
         if self._session is None:
             timeout = aiohttp.ClientTimeout(total=max(3, self.config.timeout_seconds))
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            self._session = create_http_session(timeout)
 
     async def _ensure_auth_http_session(self) -> aiohttp.ClientSession:
         await self._ensure_http_session()

@@ -8,6 +8,7 @@ import aiohttp
 try:
     from .cloudcli_auth import CloudCLIAuth
     from .cloudcli_errors import CloudCLIError
+    from .cloudcli_http import create_http_session, raise_for_redirect
     from .cloudcli_protocol import (
         MAX_ERROR_BODY_CHARS,
         iter_sse,
@@ -18,6 +19,7 @@ try:
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_auth import CloudCLIAuth
     from cloudcli.cloudcli_errors import CloudCLIError
+    from cloudcli.cloudcli_http import create_http_session, raise_for_redirect
     from cloudcli.cloudcli_protocol import (
         MAX_ERROR_BODY_CHARS,
         iter_sse,
@@ -54,12 +56,14 @@ class CloudCLIAgentClient:
         try:
             for attempt in range(2):
                 headers = await self.auth.agent_headers()
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with create_http_session(timeout) as session:
                     async with session.post(
                         self.api_url("/api/agent"),
                         json=request_payload,
                         headers=headers,
+                        allow_redirects=False,
                     ) as response:
+                        raise_for_redirect(response, "CloudCLI agent API")
                         if (
                             response.status == 401
                             and attempt == 0

@@ -1113,6 +1113,59 @@ class StateTests(unittest.TestCase):
         self.assertIn("persist_sensitive_state=false", rendered_disk)
         self.assertNotIn("bare-pending-secret", json.dumps(reloaded_input, ensure_ascii=False))
 
+    def test_session_index_omits_sensitive_display_fields_by_default(self) -> None:
+        async def scenario() -> str:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.remember_user(user)
+                await state.remember_session_index(
+                    user,
+                    [
+                        {
+                            "id": "sess-1",
+                            "provider": "codex",
+                            "projectName": "secret-project",
+                            "projectPath": "C:/secret/repo",
+                            "summary": "secret summary text",
+                            "lastActivity": "2026-01-01T00:00:00Z",
+                        }
+                    ],
+                )
+                return path.read_text(encoding="utf-8")
+
+        rendered = asyncio.run(scenario())
+        self.assertIn("sess-1", rendered)
+        self.assertIn("codex", rendered)
+        self.assertNotIn("secret-project", rendered)
+        self.assertNotIn("C:/secret/repo", rendered)
+        self.assertNotIn("secret summary text", rendered)
+
+    def test_run_event_updates_are_batched_until_flush(self) -> None:
+        async def scenario() -> tuple[str, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                state = PluginState(path)
+                state._save_batch_delay_seconds = 60
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                run_id = await state.create_run_task(
+                    user,
+                    {"provider": "codex", "projectPath": "C:/repo", "message": "doit"},
+                    "C:/repo",
+                )
+                await state.update_run_task(run_id, event="assistant: streamed chunk")
+                before_flush = path.read_text(encoding="utf-8")
+                await state.flush()
+                after_flush = path.read_text(encoding="utf-8")
+                return before_flush, after_flush
+
+        before_flush, after_flush = asyncio.run(scenario())
+        self.assertNotIn("streamed chunk", before_flush)
+        self.assertIn("streamed chunk", after_flush)
+
     def test_pending_request_ids_are_scoped_by_session(self) -> None:
         async def scenario() -> list[PendingApproval]:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -1222,13 +1275,13 @@ class CloudCLIClientTests(unittest.TestCase):
                 self.get_headers: list[dict[str, str]] = []
                 self.login_payloads: list[dict[str, str]] = []
 
-            def get(self, _url: str, *, params=None, headers=None):
+            def get(self, _url: str, *, params=None, headers=None, allow_redirects=None):
                 self.get_headers.append(dict(headers or {}))
                 if len(self.get_headers) == 1:
                     return FakeResponse(401)
                 return FakeResponse(200, '{"projects": []}')
 
-            def post(self, _url: str, *, json=None, headers=None):
+            def post(self, _url: str, *, json=None, headers=None, allow_redirects=None):
                 self.login_payloads.append(dict(json or {}))
                 return FakeResponse(200, '{"token": "fresh-token"}')
 
@@ -1262,6 +1315,175 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual("Bearer expired-token", get_headers[0].get("Authorization"))
         self.assertEqual("Bearer fresh-token", get_headers[1].get("Authorization"))
         self.assertEqual([{"username": "user", "password": "password"}], login_payloads)
+
+    def test_rest_refuses_redirects_to_avoid_api_key_leak(self) -> None:
+        class FakeContent:
+            async def iter_chunked(self, _size: int):
+                yield b""
+
+        class FakeResponse:
+            status = 302
+            charset = "utf-8"
+            headers = {"Location": "https://evil.example/steal?api_key=secret-value"}
+            content = FakeContent()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.allow_redirects: list[object] = []
+
+            def get(self, _url: str, *, params=None, headers=None, allow_redirects=None):
+                self.allow_redirects.append(allow_redirects)
+                return FakeResponse()
+
+        async def scenario() -> tuple[list[object], str]:
+            session = FakeSession()
+            config = CloudCLIConfig(
+                base_url="http://127.0.0.1:3001",
+                jwt_token="jwt-token",
+                api_key="api-secret",
+            )
+
+            async def ensure_session() -> FakeSession:
+                return session
+
+            rest = CloudCLIRestClient(
+                config=config,
+                auth=CloudCLIAuth(
+                    config=config,
+                    ensure_session=ensure_session,
+                    api_url=lambda path: f"http://127.0.0.1:3001{path}",
+                ),
+                ensure_session=ensure_session,
+                api_url=lambda path: f"http://127.0.0.1:3001{path}",
+            )
+            try:
+                await rest.get_recent_sessions(1)
+            except CloudCLIError as exc:
+                return session.allow_redirects, str(exc)
+            return session.allow_redirects, ""
+
+        allow_redirects, error = asyncio.run(scenario())
+        self.assertEqual([False], allow_redirects)
+        self.assertIn("redirect refused", error)
+        self.assertNotIn("secret-value", error)
+
+    def test_login_refuses_redirects_to_avoid_api_key_leak(self) -> None:
+        class FakeContent:
+            async def iter_chunked(self, _size: int):
+                yield b""
+
+        class FakeResponse:
+            status = 302
+            charset = "utf-8"
+            headers = {"Location": "https://evil.example/login?api_key=secret-value"}
+            content = FakeContent()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.allow_redirects: list[object] = []
+
+            def post(self, _url: str, *, json=None, headers=None, allow_redirects=None):
+                self.allow_redirects.append(allow_redirects)
+                return FakeResponse()
+
+        async def scenario() -> tuple[list[object], str]:
+            session = FakeSession()
+            config = CloudCLIConfig(
+                base_url="http://127.0.0.1:3001",
+                username="user",
+                password="password",
+                api_key="api-secret",
+            )
+            auth = CloudCLIAuth(
+                config=config,
+                ensure_session=lambda: asyncio.sleep(0, result=session),
+                api_url=lambda path: f"http://127.0.0.1:3001{path}",
+            )
+            try:
+                await auth.get_token()
+            except CloudCLIError as exc:
+                return session.allow_redirects, str(exc)
+            return session.allow_redirects, ""
+
+        allow_redirects, error = asyncio.run(scenario())
+        self.assertEqual([False], allow_redirects)
+        self.assertIn("redirect refused", error)
+        self.assertNotIn("secret-value", error)
+
+    def test_agent_refuses_redirects_to_avoid_api_key_leak(self) -> None:
+        class FakeContent:
+            async def iter_chunked(self, _size: int):
+                yield b""
+
+        class FakeResponse:
+            status = 302
+            headers = {"Content-Type": "text/plain", "Location": "https://evil.example/agent?api_key=secret-value"}
+            content = FakeContent()
+            charset = "utf-8"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeSession:
+            allow_redirects: list[object] = []
+
+            def __init__(self, *args, **kwargs) -> None:
+                self.kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, _url: str, *, json=None, headers=None, allow_redirects=None):
+                self.allow_redirects.append(allow_redirects)
+                return FakeResponse()
+
+        class FakeAuth:
+            async def agent_headers(self) -> dict[str, str]:
+                return {"X-API-Key": "api-secret"}
+
+        async def scenario() -> tuple[list[object], str]:
+            old_factory = cloudcli_agent_module.create_http_session
+            try:
+                FakeSession.allow_redirects = []
+                cloudcli_agent_module.create_http_session = lambda _timeout: FakeSession()  # type: ignore[assignment]
+                client = CloudCLIAgentClient(
+                    config=CloudCLIConfig(
+                        base_url="http://127.0.0.1:3001",
+                        api_key="api-secret",
+                    ),
+                    auth=FakeAuth(),  # type: ignore[arg-type]
+                    api_url=lambda path: f"http://127.0.0.1:3001{path}",
+                )
+                try:
+                    _events = [event async for event in client.stream_agent({"message": "hi"})]
+                except CloudCLIError as exc:
+                    return FakeSession.allow_redirects, str(exc)
+                return FakeSession.allow_redirects, ""
+            finally:
+                cloudcli_agent_module.create_http_session = old_factory  # type: ignore[assignment]
+
+        allow_redirects, error = asyncio.run(scenario())
+        self.assertEqual([False], allow_redirects)
+        self.assertIn("redirect refused", error)
+        self.assertNotIn("secret-value", error)
 
     def test_agent_stream_refreshes_expired_cached_login_token(self) -> None:
         class FakeContent:
@@ -1300,7 +1522,7 @@ class CloudCLIClientTests(unittest.TestCase):
             async def __aexit__(self, *_args):
                 return False
 
-            def post(self, _url: str, *, json=None, headers=None):
+            def post(self, _url: str, *, json=None, headers=None, allow_redirects=None):
                 self.sent_headers.append(dict(headers or {}))
                 return self.responses.pop(0)
 
@@ -1317,10 +1539,10 @@ class CloudCLIClientTests(unittest.TestCase):
                 self.cleared += 1
 
         async def scenario() -> tuple[int, list[dict[str, str]], list[dict[str, object]]]:
-            old_session = cloudcli_agent_module.aiohttp.ClientSession
+            old_factory = cloudcli_agent_module.create_http_session
             auth = FakeAuth()
             try:
-                cloudcli_agent_module.aiohttp.ClientSession = FakeSession  # type: ignore[assignment]
+                cloudcli_agent_module.create_http_session = lambda _timeout: FakeSession()  # type: ignore[assignment]
                 client = CloudCLIAgentClient(
                     config=CloudCLIConfig(
                         base_url="http://127.0.0.1:3001",
@@ -1333,7 +1555,7 @@ class CloudCLIClientTests(unittest.TestCase):
                 events = [event async for event in client.stream_agent({"message": "hi"})]
                 return auth.cleared, FakeSession.sent_headers, events
             finally:
-                cloudcli_agent_module.aiohttp.ClientSession = old_session  # type: ignore[assignment]
+                cloudcli_agent_module.create_http_session = old_factory  # type: ignore[assignment]
 
         cleared, sent_headers, events = asyncio.run(scenario())
         self.assertEqual(1, cleared)

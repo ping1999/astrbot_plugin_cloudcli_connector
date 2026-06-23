@@ -36,6 +36,17 @@ def build_auth_headers(token: str, api_key: str) -> dict[str, str]:
     return headers
 
 
+def is_redirect_status(status: int) -> bool:
+    return 300 <= int(status) < 400
+
+
+def describe_redirect_response(response: Any) -> str:
+    headers = getattr(response, "headers", {}) or {}
+    location = headers.get("Location", "") if hasattr(headers, "get") else ""
+    suffix = f" Location={redact_error_text(str(location))}" if location else ""
+    return f"HTTP {getattr(response, 'status', '3xx')} redirect refused{suffix}"
+
+
 async def read_response_text_limited(
     response: Any,
     max_chars: int = MAX_HTTP_RESPONSE_CHARS,
