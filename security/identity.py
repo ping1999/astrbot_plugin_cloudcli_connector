@@ -11,10 +11,13 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 async def build_user_ref(event: Any) -> UserRef:
-    platform_id = await _call_or_attr(event, "get_platform_id") or "unknown-platform"
-    sender_id = await _call_or_attr(event, "get_sender_id")
-    session_id = await _call_or_attr(event, "get_session_id")
-    unified_msg_origin = str(getattr(event, "unified_msg_origin", "") or "")
+    platform_id = _safe_identity_part(
+        await _call_or_attr(event, "get_platform_id"),
+        80,
+    ) or "unknown-platform"
+    sender_id = _safe_identity_part(await _call_or_attr(event, "get_sender_id"), 160)
+    session_id = _safe_identity_part(await _call_or_attr(event, "get_session_id"), 160)
+    unified_msg_origin = safe_inline_text(getattr(event, "unified_msg_origin", ""), 500)
     if not unified_msg_origin:
         unified_msg_origin = _fallback_origin(platform_id, session_id, sender_id)
     identity_verified = bool(sender_id)
@@ -77,3 +80,7 @@ def _stable_digest(value: str) -> str:
 def _fallback_origin(platform_id: str, session_id: str, sender_id: str) -> str:
     scope = session_id or sender_id or "unknown-session"
     return f"{platform_id}:fallback:{_stable_digest(scope)}"
+
+
+def _safe_identity_part(value: Any, limit: int) -> str:
+    return safe_inline_text(value, limit)

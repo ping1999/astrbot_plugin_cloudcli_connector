@@ -129,7 +129,7 @@
     "description": "Allow unrestricted /cloudcli run --project paths",
     "type": "bool",
     "default": false,
-    "hint": "Only enable in fully trusted chats. Admin users are allowed even when this is false."
+    "hint": "Only applies to non-admin users when allowed_project_roots is empty. Only enable in fully trusted chats. Admin users are allowed even when this is false."
   },
   "max_active_runs_per_user": {
     "description": "Max concurrent /cloudcli run tasks per user",
@@ -152,6 +152,12 @@
     "type": "int",
     "default": 500,
     "hint": "Set 0 to keep all run history globally."
+  },
+  "persist_sensitive_state": {
+    "description": "Persist sensitive run and approval details",
+    "type": "bool",
+    "default": false,
+    "hint": "When false, approval input bodies, audit input summaries, and raw run messages are kept only in memory or replaced with placeholders in state.json."
   },
   "run_status_interval_seconds": {
     "description": "Minimum seconds between background run status pushes",

@@ -1021,6 +1021,47 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("audit-secret", rendered)
         self.assertNotIn("audit-input-secret", rendered)
 
+    def test_sensitive_state_details_are_not_persisted_by_default(self) -> None:
+        async def scenario() -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.bind_session(user, "sess-1", 10)
+                approval = PendingApproval(
+                    "request-1",
+                    "sess-1",
+                    "Tool",
+                    {"plain": "bare-pending-secret"},
+                )
+                await state.upsert_pending(approval)
+                await state.append_audit(user=user, action="allow", approval=approval)
+                await state.create_run_task(
+                    user,
+                    {
+                        "provider": "codex",
+                        "projectPath": "C:/repo",
+                        "message": "bare-run-secret",
+                    },
+                    "C:/repo",
+                )
+                visible = await state.visible_pending_for_user(user, 10)
+
+                disk = json.loads(path.read_text(encoding="utf-8"))
+                reloaded = PluginState(path)
+                await reloaded.load()
+                reloaded_visible = await reloaded.visible_pending_for_user(user, 10)
+                return visible[0].input_data, disk, reloaded_visible[0].input_data
+
+        memory_input, disk_state, reloaded_input = asyncio.run(scenario())
+        self.assertIn("bare-pending-secret", json.dumps(memory_input, ensure_ascii=False))
+        rendered_disk = json.dumps(disk_state, ensure_ascii=False)
+        self.assertNotIn("bare-pending-secret", rendered_disk)
+        self.assertNotIn("bare-run-secret", rendered_disk)
+        self.assertIn("persist_sensitive_state=false", rendered_disk)
+        self.assertNotIn("bare-pending-secret", json.dumps(reloaded_input, ensure_ascii=False))
+
     def test_pending_request_ids_are_scoped_by_session(self) -> None:
         async def scenario() -> list[PendingApproval]:
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -1410,17 +1451,17 @@ class ApprovalServiceTests(unittest.TestCase):
         self.assertIn("同步 CloudCLI 待审批权限失败", result)
         self.assertFalse(decision_sent)
 
-    def test_allow_keeps_pending_when_confirmation_fails(self) -> None:
+    def test_allow_marks_pending_unconfirmed_when_confirmation_fails(self) -> None:
         class UnconfirmedClient:
-            decision_sent = False
+            decision_count = 0
 
             async def get_pending_permissions(self, session_id: str):
                 return [PendingApproval("request-1", session_id, "Tool", {"value": 1})]
 
             async def send_permission_decision(self, *args, **kwargs) -> None:
-                self.decision_sent = True
+                self.decision_count += 1
 
-        async def scenario() -> tuple[str, bool, bool]:
+        async def scenario() -> tuple[str, bool, bool, str, str, int]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 settings = load_connector_settings({})
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -1446,12 +1487,23 @@ class ApprovalServiceTests(unittest.TestCase):
                 result = await service.handle_allow(user, [])
                 pending = await state.get_pending("sess-1", "request-1")
                 claimed, error = await state.claim_visible_request(user, None, 10, "deny")
-                return result, pending is not None, claimed is not None and not error
+                deny_result = await service.handle_deny(user, ["changed-mind"])
+                return (
+                    result,
+                    pending is not None,
+                    claimed is not None and not error,
+                    error or "",
+                    deny_result,
+                    client.decision_count,
+                )
 
-        result, still_pending, claimable = asyncio.run(scenario())
-        self.assertIn("not confirmed", result)
+        result, still_pending, claimable, claim_error, deny_result, decision_count = asyncio.run(scenario())
+        self.assertIn("尚未确认", result)
         self.assertTrue(still_pending)
-        self.assertTrue(claimable)
+        self.assertFalse(claimable)
+        self.assertIn("尚未确认", claim_error)
+        self.assertIn("尚未确认", deny_result)
+        self.assertEqual(1, decision_count)
 
     def test_cancelled_allow_releases_pending_claim(self) -> None:
         class CancellingClient:

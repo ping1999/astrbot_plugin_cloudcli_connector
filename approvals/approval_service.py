@@ -33,6 +33,10 @@ TrackTask = Callable[[asyncio.Task], None]
 logger = logging.getLogger(__name__)
 
 
+class _DecisionSentUnconfirmed(Exception):
+    pass
+
+
 class ApprovalService:
     timeout_deny_max_attempts = 3
     timeout_deny_retry_initial_seconds = 5.0
@@ -66,7 +70,10 @@ class ApprovalService:
         bindings = await self.state.list_bindings(user)
         if not bindings:
             return "当前用户没有绑定 session，请先使用 /cloudcli bind <sessionId>。"
-        sync_error = await self.refresh_pending_for_bindings(bindings)
+        sync_error = await self.refresh_pending_for_bindings(
+            bindings,
+            clear_unconfirmed=True,
+        )
         approvals = await self.state.visible_pending_for_user(
             user,
             self.settings.max_pending_display,
@@ -100,6 +107,24 @@ class ApprovalService:
                 result="sent",
             )
             return f"已允许：{approval.tool_name} ({approval.session_id})"
+        except _DecisionSentUnconfirmed as exc:
+            await self.state.mark_pending_decision_unconfirmed(
+                approval.session_id,
+                approval.request_id,
+                actor=user.user_key,
+                action="allow",
+                error=str(exc),
+            )
+            await self.state.append_audit(
+                user=user,
+                action="allow",
+                approval=approval,
+                result=f"sent-unconfirmed: {exc}",
+            )
+            return (
+                f"已发送允许决定，但尚未确认 CloudCLI 是否已处理：{approval.tool_name} "
+                f"({approval.session_id})\n请执行 /cloudcli pending 刷新远端状态后再重试。"
+            )
         except asyncio.CancelledError:
             await self.state.release_pending_claim(approval.session_id, approval.request_id, user.user_key)
             raise
@@ -152,6 +177,25 @@ class ApprovalService:
                 result="sent",
             )
             return f"已拒绝：{approval.tool_name} ({approval.session_id})\n原因：{reason}"
+        except _DecisionSentUnconfirmed as exc:
+            await self.state.mark_pending_decision_unconfirmed(
+                approval.session_id,
+                approval.request_id,
+                actor=user.user_key,
+                action="deny",
+                error=str(exc),
+            )
+            await self.state.append_audit(
+                user=user,
+                action="deny",
+                approval=approval,
+                reason=reason,
+                result=f"sent-unconfirmed: {exc}",
+            )
+            return (
+                f"已发送拒绝决定，但尚未确认 CloudCLI 是否已处理：{approval.tool_name} "
+                f"({approval.session_id})\n请执行 /cloudcli pending 刷新远端状态后再重试。"
+            )
         except asyncio.CancelledError:
             await self.state.release_pending_claim(approval.session_id, approval.request_id, user.user_key)
             raise
@@ -232,7 +276,12 @@ class ApprovalService:
         if task and not task.done():
             task.cancel()
 
-    async def refresh_pending_for_bindings(self, bindings: list[str]) -> str:
+    async def refresh_pending_for_bindings(
+        self,
+        bindings: list[str],
+        *,
+        clear_unconfirmed: bool = False,
+    ) -> str:
         async def fetch_one(session_id: str) -> tuple[str, list[PendingApproval], str]:
             try:
                 return session_id, await self.client.get_pending_permissions(session_id), ""
@@ -245,7 +294,11 @@ class ApprovalService:
             if error:
                 errors.append(f"{session_id}: {error}")
                 continue
-            removed = await self.state.replace_pending_for_session(session_id, approvals)
+            removed = await self.state.replace_pending_for_session(
+                session_id,
+                approvals,
+                preserve_unconfirmed=not clear_unconfirmed,
+            )
             for approval_key in removed:
                 self.cancel_timeout(approval_key)
             for approval in approvals:
@@ -371,6 +424,29 @@ class ApprovalService:
                 f"tool: {approval.tool_name}\n"
                 f"reason: {reason}"
             )
+        except _DecisionSentUnconfirmed as exc:
+            await self.state.mark_pending_decision_unconfirmed(
+                approval.session_id,
+                approval.request_id,
+                actor=actor,
+                action="timeout-deny",
+                error=str(exc),
+            )
+            await self.state.append_audit(
+                user=None,
+                action="timeout-deny",
+                approval=approval,
+                reason=reason,
+                result=f"sent-unconfirmed: {exc}",
+            )
+            text = (
+                "CloudCLI 权限请求已发送自动拒绝，但尚未确认远端是否已处理：\n"
+                f"session: {approval.session_id}\n"
+                f"tool: {approval.tool_name}\n"
+                f"reason: {reason}"
+            )
+            await self._send_to_targets(targets, text)
+            return True
         except CloudCLIError as exc:
             await self.state.release_pending_claim(approval.session_id, approval.request_id, actor)
             await self.state.append_audit(
@@ -399,7 +475,10 @@ class ApprovalService:
             message=message,
             session_id=approval.session_id,
         )
-        await self._confirm_permission_decision(approval)
+        try:
+            await self._confirm_permission_decision(approval)
+        except CloudCLIError as exc:
+            raise _DecisionSentUnconfirmed(str(exc)) from exc
 
     async def _confirm_permission_decision(self, approval: PendingApproval) -> None:
         attempts = max(1, int(self.decision_confirm_attempts))

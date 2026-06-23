@@ -14,6 +14,7 @@ try:
         PendingApproval,
         UserRef,
         is_valid_session_id,
+        pending_storage_key,
     )
     from .pending_repository import PendingApprovalRepository, normalize_pending_records
     from .state_storage import JsonStateStore
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         PendingApproval,
         UserRef,
         is_valid_session_id,
+        pending_storage_key,
     )
     from persistence.state_storage import JsonStateStore
 
@@ -35,12 +37,18 @@ MAX_AUDIT_ITEMS = 500
 DEFAULT_MAX_RUN_HISTORY_PER_USER = 50
 DEFAULT_MAX_RUN_HISTORY_GLOBAL = 500
 MAX_STORED_TEXT = 1200
+OMITTED_SENSITIVE_TEXT = "[omitted by persist_sensitive_state=false]"
+OMITTED_SENSITIVE_INPUT = {
+    "notice": "approval input is kept only in memory unless persist_sensitive_state is enabled"
+}
 
 
 class PluginState:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, persist_sensitive_state: bool = False) -> None:
         self.path = path
         self.store = JsonStateStore(path)
+        self.persist_sensitive_state = persist_sensitive_state
+        self._pending_input_cache: dict[str, Any] = {}
         self._lock = asyncio.Lock()
         self._data: dict[str, Any] = {
             "version": 3,
@@ -69,6 +77,9 @@ class PluginState:
                         loaded.get("next_run_id"),
                         self._guess_next_run_id(self._data["runs"]),
                     )
+                    if not self.persist_sensitive_state:
+                        self._scrub_sensitive_state_locked()
+                        await self._save_locked()
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 self.store.backup_bad_file()
                 self._data = {
@@ -309,34 +320,52 @@ class PluginState:
 
     async def upsert_pending(self, approval: PendingApproval) -> None:
         async with self._lock:
-            if self._pending_repo_locked().upsert(approval):
+            self._remember_pending_input_locked(approval)
+            if self._pending_repo_locked().upsert(self._approval_for_storage(approval)):
                 await self._save_locked()
 
     async def remove_pending(self, session_id: str, request_id: str) -> None:
         async with self._lock:
+            self._pending_input_cache.pop(pending_storage_key(session_id, request_id), None)
             self._pending_repo_locked().remove(session_id, request_id)
             await self._save_locked()
 
     async def get_pending(self, session_id: str, request_id: str) -> PendingApproval | None:
         async with self._lock:
-            return self._pending_repo_locked().get(session_id, request_id)
+            return self._with_cached_pending_input(
+                self._pending_repo_locked().get(session_id, request_id)
+            )
 
     async def list_pending(self) -> list[PendingApproval]:
         async with self._lock:
-            return self._pending_repo_locked().list()
+            return self._with_cached_pending_inputs(self._pending_repo_locked().list())
 
     async def merge_pending(self, approvals: list[PendingApproval]) -> None:
         async with self._lock:
-            self._pending_repo_locked().merge(approvals)
+            for approval in approvals:
+                self._remember_pending_input_locked(approval)
+            self._pending_repo_locked().merge(
+                [self._approval_for_storage(approval) for approval in approvals]
+            )
             await self._save_locked()
 
     async def replace_pending_for_session(
         self,
         session_id: str,
         approvals: list[PendingApproval],
+        *,
+        preserve_unconfirmed: bool = True,
     ) -> list[str]:
         async with self._lock:
-            removed = self._pending_repo_locked().replace_for_session(session_id, approvals)
+            for approval in approvals:
+                self._remember_pending_input_locked(approval)
+            removed = self._pending_repo_locked().replace_for_session(
+                session_id,
+                [self._approval_for_storage(approval) for approval in approvals],
+                preserve_unconfirmed=preserve_unconfirmed,
+            )
+            for key in removed:
+                self._pending_input_cache.pop(key, None)
             await self._save_locked()
             return removed
 
@@ -348,7 +377,9 @@ class PluginState:
         async with self._lock:
             entry = self._user_entry(user.user_key)
             bindings = _bindings_for_origin(entry, _origin_key(user))
-            return self._pending_repo_locked().visible_for_bindings(bindings, max_items)
+            return self._with_cached_pending_inputs(
+                self._pending_repo_locked().visible_for_bindings(bindings, max_items)
+            )
 
     async def resolve_visible_request(
         self,
@@ -396,7 +427,8 @@ class PluginState:
                 action=action,
             )
             await self._save_locked()
-            return result
+            claimed, error = result
+            return self._with_cached_pending_input(claimed), error
 
     async def claim_pending(
         self,
@@ -414,11 +446,31 @@ class PluginState:
                 action=action,
             )
             await self._save_locked()
-            return result
+            claimed, error = result
+            return self._with_cached_pending_input(claimed), error
 
     async def release_pending_claim(self, session_id: str, request_id: str, actor: str) -> None:
         async with self._lock:
             if self._pending_repo_locked().release_claim(session_id, request_id, actor):
+                await self._save_locked()
+
+    async def mark_pending_decision_unconfirmed(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        actor: str,
+        action: str,
+        error: str,
+    ) -> None:
+        async with self._lock:
+            if self._pending_repo_locked().mark_decision_unconfirmed(
+                session_id,
+                request_id,
+                actor=actor,
+                action=action,
+                error=error,
+            ):
                 await self._save_locked()
 
     async def create_run_task(
@@ -445,7 +497,7 @@ class PluginState:
                 "project_path": safe_text(payload.get("projectPath"), 500),
                 "github_url": safe_text(payload.get("githubUrl"), 500),
                 "target": safe_text(display_target, 500),
-                "message": safe_text(payload.get("message"), MAX_STORED_TEXT),
+                "message": self._sensitive_text_for_storage(payload.get("message")),
                 "started_at": now,
                 "updated_at": now,
                 "finished_at": 0,
@@ -481,7 +533,7 @@ class PluginState:
             if session_id and is_valid_session_id(session_id):
                 item["session_id"] = session_id
             if summary is not None:
-                item["summary"] = safe_json_value(summary)
+                item["summary"] = safe_json_value(self._summary_for_storage(summary))
             if error:
                 item["error"] = safe_text(error, MAX_STORED_TEXT)
             if event:
@@ -577,7 +629,7 @@ class PluginState:
                     "tool_name": approval.tool_name,
                     "provider": approval.provider,
                     "reason": safe_text(reason, 500),
-                    "input_summary": safe_text(compact_json(approval.input_data), 500),
+                    "input_summary": self._approval_input_summary_for_storage(approval),
                 }
             )
             self._data["audit"] = audit[-MAX_AUDIT_ITEMS:]
@@ -604,6 +656,92 @@ class PluginState:
             ]
             items.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
             return items[: max(1, min(limit, 50))]
+
+    def _approval_for_storage(self, approval: PendingApproval) -> PendingApproval:
+        if self.persist_sensitive_state:
+            return approval
+        return PendingApproval(
+            request_id=approval.request_id,
+            session_id=approval.session_id,
+            tool_name=approval.tool_name,
+            input_data=dict(OMITTED_SENSITIVE_INPUT),
+            provider=approval.provider,
+            received_at=approval.received_at,
+        )
+
+    def _remember_pending_input_locked(self, approval: PendingApproval) -> None:
+        key = pending_storage_key(approval.session_id, approval.request_id)
+        if not key:
+            return
+        if self.persist_sensitive_state:
+            self._pending_input_cache.pop(key, None)
+            return
+        self._pending_input_cache[key] = safe_json_value(approval.input_data)
+
+    def _with_cached_pending_input(self, approval: PendingApproval | None) -> PendingApproval | None:
+        if approval is None or self.persist_sensitive_state:
+            return approval
+        key = pending_storage_key(approval.session_id, approval.request_id)
+        if not key or key not in self._pending_input_cache:
+            return approval
+        return PendingApproval(
+            request_id=approval.request_id,
+            session_id=approval.session_id,
+            tool_name=approval.tool_name,
+            input_data=self._pending_input_cache[key],
+            provider=approval.provider,
+            received_at=approval.received_at,
+        )
+
+    def _with_cached_pending_inputs(self, approvals: list[PendingApproval]) -> list[PendingApproval]:
+        return [
+            updated
+            for approval in approvals
+            if (updated := self._with_cached_pending_input(approval)) is not None
+        ]
+
+    def _sensitive_text_for_storage(self, value: Any) -> str:
+        if self.persist_sensitive_state:
+            return safe_text(value, MAX_STORED_TEXT)
+        text = value if isinstance(value, str) else str(value or "")
+        return f"{OMITTED_SENSITIVE_TEXT}; chars={len(text)}"
+
+    def _approval_input_summary_for_storage(self, approval: PendingApproval) -> str:
+        if self.persist_sensitive_state:
+            return safe_text(compact_json(approval.input_data), 500)
+        return OMITTED_SENSITIVE_TEXT
+
+    def _summary_for_storage(self, summary: dict[str, Any]) -> dict[str, Any]:
+        if self.persist_sensitive_state:
+            return summary
+        stored = dict(summary)
+        if stored.get("assistantText"):
+            stored["assistantText"] = OMITTED_SENSITIVE_TEXT
+        return stored
+
+    def _scrub_sensitive_state_locked(self) -> None:
+        pending = _read_dict(self._data.get("pending"))
+        for item in pending.values():
+            if isinstance(item, dict):
+                item["input_data"] = dict(OMITTED_SENSITIVE_INPUT)
+        self._data["pending"] = pending
+
+        runs = _read_dict(self._data.get("runs"))
+        for item in runs.values():
+            if not isinstance(item, dict):
+                continue
+            item["message"] = OMITTED_SENSITIVE_TEXT
+            summary = item.get("summary")
+            if isinstance(summary, dict) and summary.get("assistantText"):
+                summary["assistantText"] = OMITTED_SENSITIVE_TEXT
+                item["summary"] = summary
+        self._data["runs"] = runs
+
+        audit = _read_dict_list(self._data.get("audit"))
+        for item in audit:
+            if item.get("input_summary"):
+                item["input_summary"] = OMITTED_SENSITIVE_TEXT
+        self._data["audit"] = audit[-MAX_AUDIT_ITEMS:]
 
     def _pending_repo_locked(self) -> PendingApprovalRepository:
         return PendingApprovalRepository(self._data)

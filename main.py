@@ -70,7 +70,8 @@ class CloudCLIConnectorPlugin(Star):
             approval_access_mode=self.settings.approval_access_mode,
         )
         self.state = PluginState(
-            resolve_data_path(__file__, PLUGIN_NAME) / "state.json"
+            resolve_data_path(__file__, PLUGIN_NAME) / "state.json",
+            persist_sensitive_state=self.settings.persist_sensitive_state,
         )
         self.client = CloudCLIClient(
             self.settings.cloudcli,

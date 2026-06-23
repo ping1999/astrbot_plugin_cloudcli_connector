@@ -44,6 +44,7 @@ class ConnectorSettings:
     max_active_runs_global: int
     max_run_history_per_user: int
     max_run_history_global: int
+    persist_sensitive_state: bool
 
 
 def load_connector_settings(config: Any) -> ConnectorSettings:
@@ -118,6 +119,7 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
         max_active_runs_global=_read_nonnegative_limited_int(get("max_active_runs_global"), 3, 200),
         max_run_history_per_user=_read_nonnegative_limited_int(get("max_run_history_per_user"), 50, 1000),
         max_run_history_global=_read_nonnegative_limited_int(get("max_run_history_global"), 500, 10000),
+        persist_sensitive_state=_read_bool(get("persist_sensitive_state"), False),
     )
 
 

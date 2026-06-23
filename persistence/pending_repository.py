@@ -24,6 +24,12 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 PENDING_CLAIM_FIELDS = ("claimed_by", "claimed_action", "claimed_at")
+PENDING_UNCONFIRMED_FIELDS = (
+    "decision_unconfirmed_by",
+    "decision_unconfirmed_action",
+    "decision_unconfirmed_at",
+    "decision_unconfirmed_error",
+)
 
 
 class PendingApprovalRepository:
@@ -74,6 +80,8 @@ class PendingApprovalRepository:
         self,
         session_id: str,
         approvals: list[PendingApproval],
+        *,
+        preserve_unconfirmed: bool = True,
     ) -> list[str]:
         if not is_valid_session_id(session_id):
             return []
@@ -92,7 +100,11 @@ class PendingApprovalRepository:
                 pending.pop(key, None)
         for key, approval in incoming.items():
             if key:
-                pending[key] = pending_record(approval, pending.get(key))
+                pending[key] = pending_record(
+                    approval,
+                    pending.get(key),
+                    preserve_unconfirmed=preserve_unconfirmed,
+                )
         self.data["pending"] = pending
         return removed
 
@@ -130,6 +142,11 @@ class PendingApprovalRepository:
         claimed_by = _read_str(item.get("claimed_by")) if isinstance(item, dict) else ""
         if claimed_by:
             return None, "该审批请求正在被处理，请稍后执行 /cloudcli pending 刷新。"
+        if isinstance(item, dict) and _read_str(item.get("decision_unconfirmed_by")):
+            return (
+                None,
+                "该审批决定已经发送但尚未确认；请先执行 /cloudcli pending 刷新远端状态后再重试。",
+            )
         item["claimed_by"] = safe_text(actor, 200)
         item["claimed_action"] = safe_text(action, 40)
         item["claimed_at"] = time.time()
@@ -147,6 +164,30 @@ class PendingApprovalRepository:
             return False
         for field in PENDING_CLAIM_FIELDS:
             item.pop(field, None)
+        pending[key] = item
+        self.data["pending"] = pending
+        return True
+
+    def mark_decision_unconfirmed(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        actor: str,
+        action: str,
+        error: str,
+    ) -> bool:
+        pending = _read_dict(self.data.get("pending"))
+        key = pending_storage_key(session_id, request_id)
+        item = pending.get(key)
+        if not isinstance(item, dict):
+            return False
+        for field in PENDING_CLAIM_FIELDS:
+            item.pop(field, None)
+        item["decision_unconfirmed_by"] = safe_text(actor, 200)
+        item["decision_unconfirmed_action"] = safe_text(action, 40)
+        item["decision_unconfirmed_at"] = time.time()
+        item["decision_unconfirmed_error"] = safe_text(error, 500)
         pending[key] = item
         self.data["pending"] = pending
         return True
@@ -169,7 +210,13 @@ def pending_from_record(item: Any) -> PendingApproval | None:
     )
 
 
-def pending_record(approval: PendingApproval, existing: Any = None) -> dict[str, Any]:
+def pending_record(
+    approval: PendingApproval,
+    existing: Any = None,
+    *,
+    preserve_claim: bool = True,
+    preserve_unconfirmed: bool = True,
+) -> dict[str, Any]:
     record = {
         "request_id": approval.request_id,
         "session_id": approval.session_id,
@@ -179,8 +226,12 @@ def pending_record(approval: PendingApproval, existing: Any = None) -> dict[str,
         "received_at": approval.received_at or time.time(),
         "resolved": False,
     }
-    if isinstance(existing, dict):
+    if isinstance(existing, dict) and preserve_claim:
         for field in PENDING_CLAIM_FIELDS:
+            if existing.get(field):
+                record[field] = existing[field]
+    if isinstance(existing, dict) and preserve_unconfirmed:
+        for field in PENDING_UNCONFIRMED_FIELDS:
             if existing.get(field):
                 record[field] = existing[field]
     return record
@@ -207,6 +258,9 @@ def normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
             "received_at": _parse_timestamp(item.get("received_at")) or time.time(),
             "resolved": bool(item.get("resolved") is True),
         }
+        for field in PENDING_UNCONFIRMED_FIELDS:
+            if item.get(field):
+                normalized[field] = safe_text(item.get(field), 500)
         result[storage_key] = normalized
     return result
 

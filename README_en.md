@@ -59,6 +59,7 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - By default, only AstrBot admins or users in `session_allowed_user_keys` can list, bind, read, or stop CloudCLI sessions.
 - By default, only AstrBot admins or users in `run_allowed_user_keys` can start `/cloudcli run` agent tasks.
 - For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
+- By default, `persist_sensitive_state=false`, so approval input bodies, audit input summaries, and raw `/cloudcli run` task text are not written in full to local `state.json`. Fresh approval details are still available in memory after a push or refresh.
 - Non-admin users cannot directly type an unbound raw sessionId by default. They should use an index from `/cloudcli session`, or an admin can enable `allow_direct_session_id`.
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
 - Users in `approval_allowed_user_keys` can handle approvals for sessions they have bound. Binding arbitrary raw session IDs for approval-only users is disabled by default; set `approval_allow_direct_session_bind=true` only in trusted chats.
@@ -86,9 +87,10 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `run_access_mode`: run access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
 - `run_require_admin`: legacy compatibility flag. Prefer `run_access_mode`; setting this to `false` without an access mode now means allowlist-only, not all users.
 - `allowed_project_roots`: comma-separated local roots allowed for `/cloudcli run --project`
-- `allow_unrestricted_project_paths`: allow non-admin users to use arbitrary local paths when `allowed_project_roots` is empty
+- `allow_unrestricted_project_paths`: allow non-admin users to use arbitrary local paths only when `allowed_project_roots` is empty; once roots are configured, non-admin paths must stay inside them
 - `max_active_runs_per_user` / `max_active_runs_global`: concurrent `/cloudcli run` limits; `0` disables a limit
 - `max_run_history_per_user` / `max_run_history_global`: retain completed `/cloudcli run` history up to these limits; `0` disables pruning
+- `persist_sensitive_state`: persist approval inputs, audit input summaries, and raw run task text to `state.json`; default is `false`
 - `agent_idle_timeout_seconds`: idle timeout for the `/cloudcli run` streaming response
 - `agent_max_duration_seconds`: maximum wait time for one `/cloudcli run`; `0` disables this guard
 - `run_list_limit`: default task count shown by `/cloudcli run list`
