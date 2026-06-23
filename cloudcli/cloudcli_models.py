@@ -18,6 +18,27 @@ class RecentSession:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class AbortSessionResult:
+    session_id: str
+    provider: str = ""
+    confirmed_inactive: bool = False
+    confirmation_error: str = ""
+
+
+def active_sessions_contains(
+    payload: Any,
+    session_id: str,
+    provider: str = "",
+) -> bool:
+    if not session_id:
+        return False
+    sessions = payload.get("sessions") if isinstance(payload, dict) else payload
+    if provider and isinstance(sessions, dict):
+        return _session_items_contain(sessions.get(provider), session_id)
+    return _session_items_contain(sessions, session_id)
+
+
 def extract_recent_sessions(data: Any, limit: int) -> list[dict[str, Any]]:
     projects = _extract_project_items(data)
     if not isinstance(projects, list):
@@ -111,3 +132,18 @@ def _normalize_recent_session(
         projectName=project_name,
         projectPath=project_path,
     )
+
+
+def _session_items_contain(value: Any, session_id: str) -> bool:
+    if isinstance(value, str):
+        return value == session_id
+    if isinstance(value, list):
+        return any(_session_items_contain(item, session_id) for item in value)
+    if isinstance(value, tuple):
+        return any(_session_items_contain(item, session_id) for item in value)
+    if not isinstance(value, dict):
+        return False
+    for key in ("id", "sessionId", "session_id", "conversationId"):
+        if value.get(key) == session_id:
+            return True
+    return any(_session_items_contain(item, session_id) for item in value.values())

@@ -8,12 +8,22 @@ try:
     from .cloudcli_auth import CloudCLIAuth
     from .cloudcli_errors import CloudCLIError
     from .cloudcli_models import extract_recent_sessions
-    from .cloudcli_protocol import redact_error_text
+    from .cloudcli_protocol import (
+        MAX_ERROR_BODY_CHARS,
+        read_response_json_limited,
+        read_response_text_limited,
+        redact_error_text,
+    )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_auth import CloudCLIAuth
     from cloudcli.cloudcli_errors import CloudCLIError
     from cloudcli.cloudcli_models import extract_recent_sessions
-    from cloudcli.cloudcli_protocol import redact_error_text
+    from cloudcli.cloudcli_protocol import (
+        MAX_ERROR_BODY_CHARS,
+        read_response_json_limited,
+        read_response_text_limited,
+        redact_error_text,
+    )
 
 
 EnsureSession = Callable[[], Awaitable[Any]]
@@ -119,8 +129,8 @@ class CloudCLIRestClient:
             if response.status == 401:
                 return None, True
             if response.status >= 400:
-                body = await response.text()
+                body = await read_response_text_limited(response, MAX_ERROR_BODY_CHARS)
                 raise CloudCLIError(
                     f"CloudCLI REST 请求失败：HTTP {response.status} {redact_error_text(body)}"
                 )
-            return await response.json(content_type=None), False
+            return await read_response_json_limited(response), False

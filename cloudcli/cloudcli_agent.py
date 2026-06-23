@@ -8,11 +8,23 @@ import aiohttp
 try:
     from .cloudcli_auth import CloudCLIAuth
     from .cloudcli_errors import CloudCLIError
-    from .cloudcli_protocol import iter_sse, redact_error_text
+    from .cloudcli_protocol import (
+        MAX_ERROR_BODY_CHARS,
+        iter_sse,
+        read_response_json_limited,
+        read_response_text_limited,
+        redact_error_text,
+    )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_auth import CloudCLIAuth
     from cloudcli.cloudcli_errors import CloudCLIError
-    from cloudcli.cloudcli_protocol import iter_sse, redact_error_text
+    from cloudcli.cloudcli_protocol import (
+        MAX_ERROR_BODY_CHARS,
+        iter_sse,
+        read_response_json_limited,
+        read_response_text_limited,
+        redact_error_text,
+    )
 
 
 ApiUrl = Callable[[str], str]
@@ -31,7 +43,6 @@ class CloudCLIAgentClient:
         self.api_url = api_url
 
     async def stream_agent(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
-        headers = await self.auth.agent_headers()
         request_payload = dict(payload)
         request_payload["stream"] = True
 
@@ -41,36 +52,56 @@ class CloudCLIAgentClient:
             sock_read=max(10, self.config.agent_idle_timeout_seconds),
         )
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    self.api_url("/api/agent"),
-                    json=request_payload,
-                    headers=headers,
-                ) as response:
-                    if response.status >= 400:
-                        body = await response.text()
-                        if response.status == 401 and not self.config.api_key:
-                            raise CloudCLIError(
-                                "CloudCLI agent API 认证失败：请在 cloudcli_api_key 填写 CloudCLI UI 生成的 API Key。"
+            for attempt in range(2):
+                headers = await self.auth.agent_headers()
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        self.api_url("/api/agent"),
+                        json=request_payload,
+                        headers=headers,
+                    ) as response:
+                        if (
+                            response.status == 401
+                            and attempt == 0
+                            and self._can_refresh_auth()
+                        ):
+                            await self.auth.clear_cached_token()
+                            continue
+                        if response.status >= 400:
+                            body = await read_response_text_limited(
+                                response,
+                                MAX_ERROR_BODY_CHARS,
                             )
-                        raise CloudCLIError(
-                            f"CloudCLI agent API 请求失败：HTTP {response.status} {redact_error_text(body)}"
-                        )
+                            if response.status == 401 and not self.config.api_key:
+                                raise CloudCLIError(
+                                    "CloudCLI agent API authentication failed; configure cloudcli_api_key or valid CloudCLI credentials."
+                                )
+                            raise CloudCLIError(
+                                f"CloudCLI agent API request failed: HTTP {response.status} {redact_error_text(body)}"
+                            )
 
-                    content_type = response.headers.get("Content-Type", "")
-                    if "text/event-stream" not in content_type:
-                        data = await response.json(content_type=None)
-                        if isinstance(data, dict):
-                            yield {"type": "response", "data": data}
-                        else:
-                            yield {"type": "response", "data": {"raw": data}}
+                        content_type = response.headers.get("Content-Type", "")
+                        if "text/event-stream" not in content_type:
+                            data = await read_response_json_limited(response)
+                            if isinstance(data, dict):
+                                yield {"type": "response", "data": data}
+                            else:
+                                yield {"type": "response", "data": {"raw": data}}
+                            return
+
+                        async for item in iter_sse(response.content):
+                            yield item
                         return
-
-                    async for item in iter_sse(response.content):
-                        yield item
         except CloudCLIError:
             raise
         except Exception as exc:  # noqa: BLE001
             raise CloudCLIError(
-                f"CloudCLI agent 任务执行失败：{redact_error_text(str(exc))}"
+                f"CloudCLI agent task failed: {redact_error_text(str(exc))}"
             ) from exc
+
+    def _can_refresh_auth(self) -> bool:
+        return (
+            not str(getattr(self.config, "jwt_token", "") or "").strip()
+            and bool(getattr(self.config, "username", ""))
+            and bool(getattr(self.config, "password", ""))
+        )

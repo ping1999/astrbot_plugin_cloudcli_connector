@@ -161,6 +161,23 @@ def format_agent_start_message(payload: dict[str, Any], run_id: str = "", text_l
     )
 
 
+def format_abort_result(result: Any, text_limit: int = 1800) -> str:
+    session_id = _read_str(getattr(result, "session_id", ""))
+    provider = _read_str(getattr(result, "provider", ""))
+    provider_text = f" provider={provider}" if provider else ""
+    if bool(getattr(result, "confirmed_inactive", False)):
+        return clip_text(
+            f"CloudCLI abort request sent and session is no longer active: {session_id}{provider_text}",
+            text_limit,
+        )
+    confirmation_error = _read_str(getattr(result, "confirmation_error", ""))
+    suffix = f" confirmation error: {confirmation_error}" if confirmation_error else ""
+    return clip_text(
+        f"CloudCLI abort request sent but remote stop is not confirmed: {session_id}{provider_text}{suffix}",
+        text_limit,
+    )
+
+
 def format_agent_status(event: dict[str, Any], text_limit: int) -> str:
     event_type = str(event.get("type") or event.get("event") or "")
     if event_type == "session-id":

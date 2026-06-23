@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 MAX_ERROR_BODY_CHARS = 2000
+MAX_HTTP_RESPONSE_CHARS = 2_000_000
 MAX_SSE_EVENT_CHARS = 1_000_000
 
 
@@ -33,6 +34,34 @@ def build_auth_headers(token: str, api_key: str) -> dict[str, str]:
     if api_key:
         headers["X-API-Key"] = api_key
     return headers
+
+
+async def read_response_text_limited(
+    response: Any,
+    max_chars: int = MAX_HTTP_RESPONSE_CHARS,
+) -> str:
+    max_chars = max(1, int(max_chars))
+    max_bytes = max_chars * 4
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(65536):
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > max_bytes:
+            raise ValueError("CloudCLI HTTP response body is too large.")
+    encoding = getattr(response, "charset", None) or "utf-8"
+    text = bytes(body).decode(encoding, errors="replace")
+    if len(text) > max_chars:
+        raise ValueError("CloudCLI HTTP response body is too large.")
+    return text
+
+
+async def read_response_json_limited(
+    response: Any,
+    max_chars: int = MAX_HTTP_RESPONSE_CHARS,
+) -> Any:
+    text = await read_response_text_limited(response, max_chars)
+    return json.loads(text) if text else None
 
 
 async def iter_sse(content: Any) -> AsyncIterator[dict[str, Any]]:

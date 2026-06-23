@@ -19,6 +19,7 @@ try:
     from .command_router import CommandHandler, CommandRoute, CommandRouter
     from .formatting import (
         HELP_TEXT,
+        format_abort_result,
         format_bindings,
         format_chat_messages,
         format_health_report,
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from commands.command_router import CommandHandler, CommandRoute, CommandRouter
     from commands.formatting import (
         HELP_TEXT,
+        format_abort_result,
         format_bindings,
         format_chat_messages,
         format_health_report,
@@ -250,11 +252,11 @@ class CloudCLICommandHandlers:
             return f"获取 CloudCLI session 消息失败：{exc}"
 
     async def handle_run(self, user: UserRef, args: list[str]) -> str:
+        if args and args[0] in {"list", "log", "cancel"}:
+            return await self.run_service.handle_run_control(user, args)
         decision = self.authz.can_run_agent(user)
         if not decision.allowed:
             return decision.message
-        if args and args[0] in {"list", "log", "cancel"}:
-            return await self.run_service.handle_run_control(user, args)
 
         return await self.run_service.handle_run(user, args)
 
@@ -283,9 +285,8 @@ class CloudCLICommandHandlers:
             if provider not in SESSION_PROVIDERS:
                 return f"provider 不支持：{provider}。可选：claude、cursor、codex、gemini、opencode。"
         try:
-            await self.client.abort_session(resolved["id"], provider)
-            provider_text = f" provider={provider}" if provider else ""
-            return f"已向 CloudCLI 发送中止 session 请求：{resolved['id']}{provider_text}"
+            result = await self.client.abort_session(resolved["id"], provider)
+            return format_abort_result(result, self.settings.max_push_text_length)
         except CloudCLIError as exc:
             return f"中止 CloudCLI session 失败：{exc}"
 

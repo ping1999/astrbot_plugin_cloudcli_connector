@@ -57,6 +57,8 @@ async def _call_or_attr(event: Any, name: str) -> str:
 
 async def _is_event_admin(event: Any) -> bool:
     checker = getattr(event, "is_admin", None)
+    if isinstance(checker, bool):
+        return checker
     if callable(checker):
         try:
             result = checker()
@@ -65,7 +67,7 @@ async def _is_event_admin(event: Any) -> bool:
             return bool(result)
         except Exception:  # noqa: BLE001
             pass
-    return str(getattr(event, "role", "")).lower() == "admin"
+    return False
 
 
 def _stable_digest(value: str) -> str:

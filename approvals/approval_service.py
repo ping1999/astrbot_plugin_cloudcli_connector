@@ -37,6 +37,8 @@ class ApprovalService:
     timeout_deny_max_attempts = 3
     timeout_deny_retry_initial_seconds = 5.0
     timeout_deny_retry_max_seconds = 60.0
+    decision_confirm_attempts = 3
+    decision_confirm_delay_seconds = 0.2
 
     def __init__(
         self,
@@ -88,11 +90,7 @@ class ApprovalService:
             return error
         assert approval is not None
         try:
-            await self.client.send_permission_decision(
-                approval.request_id,
-                True,
-                session_id=approval.session_id,
-            )
+            await self._send_permission_decision_confirmed(approval, True)
             await self.state.remove_pending(approval.session_id, approval.request_id)
             self.cancel_timeout(approval)
             await self.state.append_audit(
@@ -139,11 +137,10 @@ class ApprovalService:
             return error
         assert approval is not None
         try:
-            await self.client.send_permission_decision(
-                approval.request_id,
+            await self._send_permission_decision_confirmed(
+                approval,
                 False,
                 message=reason,
-                session_id=approval.session_id,
             )
             await self.state.remove_pending(approval.session_id, approval.request_id)
             self.cancel_timeout(approval)
@@ -355,11 +352,10 @@ class ApprovalService:
         reason = f"审批超时 {timeout_seconds} 秒，自动拒绝。"
         actor = "system"
         try:
-            await self.client.send_permission_decision(
-                approval.request_id,
+            await self._send_permission_decision_confirmed(
+                approval,
                 False,
                 message=reason,
-                session_id=approval.session_id,
             )
             await self.state.remove_pending(approval.session_id, approval.request_id)
             await self.state.append_audit(
@@ -389,6 +385,43 @@ class ApprovalService:
             return False
         await self._send_to_targets(targets, text)
         return True
+
+    async def _send_permission_decision_confirmed(
+        self,
+        approval: PendingApproval,
+        allow: bool,
+        *,
+        message: str = "",
+    ) -> None:
+        await self.client.send_permission_decision(
+            approval.request_id,
+            allow,
+            message=message,
+            session_id=approval.session_id,
+        )
+        await self._confirm_permission_decision(approval)
+
+    async def _confirm_permission_decision(self, approval: PendingApproval) -> None:
+        attempts = max(1, int(self.decision_confirm_attempts))
+        delay = max(0.0, float(self.decision_confirm_delay_seconds))
+        last_error = "permission decision not confirmed"
+        for attempt in range(attempts):
+            try:
+                pending = await self.client.get_pending_permissions(approval.session_id)
+            except CloudCLIError as exc:
+                last_error = f"permission decision confirmation failed: {exc}"
+            else:
+                still_pending = any(
+                    item.session_id == approval.session_id
+                    and item.request_id == approval.request_id
+                    for item in pending
+                )
+                if not still_pending:
+                    return
+                last_error = "permission decision not confirmed; request is still pending"
+            if attempt + 1 < attempts and delay > 0:
+                await asyncio.sleep(delay)
+        raise CloudCLIError(last_error)
 
     async def _send_to_targets(self, targets: tuple[dict[str, Any], ...], text: str) -> None:
         for target in targets:

@@ -6,10 +6,20 @@ from typing import Any
 
 try:
     from .cloudcli_errors import CloudCLIError
-    from .cloudcli_protocol import build_auth_headers, redact_error_text
+    from .cloudcli_protocol import (
+        MAX_HTTP_RESPONSE_CHARS,
+        build_auth_headers,
+        read_response_text_limited,
+        redact_error_text,
+    )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_errors import CloudCLIError
-    from cloudcli.cloudcli_protocol import build_auth_headers, redact_error_text
+    from cloudcli.cloudcli_protocol import (
+        MAX_HTTP_RESPONSE_CHARS,
+        build_auth_headers,
+        read_response_text_limited,
+        redact_error_text,
+    )
 
 
 EnsureSession = Callable[[], Awaitable[Any]]
@@ -50,7 +60,10 @@ class CloudCLIAuth:
                 },
                 headers=headers,
             ) as response:
-                raw_body = await response.text()
+                raw_body = await read_response_text_limited(
+                    response,
+                    MAX_HTTP_RESPONSE_CHARS,
+                )
                 try:
                     data = json.loads(raw_body) if raw_body else {}
                 except json.JSONDecodeError:

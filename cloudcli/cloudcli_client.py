@@ -13,6 +13,7 @@ try:
     from .cloudcli_agent import CloudCLIAgentClient
     from .cloudcli_auth import CloudCLIAuth
     from .cloudcli_errors import CloudCLIError, CloudCLITimeout
+    from .cloudcli_models import AbortSessionResult, active_sessions_contains
     from .cloudcli_protocol import (
         build_api_url,
         build_ws_url,
@@ -25,6 +26,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_agent import CloudCLIAgentClient
     from cloudcli.cloudcli_auth import CloudCLIAuth
     from cloudcli.cloudcli_errors import CloudCLIError, CloudCLITimeout
+    from cloudcli.cloudcli_models import AbortSessionResult, active_sessions_contains
     from cloudcli.cloudcli_protocol import (
         build_api_url,
         build_ws_url,
@@ -56,6 +58,8 @@ PermissionCallback = Callable[[PendingApproval], Awaitable[None]]
 class CloudCLIClient:
     reconnect_initial_seconds = 1.0
     reconnect_max_seconds = 30.0
+    abort_confirm_attempts = 3
+    abort_confirm_delay_seconds = 0.3
 
     def __init__(
         self,
@@ -263,7 +267,7 @@ class CloudCLIClient:
             payload["message"] = message
         await self._send_json(payload)
 
-    async def abort_session(self, session_id: str, provider: str = "") -> None:
+    async def abort_session(self, session_id: str, provider: str = "") -> AbortSessionResult:
         await self.ensure_connected()
         payload: dict[str, Any] = {
             "type": "abort-session",
@@ -272,6 +276,36 @@ class CloudCLIClient:
         if provider:
             payload["provider"] = provider
         await self._send_json(payload)
+        return await self._confirm_abort_session(session_id, provider)
+
+    async def _confirm_abort_session(
+        self,
+        session_id: str,
+        provider: str = "",
+    ) -> AbortSessionResult:
+        attempts = max(1, int(self.abort_confirm_attempts))
+        delay = max(0.0, float(self.abort_confirm_delay_seconds))
+        last_error = ""
+        for attempt in range(attempts):
+            if attempt > 0 and delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                active_payload = await self.get_active_sessions()
+            except CloudCLIError as exc:
+                last_error = str(exc)
+                continue
+            if not active_sessions_contains(active_payload, session_id, provider):
+                return AbortSessionResult(
+                    session_id=session_id,
+                    provider=provider,
+                    confirmed_inactive=True,
+                )
+        return AbortSessionResult(
+            session_id=session_id,
+            provider=provider,
+            confirmed_inactive=False,
+            confirmation_error=last_error,
+        )
 
     async def _connect_locked(self) -> None:
         if self._ws and not self._ws.closed:
@@ -477,6 +511,7 @@ class CloudCLIClient:
 
     def _ws_url(self, token: str) -> str:
         return build_ws_url(self.config.base_url, token)
+
 
 def _redact_text(value: str) -> str:
     return redact_error_text(value)

@@ -11,6 +11,7 @@ try:
     from ..commands.formatting import (
         clip_text,
         extract_agent_text,
+        format_abort_result,
         format_agent_final,
         format_agent_start_message,
         format_agent_status,
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from commands.formatting import (
         clip_text,
         extract_agent_text,
+        format_abort_result,
         format_agent_final,
         format_agent_start_message,
         format_agent_status,
@@ -369,8 +371,8 @@ class RunService:
         if run_id:
             self.abort_sent_run_ids.add(run_id)
         try:
-            await self.client.abort_session(session_id, str(payload.get("provider") or ""))
-            return f"\n已向 CloudCLI 发送中止 session 请求：{session_id}"
+            result = await self.client.abort_session(session_id, str(payload.get("provider") or ""))
+            return "\n" + format_abort_result(result, self.settings.max_push_text_length)
         except CloudCLIError as exc:
             if run_id:
                 self.abort_sent_run_ids.discard(run_id)

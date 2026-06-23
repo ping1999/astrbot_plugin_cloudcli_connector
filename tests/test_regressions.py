@@ -10,6 +10,9 @@ from pathlib import Path
 from approvals.approval_notifications import ApprovalNotificationPolicy
 from approvals.approval_service import ApprovalService
 from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIConfig, CloudCLIError
+from cloudcli.cloudcli_agent import CloudCLIAgentClient
+import cloudcli.cloudcli_agent as cloudcli_agent_module
+from cloudcli.cloudcli_models import active_sessions_contains
 from cloudcli.cloudcli_protocol import build_ws_url, parse_sse_event
 from cloudcli.cloudcli_transport import WebSocketRequestMux
 from commands.command_parser import ParsedCommand
@@ -106,6 +109,21 @@ class IdentityTests(unittest.TestCase):
 
         user = asyncio.run(build_user_ref(Event()))
         self.assertFalse(user.identity_verified)
+        self.assertFalse(user.is_admin)
+
+    def test_role_attribute_is_not_trusted_as_admin_source(self) -> None:
+        class Event:
+            unified_msg_origin = "origin"
+            role = "admin"
+
+            def get_platform_id(self) -> str:
+                return "test"
+
+            def get_sender_id(self) -> str:
+                return "u1"
+
+        user = asyncio.run(build_user_ref(Event()))
+        self.assertTrue(user.identity_verified)
         self.assertFalse(user.is_admin)
 
     def test_async_sender_id_is_awaited(self) -> None:
@@ -330,6 +348,22 @@ class ProtocolTests(unittest.TestCase):
             {"event": "status", "message": "ok"},
         )
 
+    def test_active_session_lookup_handles_provider_scoped_shapes(self) -> None:
+        payload = {
+            "sessions": {
+                "claude": [
+                    "sess-1",
+                    {"sessionId": "sess-2"},
+                    {"nested": {"conversationId": "sess-3"}},
+                ],
+                "codex": [{"id": "sess-4"}],
+            }
+        }
+        self.assertTrue(active_sessions_contains(payload, "sess-1"))
+        self.assertTrue(active_sessions_contains(payload, "sess-3", "claude"))
+        self.assertFalse(active_sessions_contains(payload, "sess-3", "codex"))
+        self.assertTrue(active_sessions_contains(payload, "sess-4", "codex"))
+
     def test_request_mux_serializes_same_key_requests(self) -> None:
         async def scenario() -> tuple[int, dict[str, object], dict[str, object]]:
             mux = WebSocketRequestMux()
@@ -426,7 +460,7 @@ class CommandRouterTests(unittest.TestCase):
 
 
 class CommandHandlerTests(unittest.TestCase):
-    def test_run_control_requires_current_run_permission(self) -> None:
+    def test_run_control_does_not_require_current_new_run_permission(self) -> None:
         class FakeRunService:
             called = False
 
@@ -453,6 +487,40 @@ class CommandHandlerTests(unittest.TestCase):
             result = await handlers.handle_run(
                 UserRef("test:u1", "User", "origin"),
                 ["list"],
+            )
+            return result, run_service.called
+
+        result, called = asyncio.run(scenario())
+        self.assertEqual("control", result)
+        self.assertTrue(called)
+
+    def test_starting_run_still_requires_current_run_permission(self) -> None:
+        class FakeRunService:
+            called = False
+
+            async def handle_run_control(self, user: UserRef, args: list[str]) -> str:
+                self.called = True
+                return "control"
+
+            async def handle_run(self, user: UserRef, args: list[str]) -> str:
+                self.called = True
+                return "run"
+
+        async def scenario() -> tuple[str, bool]:
+            settings = load_connector_settings({"run_access_mode": "allowlist_only"})
+            run_service = FakeRunService()
+            handlers = CloudCLICommandHandlers(
+                settings=settings,
+                authz=AuthorizationPolicy(settings),
+                state=object(),  # type: ignore[arg-type]
+                client=object(),  # type: ignore[arg-type]
+                session_resolver=object(),  # type: ignore[arg-type]
+                run_service=run_service,  # type: ignore[arg-type]
+                approval_service=object(),  # type: ignore[arg-type]
+            )
+            result = await handlers.handle_run(
+                UserRef("test:u1", "User", "origin"),
+                ["do", "work"],
             )
             return result, run_service.called
 
@@ -1037,6 +1105,82 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual("Bearer jwt-token", headers.get("Authorization"))
         self.assertEqual("api-secret", headers.get("X-API-Key"))
 
+    def test_agent_stream_refreshes_expired_cached_login_token(self) -> None:
+        class FakeContent:
+            def __init__(self, text: str) -> None:
+                self.payload = text.encode("utf-8")
+
+            async def iter_chunked(self, _size: int):
+                yield self.payload
+
+        class FakeResponse:
+            def __init__(self, status: int, body: str = "") -> None:
+                self.status = status
+                self.headers = {"Content-Type": "application/json"}
+                self.content = FakeContent(body)
+                self.charset = "utf-8"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeSession:
+            responses = [
+                FakeResponse(401),
+                FakeResponse(200, '{"success": true}'),
+            ]
+            sent_headers: list[dict[str, str]] = []
+
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            def post(self, _url: str, *, json=None, headers=None):
+                self.sent_headers.append(dict(headers or {}))
+                return self.responses.pop(0)
+
+        class FakeAuth:
+            calls = 0
+            cleared = 0
+
+            async def agent_headers(self) -> dict[str, str]:
+                self.calls += 1
+                return {"Authorization": f"Bearer token-{self.calls}"}
+
+            async def clear_cached_token(self) -> None:
+                self.cleared += 1
+
+        async def scenario() -> tuple[int, list[dict[str, str]], list[dict[str, object]]]:
+            old_session = cloudcli_agent_module.aiohttp.ClientSession
+            auth = FakeAuth()
+            try:
+                cloudcli_agent_module.aiohttp.ClientSession = FakeSession  # type: ignore[assignment]
+                client = CloudCLIAgentClient(
+                    config=CloudCLIConfig(
+                        base_url="http://127.0.0.1:3001",
+                        username="user",
+                        password="password",
+                    ),
+                    auth=auth,  # type: ignore[arg-type]
+                    api_url=lambda path: f"http://127.0.0.1:3001{path}",
+                )
+                events = [event async for event in client.stream_agent({"message": "hi"})]
+                return auth.cleared, FakeSession.sent_headers, events
+            finally:
+                cloudcli_agent_module.aiohttp.ClientSession = old_session  # type: ignore[assignment]
+
+        cleared, sent_headers, events = asyncio.run(scenario())
+        self.assertEqual(1, cleared)
+        self.assertEqual(["Bearer token-1", "Bearer token-2"], [item["Authorization"] for item in sent_headers])
+        self.assertEqual([{"type": "response", "data": {"success": True}}], events)
+
     def test_unauthenticated_ws_does_not_require_token(self) -> None:
         class FakeWebSocket:
             closed = False
@@ -1266,6 +1410,49 @@ class ApprovalServiceTests(unittest.TestCase):
         self.assertIn("同步 CloudCLI 待审批权限失败", result)
         self.assertFalse(decision_sent)
 
+    def test_allow_keeps_pending_when_confirmation_fails(self) -> None:
+        class UnconfirmedClient:
+            decision_sent = False
+
+            async def get_pending_permissions(self, session_id: str):
+                return [PendingApproval("request-1", session_id, "Tool", {"value": 1})]
+
+            async def send_permission_decision(self, *args, **kwargs) -> None:
+                self.decision_sent = True
+
+        async def scenario() -> tuple[str, bool, bool]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                settings = load_connector_settings({})
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin", is_admin=True)
+                await state.bind_session(user, "sess-1", 10)
+                await state.upsert_pending(
+                    PendingApproval("request-1", "sess-1", "Tool", {"value": 1})
+                )
+                client = UnconfirmedClient()
+                service = ApprovalService(
+                    settings=settings,
+                    state=state,
+                    client=client,  # type: ignore[arg-type]
+                    notifications=ApprovalNotificationPolicy(
+                        approval_allowed_user_keys=frozenset(),
+                        approval_require_admin=True,
+                    ),
+                    send_proactive=lambda _origin, _text: asyncio.sleep(0),
+                    track_task=lambda _task: None,
+                )
+                service.decision_confirm_delay_seconds = 0
+                result = await service.handle_allow(user, [])
+                pending = await state.get_pending("sess-1", "request-1")
+                claimed, error = await state.claim_visible_request(user, None, 10, "deny")
+                return result, pending is not None, claimed is not None and not error
+
+        result, still_pending, claimable = asyncio.run(scenario())
+        self.assertIn("not confirmed", result)
+        self.assertTrue(still_pending)
+        self.assertTrue(claimable)
+
     def test_cancelled_allow_releases_pending_claim(self) -> None:
         class CancellingClient:
             async def get_pending_permissions(self, session_id: str):
@@ -1351,6 +1538,11 @@ class ApprovalServiceTests(unittest.TestCase):
                 self.attempts += 1
                 if self.attempts == 1:
                     raise CloudCLIError("temporary failure")
+
+            async def get_pending_permissions(self, session_id: str):
+                if self.attempts >= 2:
+                    return []
+                return [PendingApproval("request-1", session_id, "Tool", {"value": 1})]
 
         async def scenario() -> tuple[int, bool]:
             with tempfile.TemporaryDirectory() as temp_dir:
