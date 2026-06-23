@@ -1,3 +1,5 @@
+"""写入状态文件前的文本和 JSON 清洗工具。"""
+
 from __future__ import annotations
 
 import json
@@ -16,6 +18,7 @@ MAX_STORED_JSON_DEPTH = 6
 
 
 def safe_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
+    """把任意值转成可存储文本，移除控制字符、脱敏并截断。"""
     if value is None:
         return ""
     text = value if isinstance(value, str) else str(value)
@@ -27,6 +30,7 @@ def safe_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
 
 
 def safe_json_value(value: Any, depth: int = 0) -> Any:
+    """递归清洗 JSON-like 数据，限制深度、条目数并按敏感键脱敏。"""
     if depth >= MAX_STORED_JSON_DEPTH:
         return safe_text(value, MAX_STORED_TEXT)
     if value is None or isinstance(value, (bool, int, float)):
@@ -41,6 +45,7 @@ def safe_json_value(value: Any, depth: int = 0) -> Any:
                 break
             safe_key = safe_text(key, 120)
             if is_sensitive_key(safe_key):
+                # 即使 persist_sensitive_state=true，也不把明显的密码/token 字段原样落盘。
                 result[safe_key] = "[redacted]"
             else:
                 result[safe_key] = safe_json_value(item, depth + 1)
@@ -61,6 +66,7 @@ def safe_json_value(value: Any, depth: int = 0) -> Any:
 
 
 def compact_json(value: Any) -> str:
+    """把 JSON-like 数据压成一行字符串，便于审计摘要展示。"""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -72,6 +78,7 @@ def compact_json(value: Any) -> str:
 
 
 def is_sensitive_key(value: str) -> bool:
+    """根据字段名判断它是否像凭据，支持驼峰、下划线和连字符写法。"""
     normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", value)
     normalized = re.sub(r"[^a-zA-Z0-9]+", "_", normalized).strip("_").lower()
     if not normalized:

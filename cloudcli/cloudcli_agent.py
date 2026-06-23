@@ -1,3 +1,5 @@
+"""CloudCLI Agent API 客户端，负责发起流式 agent 任务并解析 SSE 响应。"""
+
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
@@ -33,6 +35,8 @@ ApiUrl = Callable[[str], str]
 
 
 class CloudCLIAgentClient:
+    """只封装 `/api/agent`，其余 REST/WebSocket 能力由其他客户端负责。"""
+
     def __init__(
         self,
         *,
@@ -45,9 +49,11 @@ class CloudCLIAgentClient:
         self.api_url = api_url
 
     async def stream_agent(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+        """发送 agent 任务请求；如果服务端返回 SSE，就逐条 yield 事件。"""
         request_payload = dict(payload)
         request_payload["stream"] = True
 
+        # Agent 任务可能运行很久，因此总超时关闭，只限制连接建立和空闲读取时间。
         timeout = aiohttp.ClientTimeout(
             total=None,
             sock_connect=max(3, self.config.timeout_seconds),
@@ -64,6 +70,7 @@ class CloudCLIAgentClient:
                         allow_redirects=False,
                     ) as response:
                         raise_for_redirect(response, "CloudCLI agent API")
+                        # JWT 过期时最多刷新一次，避免错误账号/密码导致无限重试。
                         if (
                             response.status == 401
                             and attempt == 0
@@ -86,6 +93,7 @@ class CloudCLIAgentClient:
 
                         content_type = response.headers.get("Content-Type", "")
                         if "text/event-stream" not in content_type:
+                            # 某些实现可能直接返回 JSON，这里也兼容并包装成一条 response 事件。
                             data = await read_response_json_limited(response)
                             if isinstance(data, dict):
                                 yield {"type": "response", "data": data}
@@ -104,6 +112,7 @@ class CloudCLIAgentClient:
             ) from exc
 
     def _can_refresh_auth(self) -> bool:
+        """只有配置用户名密码时才有能力重新登录刷新 JWT。"""
         return (
             bool(getattr(self.config, "username", ""))
             and bool(getattr(self.config, "password", ""))

@@ -1,3 +1,5 @@
+"""插件配置读取和安全归一化。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,6 +15,8 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 @dataclass(frozen=True)
 class ConnectorSettings:
+    """插件运行期使用的不可变配置快照。"""
+
     cloudcli: CloudCLIConfig
     auto_connect: bool
     recent_sessions_limit: int
@@ -51,6 +55,7 @@ class ConnectorSettings:
 
 
 def load_connector_settings(config: Any) -> ConnectorSettings:
+    """从 AstrBot 配置对象中读取所有选项，并为缺失/非法值套用安全默认值。"""
     get = config.get if hasattr(config, "get") else lambda _key, default=None: default
     jwt_token = _read_str(get("cloudcli_jwt_token"), "")
     username = _read_str(get("cloudcli_username"), "")
@@ -61,6 +66,7 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
     stop_require_admin = _read_bool(get("stop_require_admin"), True)
     run_require_admin = _read_bool(get("run_require_admin"), True)
     has_cloudcli_credentials = bool(jwt_token or api_key or (username and password))
+    # 所有数字配置都在读取时夹到合理范围内，避免错误配置导致无限等待或消息过长。
     return ConnectorSettings(
         cloudcli=CloudCLIConfig(
             base_url=_read_base_url(
@@ -134,10 +140,12 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
 
 
 def _read_str(value: Any, default: str) -> str:
+    """读取非空字符串，否则返回默认值。"""
     return value.strip() if isinstance(value, str) and value.strip() else default
 
 
 def _read_base_url(value: Any, *, has_credentials: bool = False) -> str:
+    """校验 CloudCLI base URL；携带凭据时禁止非本机 HTTP 明文地址。"""
     raw = _read_str(value, "http://127.0.0.1:3001")
     try:
         parsed = urlsplit(raw)
@@ -158,11 +166,13 @@ def _read_base_url(value: Any, *, has_credentials: bool = False) -> str:
         and parsed.scheme == "http"
         and not _is_loopback_hostname(parsed.hostname or "")
     ):
+        # 避免把 JWT、密码或 API key 通过明文 HTTP 发到远端主机。
         return "http://127.0.0.1:3001"
     return urlunsplit((parsed.scheme, safe_netloc, parsed.path.rstrip("/"), "", ""))
 
 
 def _base_url_netloc(parsed: Any) -> str:
+    """重建 netloc，顺手移除 URL 中误填的用户名密码。"""
     if parsed.username or parsed.password:
         hostname = parsed.hostname or ""
         if not hostname:
@@ -175,6 +185,7 @@ def _base_url_netloc(parsed: Any) -> str:
 
 
 def _is_loopback_hostname(hostname: str) -> bool:
+    """判断主机名是否是 localhost 或回环 IP。"""
     normalized = hostname.rstrip(".").lower()
     if normalized == "localhost":
         return True
@@ -185,10 +196,12 @@ def _is_loopback_hostname(hostname: str) -> bool:
 
 
 def _read_bool(value: Any, default: bool) -> bool:
+    """只接受真实 bool，避免字符串 'false' 被 Python 当作 True。"""
     return value if isinstance(value, bool) else default
 
 
 def _read_str_list(value: Any) -> list[str]:
+    """读取字符串列表；也兼容逗号分隔的配置写法。"""
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     if isinstance(value, str):
@@ -197,6 +210,7 @@ def _read_str_list(value: Any) -> list[str]:
 
 
 def _read_limited_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    """读取整数并限制在闭区间 `[minimum, maximum]` 内。"""
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -209,6 +223,7 @@ def _read_limited_int(value: Any, default: int, minimum: int, maximum: int) -> i
 
 
 def _read_nonnegative_limited_int(value: Any, default: int, maximum: int) -> int:
+    """读取非负整数；0 通常表示关闭某类限制或超时。"""
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -221,6 +236,7 @@ def _read_nonnegative_limited_int(value: Any, default: int, maximum: int) -> int
 
 
 def _read_choice(value: Any, default: str, choices: set[str]) -> str:
+    """读取枚举值，大小写不敏感。"""
     if isinstance(value, str):
         normalized = value.strip().lower()
         if normalized in choices:
@@ -229,6 +245,7 @@ def _read_choice(value: Any, default: str, choices: set[str]) -> str:
 
 
 def _read_access_mode(value: Any, *, legacy_require_admin: bool) -> str:
+    """读取访问模式，并兼容早期 `*_require_admin` 布尔配置。"""
     choices = {"admin_or_allowlist", "allowlist_only", "authenticated"}
     if isinstance(value, str):
         normalized = value.strip().lower().replace("-", "_")

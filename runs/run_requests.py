@@ -1,3 +1,5 @@
+"""`/cloudcli run` 请求解析：把聊天参数转换成 CloudCLI Agent API payload。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -37,39 +39,51 @@ VALUE_OPTIONS = frozenset({"project", "github", "session", "provider", "model", 
 
 @dataclass(frozen=True)
 class ProjectTarget:
+    """本地项目目录目标。"""
+
     project_path: str
 
     @property
     def display_target(self) -> str:
+        """用于任务列表和启动消息的目标展示文本。"""
         return self.project_path
 
     def apply_to_payload(self, payload: dict[str, Any]) -> None:
+        """把目标写入 Agent API payload。"""
         payload["projectPath"] = self.project_path
 
 
 @dataclass(frozen=True)
 class GitHubTarget:
+    """GitHub 仓库 URL 目标。"""
+
     github_url: str
 
     @property
     def display_target(self) -> str:
+        """用于任务列表和启动消息的目标展示文本。"""
         return self.github_url
 
     def apply_to_payload(self, payload: dict[str, Any]) -> None:
+        """把目标写入 Agent API payload。"""
         payload["githubUrl"] = self.github_url
 
 
 @dataclass(frozen=True)
 class SessionTarget:
+    """已有 CloudCLI session 目标，会带上它关联的项目路径。"""
+
     session_id: str
     project_path: str
     provider: str = ""
 
     @property
     def display_target(self) -> str:
+        """用于任务列表和启动消息的目标展示文本。"""
         return f"{self.session_id} ({self.project_path})"
 
     def apply_to_payload(self, payload: dict[str, Any]) -> None:
+        """把 session 目标写入 Agent API payload。"""
         payload["sessionId"] = self.session_id
         payload["projectPath"] = self.project_path
 
@@ -79,6 +93,8 @@ RunTarget = ProjectTarget | GitHubTarget | SessionTarget
 
 @dataclass
 class ParsedRun:
+    """解析成功后的 run 请求。"""
+
     payload: dict[str, Any]
     display_target: str
     target: RunTarget
@@ -86,6 +102,8 @@ class ParsedRun:
 
 @dataclass
 class RunOptions:
+    """命令行选项的中间结构，先收集再统一校验。"""
+
     provider: str = ""
     project_path: str = ""
     github_url: str = ""
@@ -98,6 +116,8 @@ class RunOptions:
 
 
 class RunRequestBuilder:
+    """负责解析 run 命令、校验参数、解析目标并生成 Agent API payload。"""
+
     def __init__(
         self,
         *,
@@ -115,6 +135,7 @@ class RunRequestBuilder:
         args: list[str],
         raw_args: str = "",
     ) -> tuple[ParsedRun | None, str | None]:
+        """解析 `/cloudcli run` 参数；成功返回 ParsedRun，失败返回用户可读错误。"""
         if not args:
             return None, self.usage()
 
@@ -125,6 +146,7 @@ class RunRequestBuilder:
         while index < len(args):
             token = args[index]
             if token == "--":
+                # `--` 后面的全部内容都视为任务描述，允许用户写以 -- 开头的自然语言。
                 message_start_index = index + 1
                 message_parts = args[index + 1 :]
                 break
@@ -166,6 +188,7 @@ class RunRequestBuilder:
         if not project_decision.allowed:
             return None, project_decision.message
         if project_decision.path:
+            # 权限层会把路径展开成绝对路径，传给 CloudCLI 时使用这个确定值。
             if isinstance(target, ProjectTarget):
                 target = ProjectTarget(project_decision.path)
             elif isinstance(target, SessionTarget):
@@ -202,6 +225,7 @@ class RunRequestBuilder:
         ), None
 
     def usage(self) -> str:
+        """返回 run 命令帮助文本。"""
         return (
             "用法：/cloudcli run [选项] <任务>\n"
             "选项：--project <path>、--github <url>、--session <sessionId>、"
@@ -214,6 +238,7 @@ class RunRequestBuilder:
         args: list[str],
         index: int,
     ) -> tuple[str | None, str, bool, str | None]:
+        """读取一个 `--name value` 或 `--name=value` 选项。"""
         token = args[index]
         raw = token[2:]
         if "=" in raw:
@@ -237,6 +262,7 @@ class RunRequestBuilder:
         return name, value, True, None
 
     def _apply_option(self, options: RunOptions, name: str, value: str) -> str | None:
+        """把单个选项写入 RunOptions；未知选项直接返回帮助错误。"""
         if name == "project":
             options.project_path = value
         elif name == "github":
@@ -263,6 +289,7 @@ class RunRequestBuilder:
         return None
 
     def _validate_options(self, options: RunOptions) -> str | None:
+        """统一校验选项组合和每个值的安全性。"""
         provider = options.provider
         if provider and provider not in RUN_PROVIDERS:
             return f"provider 不支持：{provider}。可选：claude、cursor、codex、gemini、opencode。"
@@ -297,6 +324,7 @@ class RunRequestBuilder:
         return None
 
     async def _resolve_target(self, user: UserRef, options: RunOptions) -> tuple[RunTarget | None, str | None]:
+        """解析任务目标；显式 project/github 优先，否则尝试使用 session。"""
         if options.project_path:
             return ProjectTarget(options.project_path), None
         if options.github_url:
@@ -307,6 +335,7 @@ class RunRequestBuilder:
             session_decision = self.authz.can_access_sessions(user)
             if not session_decision.allowed:
                 return None, "请通过 --project <path> 或 --github <url> 指定任务目标：" + session_decision.message
+            # 省略目标时只允许唯一绑定 session，避免把任务发到错误项目。
             session_ref, error = await self.sessions.infer_single_bound_session(user)
             if error:
                 return None, "请通过 --project <path>、--github <url> 或 --session <sessionId> 指定任务目标：" + error
@@ -314,6 +343,7 @@ class RunRequestBuilder:
         return await self._resolve_session_target(user, session_ref)
 
     async def _resolve_session_target(self, user: UserRef, session_ref: str) -> tuple[SessionTarget | None, str | None]:
+        """把 session 引用解析为 Agent API 需要的 sessionId、provider 和 projectPath。"""
         session_decision = self.authz.can_access_sessions(user)
         if not session_decision.allowed:
             return None, session_decision.message
@@ -338,6 +368,7 @@ class RunRequestBuilder:
         provider = str(resolved.get("provider") or "")
         project_path = str(resolved.get("projectPath") or "")
         if not project_path:
+            # Agent API 需要项目路径；旧缓存没有 projectPath 时尝试从最近 session 元数据补齐。
             session_meta = await self.sessions.find_recent_session(session_id)
             if not session_meta:
                 return None, "无法从 CloudCLI 最近 session 中找到该 session 的 projectPath，请改用 --project <path>。"
@@ -352,6 +383,7 @@ class RunRequestBuilder:
 
 
 def _raw_message_from_args(raw_args: str, message_start_index: int) -> str | None:
+    """从原始参数字符串中切出任务描述，保留用户输入的空白、引号和换行感。"""
     if not raw_args or message_start_index < 0:
         return None
     try:

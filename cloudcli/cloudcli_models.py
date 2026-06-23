@@ -1,3 +1,5 @@
+"""CloudCLI 响应模型和归一化函数。"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -6,6 +8,8 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RecentSession:
+    """插件内部使用的最近 session 统一结构。"""
+
     provider: str
     id: str
     summary: str = ""
@@ -15,11 +19,14 @@ class RecentSession:
     projectPath: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        """转成普通 dict，方便状态缓存和格式化函数处理。"""
         return asdict(self)
 
 
 @dataclass(frozen=True)
 class AbortSessionResult:
+    """中止 session 后的确认结果。"""
+
     session_id: str
     provider: str = ""
     confirmed_inactive: bool = False
@@ -31,6 +38,7 @@ def active_sessions_contains(
     session_id: str,
     provider: str = "",
 ) -> bool:
+    """在 CloudCLI 活跃 session 的多种响应形状中判断某个 session 是否仍存在。"""
     if not session_id:
         return False
     sessions = payload.get("sessions") if isinstance(payload, dict) else payload
@@ -40,6 +48,7 @@ def active_sessions_contains(
 
 
 def extract_recent_sessions(data: Any, limit: int) -> list[dict[str, Any]]:
+    """从项目列表响应中提取所有 provider 的最近 session，并按活动时间倒序截断。"""
     projects = _extract_project_items(data)
     if not isinstance(projects, list):
         raise ValueError("无法解析 CloudCLI 最近 session 响应。")
@@ -75,6 +84,7 @@ def extract_recent_sessions(data: Any, limit: int) -> list[dict[str, Any]]:
 
 
 def _extract_project_items(data: Any) -> Any:
+    """兼容 `{projects: [...]}`、`{data: [...]}`、`{items: [...]}` 和直接数组。"""
     if not isinstance(data, dict):
         return data
     for key in ("projects", "data", "items"):
@@ -84,6 +94,7 @@ def _extract_project_items(data: Any) -> Any:
 
 
 def _provider_session_fields() -> tuple[tuple[str, str], ...]:
+    """CloudCLI 不同 provider 在项目对象中的 session 字段名映射。"""
     return (
         ("claude", "sessions"),
         ("codex", "codexSessions"),
@@ -99,6 +110,7 @@ def _normalize_recent_session(
     project_name: str,
     project_path: str,
 ) -> RecentSession | None:
+    """把字符串或 dict 形态的 session 归一化为 RecentSession。"""
     if isinstance(session, str):
         session_id = session
         summary = ""
@@ -135,6 +147,7 @@ def _normalize_recent_session(
 
 
 def _session_items_contain(value: Any, session_id: str) -> bool:
+    """递归扫描嵌套 session 结构，兼容 dict/list/tuple/string。"""
     if isinstance(value, str):
         return value == session_id
     if isinstance(value, list):

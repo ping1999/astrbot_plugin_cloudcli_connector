@@ -1,3 +1,5 @@
+"""WebSocket 请求复用器：把异步消息流中的响应匹配回发起请求的协程。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,12 +14,14 @@ SendJson = Callable[[dict[str, Any]], Awaitable[None]]
 
 @dataclass
 class _RequestLockSlot:
+    """同一 request_key 的串行化锁，ref_count 用来在最后一个请求结束后回收锁。"""
+
     lock: asyncio.Lock
     ref_count: int = 0
 
 
 class WebSocketRequestMux:
-    """Match WebSocket responses to requests and serialize ambiguous request groups."""
+    """匹配 WebSocket 响应，并串行化无法区分的同类请求。"""
 
     def __init__(self) -> None:
         self._waiters: list[tuple[WaiterPredicate, asyncio.Future]] = []
@@ -32,6 +36,7 @@ class WebSocketRequestMux:
         timeout_seconds: int,
         request_key: str = "",
     ) -> dict[str, Any]:
+        """发送请求并等待响应；request_key 相同的请求会排队执行。"""
         if request_key:
             slot = self._request_locks.get(request_key)
             if slot is None:
@@ -66,6 +71,7 @@ class WebSocketRequestMux:
         send_json: SendJson,
         timeout_seconds: int,
     ) -> dict[str, Any]:
+        """注册等待者、发送 payload，然后等待第一条匹配 predicate 的消息。"""
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._waiters.append((predicate, future))
@@ -80,6 +86,7 @@ class WebSocketRequestMux:
             ]
 
     async def handle_message(self, data: dict[str, Any]) -> None:
+        """把收到的消息交给所有等待者，predicate 命中的 future 会被唤醒。"""
         matched_waiters: list[asyncio.Future] = []
         for predicate, future in list(self._waiters):
             if future.done():
@@ -99,6 +106,7 @@ class WebSocketRequestMux:
             ]
 
     def fail_waiters(self, exc: Exception) -> None:
+        """连接断开或关闭时，让所有等待中的请求立即失败。"""
         for _, future in self._waiters:
             if not future.done():
                 future.set_exception(exc)

@@ -1,3 +1,5 @@
+"""AstrBot 插件入口：把聊天命令连接到 CloudCLI 的会话、任务和审批能力。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -59,19 +61,25 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     "0.4.0",
 )
 class CloudCLIConnectorPlugin(Star):
+    """CloudCLI Connector 的组合根，负责装配服务并接入 AstrBot 生命周期。"""
+
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
+        """读取配置并创建插件运行所需的客户端、状态仓库、权限策略和命令路由。"""
         super().__init__(context)
         self.config = config or {}
         self.settings = load_connector_settings(self.config)
         self.authz = AuthorizationPolicy(self.settings)
+        # 审批通知和审批权限使用同一组访问配置，避免把工具输入推送给无权用户。
         self.approval_notifications = ApprovalNotificationPolicy(
             approval_allowed_user_keys=self.settings.approval_allowed_user_keys,
             approval_require_admin=self.settings.approval_require_admin,
             approval_access_mode=self.settings.approval_access_mode,
         )
+        # 所有本地状态统一写入插件数据目录，便于重启后恢复绑定、待审批和任务历史。
         self.state = PluginState(
             resolve_data_path(__file__, PLUGIN_NAME) / "state.json",
             persist_sensitive_state=self.settings.persist_sensitive_state,
+            exclusive_runtime_lock=True,
         )
         self.client = CloudCLIClient(
             self.settings.cloudcli,
@@ -103,6 +111,7 @@ class CloudCLIConnectorPlugin(Star):
         )
         self.run_service = RunService(
             settings=self.settings,
+            authz=self.authz,
             state=self.state,
             client=self.client,
             request_builder=self.run_request_builder,
@@ -122,6 +131,7 @@ class CloudCLIConnectorPlugin(Star):
         self.command_router = self.command_handlers.build_router()
 
     async def initialize(self) -> None:
+        """AstrBot 启动插件时调用：恢复状态、重建审批超时任务并按配置连接 CloudCLI。"""
         await self.state.load()
         interrupted = await self.state.mark_interrupted_runs(
             "AstrBot 插件重启，本地后台任务已中断。"
@@ -132,6 +142,7 @@ class CloudCLIConnectorPlugin(Star):
         self.client.start(auto_connect=self.settings.auto_connect)
 
     async def terminate(self) -> None:
+        """AstrBot 卸载插件时调用：取消后台任务、刷新状态文件并关闭网络连接。"""
         for task in list(self._background_tasks):
             task.cancel()
         for task in list(self._background_tasks):
@@ -139,12 +150,12 @@ class CloudCLIConnectorPlugin(Star):
                 await task
             except asyncio.CancelledError:
                 pass
-        await self.state.flush()
+        await self.state.close()
         await self.client.close()
 
     @filter.command("cloudcli")
     async def cloudcli(self, event: AstrMessageEvent):
-        """CloudCLI session and permission approval commands."""
+        """处理 `/cloudcli` 指令，并把异常脱敏后返回给聊天用户。"""
         user = await build_user_ref(event)
         await self.state.remember_user(user)
         try:
@@ -156,18 +167,22 @@ class CloudCLIConnectorPlugin(Star):
         yield event.plain_result(text)
 
     async def _dispatch(self, command: ParsedCommand, user: UserRef) -> str:
+        """把解析后的命令交给命令路由，让入口层只关心 AstrBot 事件适配。"""
         return await self.command_router.dispatch(command, user)
 
     async def _on_permission_request(self, approval: PendingApproval) -> None:
+        """CloudCLI WebSocket 收到权限请求后回调到审批服务。"""
         await self.approval_service.on_permission_request(approval)
 
     async def _send_proactive(self, unified_msg_origin: str, text: str) -> None:
+        """主动向最初绑定 session 的聊天会话推送审批或任务状态。"""
         try:
             session = MessageSession.from_str(unified_msg_origin)
         except Exception:  # noqa: BLE001
             logger.warning("Invalid unified_msg_origin: %s", unified_msg_origin)
             return
 
+        # AstrBot 的主动发送需要先找到匹配平台，再用保存下来的会话标识发送消息。
         chain = MessageChain().message(clip_text(text, self._max_push_text_length()))
         for platform in getattr(self.context.platform_manager, "platform_insts", []):
             try:
@@ -186,8 +201,10 @@ class CloudCLIConnectorPlugin(Star):
         logger.warning("No platform instance found for %s", unified_msg_origin)
 
     def _track_task(self, task: asyncio.Task) -> None:
+        """统一登记后台任务，方便插件退出时集中取消并等待清理。"""
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
     def _max_push_text_length(self) -> int:
+        """读取主动推送文本长度上限，集中封装方便未来改成动态配置。"""
         return self.settings.max_push_text_length

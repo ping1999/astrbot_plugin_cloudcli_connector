@@ -1,3 +1,5 @@
+"""CloudCLI agent 任务历史仓库。"""
+
 from __future__ import annotations
 
 import re
@@ -23,6 +25,8 @@ MAX_STORED_TEXT = 1200
 
 
 class RunRepository:
+    """只操作状态字典中的 `runs` 区域，不负责加锁和落盘。"""
+
     def __init__(self, data: dict[str, Any]) -> None:
         self.data = data
 
@@ -36,6 +40,7 @@ class RunRepository:
         max_history_per_user: int = DEFAULT_MAX_RUN_HISTORY_PER_USER,
         max_history_global: int = DEFAULT_MAX_RUN_HISTORY_GLOBAL,
     ) -> str:
+        """创建一条本地任务记录，并返回自增任务编号。"""
         run_id = str(_read_positive_int(self.data.get("next_run_id"), 1))
         self.data["next_run_id"] = int(run_id) + 1
         runs = _read_dict(self.data.get("runs"))
@@ -58,6 +63,7 @@ class RunRepository:
             "log": [],
             "summary": {},
         }
+        # 创建新任务时顺手裁剪历史，避免状态文件随着长期使用无限增长。
         self.prune(runs, max_history_per_user, max_history_global)
         self.data["runs"] = runs
         return run_id
@@ -74,6 +80,7 @@ class RunRepository:
         error: str | None = None,
         finished: bool = False,
     ) -> bool:
+        """更新任务状态、日志、sessionId、摘要或错误信息。"""
         if not RUN_ID_RE.fullmatch(run_id):
             return False
         runs = _read_dict(self.data.get("runs"))
@@ -93,6 +100,7 @@ class RunRepository:
         if event:
             log = _read_dict_list(item.get("log"))
             log.append({"ts": now, "text": safe_text(event, MAX_STORED_TEXT)})
+            # 只保留最近日志，完整输出不应无限写入本地状态文件。
             item["log"] = log[-MAX_RUN_LOG_ITEMS:]
         if finished:
             item["finished_at"] = now
@@ -102,6 +110,7 @@ class RunRepository:
         return True
 
     def prune_history(self, max_history_per_user: int, max_history_global: int) -> bool:
+        """按用户和全局上限裁剪已结束任务历史。"""
         runs = _read_dict(self.data.get("runs"))
         before = len(runs)
         self.prune(runs, max_history_per_user, max_history_global)
@@ -111,6 +120,7 @@ class RunRepository:
         return False
 
     def list_tasks(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
+        """列出当前用户在当前聊天 origin 可见的任务。"""
         runs = _read_dict(self.data.get("runs"))
         items = [
             dict(item)
@@ -123,6 +133,7 @@ class RunRepository:
         return items[: max(1, min(limit, 50))]
 
     def get_task(self, user: UserRef, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        """读取单个任务，并限制只能在发起任务的同一聊天会话中查看/操作。"""
         if not RUN_ID_RE.fullmatch(run_id):
             return None, "任务编号格式不合法。"
         item = _read_dict(self.data.get("runs")).get(run_id)
@@ -135,6 +146,7 @@ class RunRepository:
         return dict(item), None
 
     def mark_interrupted(self, reason: str) -> int:
+        """插件重启时把还在 running/queued/pending 的本地任务标成 interrupted。"""
         runs = _read_dict(self.data.get("runs"))
         now = time.time()
         changed = 0
@@ -156,6 +168,7 @@ class RunRepository:
         return changed
 
     def scrub_sensitive(self, omitted_text: str) -> None:
+        """关闭敏感状态持久化时，清除历史任务中的用户 prompt 和助手摘要。"""
         runs = _read_dict(self.data.get("runs"))
         for item in runs.values():
             if not isinstance(item, dict):
@@ -173,6 +186,7 @@ class RunRepository:
         max_history_per_user: int,
         max_history_global: int,
     ) -> None:
+        """在传入的 runs 字典上原地裁剪已结束任务。"""
         removable = [
             (str(run_id), item)
             for run_id, item in runs.items()
@@ -201,6 +215,7 @@ class RunRepository:
 
 
 def normalize_run_records(value: dict[str, Any]) -> dict[str, Any]:
+    """加载状态文件时清洗任务记录，丢弃非法 run_id 和异常字段。"""
     result: dict[str, Any] = {}
     for key, item in value.items():
         run_id = _read_str(key)
@@ -231,15 +246,18 @@ def normalize_run_records(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def guess_next_run_id(runs: dict[str, Any]) -> int:
+    """根据已有任务编号推断下一个自增 ID。"""
     ids = [int(key) for key in runs if isinstance(key, str) and RUN_ID_RE.fullmatch(key)]
     return max(ids, default=0) + 1
 
 
 def run_visible_in_origin(item: dict[str, Any], user: UserRef) -> bool:
+    """任务只能在创建它的聊天 origin 中查看和取消。"""
     return _read_str(item.get("origin")) == origin_key(user)
 
 
 def _normalize_run_log(value: Any) -> list[dict[str, Any]]:
+    """清洗任务日志并截断到最近 MAX_RUN_LOG_ITEMS 条。"""
     items: list[dict[str, Any]] = []
     for item in _read_dict_list(value):
         items.append(

@@ -1,3 +1,5 @@
+"""CloudCLI 协议公共工具：URL、鉴权头、有限读取和 SSE 解析。"""
+
 from __future__ import annotations
 
 import json
@@ -14,13 +16,16 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 MAX_ERROR_BODY_CHARS = 2000
 MAX_HTTP_RESPONSE_CHARS = 2_000_000
 MAX_SSE_EVENT_CHARS = 1_000_000
+MAX_WS_MESSAGE_CHARS = 1_000_000
 
 
 def build_api_url(base_url: str, path: str) -> str:
+    """把基础地址和 API 路径拼成 REST URL。"""
     return f"{base_url.rstrip('/')}{path}"
 
 
 def build_ws_url(base_url: str, _token: str = "") -> str:
+    """把 http/https 基础地址转换为 ws/wss 地址。"""
     split = urlsplit(base_url.rstrip("/"))
     scheme = "wss" if split.scheme == "https" else "ws"
     path = f"{split.path.rstrip('/')}/ws"
@@ -28,6 +33,7 @@ def build_ws_url(base_url: str, _token: str = "") -> str:
 
 
 def build_auth_headers(token: str, api_key: str) -> dict[str, str]:
+    """按 CloudCLI 约定生成 JWT 和 API key 请求头。"""
     headers: dict[str, str] = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -37,10 +43,12 @@ def build_auth_headers(token: str, api_key: str) -> dict[str, str]:
 
 
 def is_redirect_status(status: int) -> bool:
+    """判断 HTTP 状态码是否为 3xx 跳转。"""
     return 300 <= int(status) < 400
 
 
 def describe_redirect_response(response: Any) -> str:
+    """生成跳转错误摘要，并对 Location 中可能出现的凭据做脱敏。"""
     headers = getattr(response, "headers", {}) or {}
     location = headers.get("Location", "") if hasattr(headers, "get") else ""
     suffix = f" Location={redact_error_text(str(location))}" if location else ""
@@ -51,6 +59,7 @@ async def read_response_text_limited(
     response: Any,
     max_chars: int = MAX_HTTP_RESPONSE_CHARS,
 ) -> str:
+    """有限读取响应正文，避免错误页面或异常响应把内存打满。"""
     max_chars = max(1, int(max_chars))
     max_bytes = max_chars * 4
     body = bytearray()
@@ -71,11 +80,13 @@ async def read_response_json_limited(
     response: Any,
     max_chars: int = MAX_HTTP_RESPONSE_CHARS,
 ) -> Any:
+    """先按大小上限读取文本，再解析 JSON。"""
     text = await read_response_text_limited(response, max_chars)
     return json.loads(text) if text else None
 
 
 async def iter_sse(content: Any) -> AsyncIterator[dict[str, Any]]:
+    """逐块读取 SSE 流，按空行切分事件并限制单条事件大小。"""
     buffer = ""
     async for chunk in content.iter_any():
         if not chunk:
@@ -96,6 +107,7 @@ async def iter_sse(content: Any) -> AsyncIterator[dict[str, Any]]:
 
 
 def parse_sse_event(raw_event: str) -> dict[str, Any] | None:
+    """解析单条 SSE 事件；data 不是 JSON 时也包装成 content 文本。"""
     data_lines: list[str] = []
     event_name = ""
     for line in raw_event.replace("\r\n", "\n").split("\n"):
@@ -120,4 +132,5 @@ def parse_sse_event(raw_event: str) -> dict[str, Any] | None:
 
 
 def redact_error_text(value: str) -> str:
+    """对网络错误正文做统一脱敏和长度限制。"""
     return redact_text(value, MAX_ERROR_BODY_CHARS)

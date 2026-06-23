@@ -1,3 +1,5 @@
+"""CloudCLI agent 任务相关的聊天文本格式化。"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -19,6 +21,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 def format_agent_start_message(payload: dict[str, Any], run_id: str = "", text_limit: int = 1800) -> str:
+    """任务创建成功后返回给用户的启动摘要。"""
     target = payload.get("projectPath") or payload.get("githubUrl") or payload.get("sessionId") or "(unknown)"
     provider = payload.get("provider") or "claude"
     extras = []
@@ -38,6 +41,7 @@ def format_agent_start_message(payload: dict[str, Any], run_id: str = "", text_l
 
 
 def format_abort_result(result: Any, text_limit: int = 1800) -> str:
+    """把中止 session 的确认结果渲染成一句可读说明。"""
     session_id = read_str(getattr(result, "session_id", ""))
     provider = read_str(getattr(result, "provider", ""))
     provider_text = f" provider={provider}" if provider else ""
@@ -55,6 +59,7 @@ def format_abort_result(result: Any, text_limit: int = 1800) -> str:
 
 
 def format_agent_status(event: dict[str, Any], text_limit: int) -> str:
+    """挑选值得主动推送的流式事件，普通内容事件由任务日志保存即可。"""
     event_type = str(event.get("type") or event.get("event") or "")
     if event_type == "session-id":
         return clip_text(f"CloudCLI 任务 session：{event.get('sessionId')}", text_limit)
@@ -74,6 +79,7 @@ def format_agent_status(event: dict[str, Any], text_limit: int) -> str:
 
 
 def format_agent_final(summary: dict[str, Any], text_limit: int) -> str:
+    """任务结束时生成最终摘要，包括 session、项目、分支、PR、错误和助手文本。"""
     status = "完成" if not summary.get("errors") else "结束但有错误"
     lines = [f"CloudCLI 任务{status}。"]
     if summary.get("sessionId"):
@@ -98,6 +104,7 @@ def format_agent_final(summary: dict[str, Any], text_limit: int) -> str:
 
 
 def format_run_tasks(tasks: list[dict[str, Any]], limit: int, text_limit: int = 1800) -> str:
+    """渲染当前用户在当前聊天会话中可见的任务列表。"""
     if not tasks:
         return "当前用户还没有 CloudCLI 任务。"
     lines = ["CloudCLI 任务："]
@@ -114,6 +121,7 @@ def format_run_tasks(tasks: list[dict[str, Any]], limit: int, text_limit: int = 
 
 
 def format_run_log(task: dict[str, Any], text_limit: int) -> str:
+    """渲染单个任务的关键信息和最近日志。"""
     run_id = task.get("id") or "?"
     status = task.get("status") or "unknown"
     lines = [f"CloudCLI 任务 #{run_id} 日志："]
@@ -140,6 +148,7 @@ def format_run_log(task: dict[str, Any], text_limit: int) -> str:
 
 
 def extract_agent_text(event: dict[str, Any]) -> str:
+    """从流式事件中提取可保存的助手正文，过滤 thinking/status/tool 这类噪声。"""
     event_type = str(event.get("type") or event.get("event") or "")
     if event_type in {"content", "text"}:
         return read_str(event.get("content") or event.get("text"))

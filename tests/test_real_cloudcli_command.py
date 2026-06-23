@@ -1,3 +1,5 @@
+"""可选的 CloudCLI 实机命令测试：默认只跑安全离线回归，真实请求需在 config.yaml 显式开启。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +33,7 @@ except ModuleNotFoundError as exc:
 
 
 def load_config(path: Path) -> dict[str, Any]:
+    """读取 tests/config.yaml；缺文件时返回空配置，让真实 CloudCLI 测试自动跳过。"""
     if not path.exists():
         return {}
     try:
@@ -50,6 +53,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def load_simple_yaml(path: Path) -> dict[str, str]:
+    """在未安装 PyYAML 时解析最简单的 `key: value` 配置文件。"""
     data: dict[str, str] = {}
     for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         line = raw_line.strip()
@@ -66,6 +70,7 @@ def load_simple_yaml(path: Path) -> dict[str, str]:
 
 
 def parse_simple_yaml_value(value: str) -> str:
+    """解析简单 YAML 值，支持引号和行尾注释。"""
     if " #" in value and not value.startswith(("'", '"')):
         value = value.split(" #", 1)[0].rstrip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -85,6 +90,7 @@ PRINT_OUTPUT_LIMIT = int(
 
 
 def install_fake_astrbot_modules() -> None:
+    """安装一组最小 AstrBot 假模块，让插件能在普通 Python 环境中导入。"""
     astrbot_mod = types.ModuleType("astrbot")
     api_mod = types.ModuleType("astrbot.api")
     event_mod = types.ModuleType("astrbot.api.event")
@@ -96,47 +102,69 @@ def install_fake_astrbot_modules() -> None:
     session_mod = types.ModuleType("astrbot.core.platform.message_session")
 
     class FakeLogger:
+        """测试用 logger，直接把警告输出到控制台便于调试。"""
+
         def warning(self, *args: Any, **_kwargs: Any) -> None:
+            """记录 warning 日志。"""
             print("[warning]", *args)
 
         def exception(self, *args: Any, **_kwargs: Any) -> None:
+            """记录 exception 日志。"""
             print("[exception]", *args)
 
     class FakeFilter:
+        """模拟 AstrBot 的命令装饰器。"""
+
         @staticmethod
         def command(_name: str):
+            """返回不改变函数本身的装饰器。"""
             def decorator(func):
+                """保持被装饰函数原样返回。"""
                 return func
 
             return decorator
 
     class FakeStar:
+        """模拟 AstrBot Star 基类，只保存 context。"""
+
         def __init__(self, context: Any) -> None:
             self.context = context
 
     class FakeContext:
+        """占位 Context 类型，供类型导入使用。"""
+
         pass
 
     class FakeMessageChain:
+        """模拟 AstrBot MessageChain，测试只关心最终文本。"""
+
         def __init__(self) -> None:
+            """初始化空消息文本。"""
             self.text = ""
 
         def message(self, text: str):
+            """追加文本并返回自身，模拟链式 API。"""
             self.text += text
             return self
 
     class FakeMessageSession:
+        """模拟主动推送所需的 MessageSession。"""
+
         def __init__(self, platform_id: str, raw: str = "") -> None:
+            """保存平台 ID 和原始 origin 字符串。"""
             self.platform_id = platform_id
             self.raw = raw
 
         @classmethod
         def from_str(cls, value: str):
+            """从 unified_msg_origin 中解析平台 ID。"""
             platform_id = value.split(":", 1)[0] if ":" in value else value
             return cls(platform_id or "test", value)
 
     def register(*_args: Any, **_kwargs: Any):
+        """模拟插件注册装饰器，直接返回原类。"""
         def decorator(cls):
+            """保持插件类原样返回。"""
             return cls
 
         return decorator
@@ -176,35 +204,48 @@ from security.run_validation import looks_like_github_url  # noqa: E402
 
 
 class FakePlatformMeta:
+    """测试平台元数据，平台 ID 固定为 test。"""
+
     id = "test"
 
 
 class FakePlatform:
+    """模拟 AstrBot 平台实例，把主动推送写入 outbox。"""
+
     def __init__(self, outbox: list[str], sent_origins: list[str]) -> None:
         self.outbox = outbox
         self.sent_origins = sent_origins
 
     def meta(self) -> FakePlatformMeta:
+        """返回平台元数据。"""
         return FakePlatformMeta()
 
     async def send_by_session(self, session: Any, chain: Any) -> None:
+        """记录主动推送文本和目标 origin。"""
         self.outbox.append(getattr(chain, "text", str(chain)))
         self.sent_origins.append(getattr(session, "raw", ""))
 
 
 class FakePlatformManager:
+    """模拟 AstrBot platform_manager，包含一个 FakePlatform。"""
+
     def __init__(self, outbox: list[str], sent_origins: list[str]) -> None:
+        """把共享 outbox 交给平台实例。"""
         self.platform_insts = [FakePlatform(outbox, sent_origins)]
 
 
 class FakeContext:
+    """插件测试上下文，收集主动推送的文本和目标会话。"""
+
     def __init__(self) -> None:
+        """创建主动推送收件箱和 fake platform manager。"""
         self.outbox: list[str] = []
         self.sent_origins: list[str] = []
         self.platform_manager = FakePlatformManager(self.outbox, self.sent_origins)
 
 
 def setting(config_key: str | tuple[str, ...], default: str = "") -> str:
+    """读取测试配置；支持多个候选 key 以兼容旧配置名。"""
     keys = (config_key,) if isinstance(config_key, str) else config_key
     for key in keys:
         value = CONFIG.get(key)
@@ -214,15 +255,18 @@ def setting(config_key: str | tuple[str, ...], default: str = "") -> str:
 
 
 def bool_setting(config_key: str | tuple[str, ...], default: bool = False) -> bool:
+    """按常见布尔字符串读取测试开关。"""
     value = setting(config_key, "true" if default else "false")
     return value.lower() in {"1", "true", "yes", "on"}
 
 
 def real_cloudcli_enabled() -> bool:
+    """是否允许本文件中的真实 CloudCLI 请求测试运行。"""
     return bool_setting("real_enabled")
 
 
 def has_real_cloudcli_config() -> bool:
+    """真实测试需要 real_enabled=true 且配置 JWT 或用户名密码。"""
     if not real_cloudcli_enabled():
         return False
     has_token = bool(setting(("jwt_token", "cloudcli_jwt_token")))
@@ -234,12 +278,14 @@ def has_real_cloudcli_config() -> bool:
 
 
 def safe_print(text: str) -> None:
+    """按当前终端编码安全输出测试日志，避免 Windows 控制台编码异常。"""
     encoding = sys.stdout.encoding or "utf-8"
     safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
     print(safe_text)
 
 
 def format_command_output(command: str, result: str) -> str:
+    """把一条测试命令和响应格式化为可读日志，并按配置裁剪输出。"""
     rendered = result
     if PRINT_OUTPUT_LIMIT > 0 and len(rendered) > PRINT_OUTPUT_LIMIT:
         rendered = rendered[:PRINT_OUTPUT_LIMIT] + f"\n... truncated {len(result) - PRINT_OUTPUT_LIMIT} chars"
@@ -247,6 +293,7 @@ def format_command_output(command: str, result: str) -> str:
 
 
 def plugin_config(**overrides: Any) -> dict[str, Any]:
+    """构造插件配置，默认关闭自动连接和超时审批，测试按需覆盖。"""
     config = {
         "cloudcli_base_url": setting("base_url", "http://127.0.0.1:13002"),
         "cloudcli_jwt_token": setting(("jwt_token", "cloudcli_jwt_token")),
@@ -275,7 +322,10 @@ def plugin_config(**overrides: Any) -> dict[str, Any]:
 
 
 class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
+    """模拟 AstrBot 中的 `/cloudcli` 命令流，并可选连接真实 CloudCLI。"""
+
     async def asyncSetUp(self) -> None:
+        """为每个测试创建隔离的数据目录、插件实例和管理员测试用户。"""
         self.temp_dir = tempfile.TemporaryDirectory()
         self._old_data_path = os.environ.get("ASTRBOT_DATA_PATH")
         os.environ["ASTRBOT_DATA_PATH"] = self.temp_dir.name
@@ -294,6 +344,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         await self.plugin.state.remember_user(self.user)
 
     async def asyncTearDown(self) -> None:
+        """关闭插件并恢复 ASTRBOT_DATA_PATH。"""
         await self.plugin.terminate()
         if self._old_data_path is None:
             os.environ.pop("ASTRBOT_DATA_PATH", None)
@@ -302,12 +353,14 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         self.temp_dir.cleanup()
 
     async def command(self, text: str) -> str:
+        """直接调用插件路由执行一条 `/cloudcli` 命令，并打印可读输出。"""
         parsed = parse_command(text)
         result = await self.plugin._dispatch(parsed, self.user)
         safe_print(format_command_output(text, result))
         return result
 
     async def pick_session_id(self) -> str:
+        """优先使用配置的 session_id，否则从真实 CloudCLI 最近 session 中挑一个。"""
         configured = setting("session_id")
         if configured:
             return configured
@@ -321,6 +374,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         return str(sessions[0]["id"])
 
     def test_security_regression_redaction_and_url_validation(self) -> None:
+        """离线安全回归：脱敏函数和 GitHub URL 白名单不依赖真实 CloudCLI。"""
         rendered = redact_text('{"api_key": "secret-value", "password": "pw-value"}')
         self.assertIn("[redacted]", rendered)
         self.assertNotIn("secret-value", rendered)
@@ -332,6 +386,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(looks_like_github_url("https://example.com/repo"))
 
     async def test_security_regression_approval_push_targeting_and_redaction(self) -> None:
+        """离线安全回归：审批详情只推给允许用户，且工具输入中的 secret 会被脱敏。"""
         strict_context = FakeContext()
         strict_plugin = CloudCLIConnectorPlugin(
             strict_context,
@@ -343,6 +398,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         )
         await strict_plugin.initialize()
         try:
+            # 未进入审批白名单时，即使用户是管理员且绑定了 session，也不应收到详细工具输入。
             strict_user = UserRef(
                 user_key="test:strict-admin",
                 display_name="Strict Admin",
@@ -383,6 +439,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         )
         await allow_plugin.initialize()
         try:
+            # 明确白名单用户可以收到审批详情，但消息内容仍需要通过 redaction。
             allow_user = UserRef(
                 user_key="test:allowlisted",
                 display_name="Allowlisted User",
@@ -415,6 +472,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
             await allow_plugin.terminate()
 
     async def test_security_regression_project_path_realpath_rejects_symlink_escape(self) -> None:
+        """离线安全回归：allowed_project_roots 要按真实路径拒绝符号链接逃逸。"""
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             allowed = base / "allowed"
@@ -446,6 +504,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("projectPath 不在 allowed_project_roots", path_error)
 
     async def test_real_cloudcli_command_flow(self) -> None:
+        """真实 CloudCLI 烟测：覆盖 help/status/session/bind/chat/pending/audit/unbind。"""
         if not has_real_cloudcli_config():
             self.skipTest(
                 "Set real_enabled=true plus jwt_token or username/password in tests/config.yaml "
@@ -484,6 +543,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
             session_id = configured_session_id
             bind_ref = configured_session_id
         else:
+            # 没显式配置 session_id 时，使用 `/cloudcli session` 缓存的第一个最近 session。
             resolved, error = await self.plugin.state.resolve_session_ref(self.user, "1")
             if error or not resolved:
                 self.fail(error or "无法从 /cloudcli session 结果中解析第 1 个 session。")
@@ -539,12 +599,14 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         parsed = parse_command("/cloudcli allow")
         blocked_allow = await self.plugin._dispatch(parsed, non_admin_user)
         safe_print(format_command_output("/cloudcli allow (non-admin)", blocked_allow))
+        # 真实环境测试也顺手确认非管理员无法直接审批。
         self.assertIn("没有权限审批", blocked_allow)
 
         unbind_text = await self.command(f"/cloudcli unbind {session_id}")
         self.assertIn("已解绑 session", unbind_text)
 
     async def test_real_cloudcli_run_command_when_enabled(self) -> None:
+        """可选真实 run 测试：需要 run_enabled=true，并会实际启动 CloudCLI agent 任务。"""
         if not bool_setting("run_enabled"):
             self.skipTest("Set run_enabled=true in tests/config.yaml to run /cloudcli run against real CloudCLI.")
         if not has_real_cloudcli_config():
@@ -582,6 +644,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"任务 #{task_id} 日志", run_log_text)
 
         if bool_setting("run_cancel_enabled"):
+            # run_cancel_enabled 用于验证取消路径；默认不取消，等待任务自然结束并检查主动推送。
             cancel_text = await self.command(f"/cloudcli run cancel {task_id}")
             self.assertTrue(
                 "已取消 CloudCLI 任务" in cancel_text or "已经是" in cancel_text,
@@ -603,6 +666,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"任务 #{task_id} 日志", final_log_text)
 
     async def test_real_cloudcli_stop_command_when_enabled(self) -> None:
+        """可选真实 stop 测试：需要 stop_enabled=true，会向真实 CloudCLI 发送 abort-session。"""
         if not bool_setting("stop_enabled"):
             self.skipTest("Set stop_enabled=true in tests/config.yaml to send abort-session to real CloudCLI.")
         if not has_real_cloudcli_config():
@@ -620,6 +684,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
 
 
 def extract_task_id(text: str) -> str:
+    """从启动消息中的 `task=#N` 提取本地任务编号。"""
     match = re.search(r"task=#(\d+)", text)
     return match.group(1) if match else ""
 

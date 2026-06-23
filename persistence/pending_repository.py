@@ -1,3 +1,5 @@
+"""待审批权限请求的状态仓库。"""
+
 from __future__ import annotations
 
 import time
@@ -33,10 +35,13 @@ PENDING_UNCONFIRMED_FIELDS = (
 
 
 class PendingApprovalRepository:
+    """只操作状态字典中的 `pending` 区域，不负责加锁和落盘。"""
+
     def __init__(self, data: dict[str, Any]) -> None:
         self.data = data
 
     def upsert(self, approval: PendingApproval) -> bool:
+        """新增或更新一条待审批请求，同时保留已有 claim/unconfirmed 状态。"""
         pending = _read_dict(self.data.get("pending"))
         key = pending_storage_key(approval.session_id, approval.request_id)
         if not key:
@@ -46,6 +51,7 @@ class PendingApprovalRepository:
         return True
 
     def remove(self, session_id: str, request_id: str) -> bool:
+        """移除已处理或远端已消失的待审批请求。"""
         pending = _read_dict(self.data.get("pending"))
         key = pending_storage_key(session_id, request_id)
         existed = bool(key and key in pending)
@@ -54,12 +60,14 @@ class PendingApprovalRepository:
         return existed
 
     def get(self, session_id: str, request_id: str) -> PendingApproval | None:
+        """读取单条待审批请求。"""
         item = _read_dict(self.data.get("pending")).get(
             pending_storage_key(session_id, request_id)
         )
         return pending_from_record(item)
 
     def list(self) -> list[PendingApproval]:
+        """列出所有未 resolved 的待审批请求。"""
         approvals = []
         for item in _read_dict(self.data.get("pending")).values():
             approval = pending_from_record(item)
@@ -69,6 +77,7 @@ class PendingApprovalRepository:
         return approvals
 
     def merge(self, approvals: list[PendingApproval]) -> None:
+        """把一批远端审批合并进本地缓存，不删除本地已有项。"""
         pending = _read_dict(self.data.get("pending"))
         for approval in approvals:
             key = pending_storage_key(approval.session_id, approval.request_id)
@@ -83,6 +92,7 @@ class PendingApprovalRepository:
         *,
         preserve_unconfirmed: bool = True,
     ) -> list[str]:
+        """用远端结果替换某个 session 的待审批列表，并返回被删除的 storage key。"""
         if not is_valid_session_id(session_id):
             return []
         pending = _read_dict(self.data.get("pending"))
@@ -96,6 +106,7 @@ class PendingApprovalRepository:
             if not isinstance(item, dict):
                 continue
             if _read_str(item.get("session_id")) == session_id and key not in incoming:
+                # 远端已经没有这条审批，本地也要删掉并取消对应超时任务。
                 removed.append(key)
                 pending.pop(key, None)
         for key, approval in incoming.items():
@@ -109,6 +120,7 @@ class PendingApprovalRepository:
         return removed
 
     def visible_for_bindings(self, bindings: list[str], max_items: int) -> list[PendingApproval]:
+        """筛出当前用户绑定 session 中可见的待审批请求。"""
         if not bindings:
             return []
         approvals = []
@@ -133,6 +145,7 @@ class PendingApprovalRepository:
         actor: str,
         action: str,
     ) -> tuple[PendingApproval | None, str | None]:
+        """占用一条审批请求，防止并发 allow/deny 或超时 worker 重复处理。"""
         pending = _read_dict(self.data.get("pending"))
         key = pending_storage_key(session_id, request_id)
         item = pending.get(key)
@@ -143,6 +156,7 @@ class PendingApprovalRepository:
         if claimed_by:
             return None, "该审批请求正在被处理，请稍后执行 /cloudcli pending 刷新。"
         if isinstance(item, dict) and _read_str(item.get("decision_unconfirmed_by")):
+            # 发送结果后未确认时不能再次处理，否则可能向 CloudCLI 发送两次冲突决定。
             return (
                 None,
                 "该审批决定已经发送但尚未确认；请先执行 /cloudcli pending 刷新远端状态后再重试。",
@@ -155,6 +169,7 @@ class PendingApprovalRepository:
         return approval, None
 
     def release_claim(self, session_id: str, request_id: str, actor: str) -> bool:
+        """处理失败或提醒结束后释放当前 actor 的 claim。"""
         pending = _read_dict(self.data.get("pending"))
         key = pending_storage_key(session_id, request_id)
         item = pending.get(key)
@@ -177,6 +192,7 @@ class PendingApprovalRepository:
         action: str,
         error: str,
     ) -> bool:
+        """标记审批决定已发送但远端未确认，等待用户刷新远端状态。"""
         pending = _read_dict(self.data.get("pending"))
         key = pending_storage_key(session_id, request_id)
         item = pending.get(key)
@@ -194,6 +210,7 @@ class PendingApprovalRepository:
 
 
 def pending_from_record(item: Any) -> PendingApproval | None:
+    """把状态文件中的 dict 还原为 PendingApproval。"""
     if not isinstance(item, dict) or item.get("resolved") is True:
         return None
     session_id = _read_str(item.get("session_id"))
@@ -217,6 +234,7 @@ def pending_record(
     preserve_claim: bool = True,
     preserve_unconfirmed: bool = True,
 ) -> dict[str, Any]:
+    """把 PendingApproval 转成可落盘记录，并按需保留处理中状态。"""
     record = {
         "request_id": approval.request_id,
         "session_id": approval.session_id,
@@ -238,6 +256,7 @@ def pending_record(
 
 
 def normalize_pending_records(value: dict[str, Any]) -> dict[str, Any]:
+    """加载状态文件时清洗 pending 记录，丢弃非法键和值。"""
     result: dict[str, Any] = {}
     for key, item in value.items():
         if not isinstance(item, dict):

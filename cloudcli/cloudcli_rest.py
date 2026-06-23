@@ -1,3 +1,5 @@
+"""CloudCLI REST 客户端：读取项目最近 session 和 session 历史消息。"""
+
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
@@ -33,6 +35,8 @@ ApiUrl = Callable[[str], str]
 
 
 class CloudCLIRestClient:
+    """封装需要短请求/JSON 响应的 CloudCLI REST API。"""
+
     def __init__(
         self,
         *,
@@ -47,6 +51,7 @@ class CloudCLIRestClient:
         self.api_url = api_url
 
     async def get_recent_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
+        """读取最近 session 并归一化成统一字段，供绑定和展示使用。"""
         token = await self.auth.get_token()
         headers = self.auth.headers(token)
         params = {
@@ -72,6 +77,7 @@ class CloudCLIRestClient:
         limit: int = 20,
         offset: int = 0,
     ) -> dict[str, Any]:
+        """读取指定 session 的历史消息；兼容服务端返回 list 或分页 dict。"""
         token = await self.auth.get_token()
         params: dict[str, str] = {}
         if limit >= 0:
@@ -103,6 +109,7 @@ class CloudCLIRestClient:
         params: dict[str, str],
         headers: dict[str, str],
     ) -> Any:
+        """GET JSON；如果 JWT 失效且有用户名密码，就重新登录后再试一次。"""
         data, unauthorized = await self._get_json(path, params, headers)
         if not unauthorized:
             return data
@@ -122,6 +129,7 @@ class CloudCLIRestClient:
         params: dict[str, str],
         headers: dict[str, str],
     ) -> tuple[Any, bool]:
+        """执行单次 REST GET；返回 `(data, unauthorized)` 让上层决定是否刷新认证。"""
         session = await self.ensure_session()
         async with session.get(
             self.api_url(path),

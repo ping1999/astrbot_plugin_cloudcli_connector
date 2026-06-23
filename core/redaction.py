@@ -1,3 +1,5 @@
+"""错误日志和用户可见文本的敏感信息脱敏工具。"""
+
 from __future__ import annotations
 
 import re
@@ -33,6 +35,7 @@ _SECRET_SUBSTITUTIONS = (
 
 
 def redact_text(value: str, max_chars: int = DEFAULT_MAX_REDACTED_TEXT_CHARS) -> str:
+    """隐藏常见 token、密码、API key 等字段，并限制最终文本长度。"""
     if not value:
         return ""
     text = value
@@ -44,5 +47,6 @@ def redact_text(value: str, max_chars: int = DEFAULT_MAX_REDACTED_TEXT_CHARS) ->
 
 
 def redact_exception_text(exc: BaseException, max_chars: int = 8000) -> str:
+    """渲染异常堆栈后统一脱敏，适合写入日志。"""
     rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return redact_text(rendered, max_chars)

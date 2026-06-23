@@ -1,3 +1,5 @@
+"""聊天输出格式化的公共工具：负责截断、脱敏和从松散 JSON 中提取文本。"""
+
 from __future__ import annotations
 
 import json
@@ -34,6 +36,7 @@ run 选项：--project <path>、--github <url>、--session <sessionId>、--provi
 
 
 def clip_text(text: str, limit: int) -> str:
+    """按聊天推送长度限制裁剪文本，并在裁剪前先做敏感信息脱敏。"""
     if limit < 20:
         limit = 20
     text = redact_text(text, limit)
@@ -43,10 +46,12 @@ def clip_text(text: str, limit: int) -> str:
 
 
 def read_str(value: Any) -> str:
+    """只接受真实字符串，避免把 dict/list 之类误拼到用户消息里。"""
     return value if isinstance(value, str) else ""
 
 
 def read_int(value: Any, default: int) -> int:
+    """宽松读取整数；字段缺失或类型不对时回退默认值。"""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -54,6 +59,7 @@ def read_int(value: Any, default: int) -> int:
 
 
 def render_compact_json(value: Any) -> str:
+    """把常见对象渲染成一行摘要，例如 PR URL、编号或名称。"""
     if isinstance(value, dict):
         for key in ("url", "html_url"):
             if value.get(key):
@@ -66,6 +72,7 @@ def render_compact_json(value: Any) -> str:
 
 
 def render_input(value: Any) -> str:
+    """把工具输入或未知对象渲染为可读文本，供审批和日志展示。"""
     if value is None:
         return "(empty)"
     if isinstance(value, str):
@@ -77,6 +84,7 @@ def render_input(value: Any) -> str:
 
 
 def extract_text(value: Any) -> str:
+    """从 OpenAI/Claude 风格的多种响应结构里提取最像正文的文本。"""
     if value is None:
         return ""
     if isinstance(value, str):

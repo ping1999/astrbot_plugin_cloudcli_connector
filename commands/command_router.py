@@ -1,3 +1,5 @@
+"""轻量命令路由：根据解析出的子命令选择对应 handler。"""
+
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
@@ -17,6 +19,8 @@ ParsedCommandHandler = Callable[[UserRef, ParsedCommand], Awaitable[str]]
 
 @dataclass(frozen=True)
 class CommandRoute:
+    """描述一条子命令路由及其参数约束。"""
+
     handler: CommandHandler | ParsedCommandHandler
     usage: str = ""
     no_args: bool = False
@@ -24,6 +28,8 @@ class CommandRoute:
 
 
 class CommandRouter:
+    """统一处理帮助、未知命令、参数数量错误和 handler 调用。"""
+
     def __init__(
         self,
         *,
@@ -36,6 +42,7 @@ class CommandRouter:
         self.help_names = help_names or {"", "help", "-h", "--help"}
 
     async def dispatch(self, command: ParsedCommand, user: UserRef) -> str:
+        """执行一条解析后的命令，返回最终要发送到聊天里的文本。"""
         if command.name in self.help_names:
             return self.help_text
 

@@ -1,3 +1,5 @@
+"""插件范围内共享的常量。"""
+
 from __future__ import annotations
 
 

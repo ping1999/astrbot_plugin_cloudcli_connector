@@ -1,3 +1,5 @@
+"""审批服务：同步待审批权限、发送 allow/deny 决定、处理超时和审计。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -34,10 +36,14 @@ logger = logging.getLogger(__name__)
 
 
 class _DecisionSentUnconfirmed(Exception):
+    """审批决定已发出，但无法确认远端是否成功处理。"""
+
     pass
 
 
 class ApprovalService:
+    """围绕 PendingApproval 的业务服务，负责用户命令和后台超时任务。"""
+
     timeout_deny_max_attempts = 3
     timeout_deny_retry_initial_seconds = 5.0
     timeout_deny_retry_max_seconds = 60.0
@@ -54,6 +60,7 @@ class ApprovalService:
         send_proactive: SendProactive,
         track_task: TrackTask,
     ) -> None:
+        """注入状态仓库、CloudCLI 客户端和主动推送函数。"""
         self.settings = settings
         self.state = state
         self.client = client
@@ -63,10 +70,12 @@ class ApprovalService:
         self.timeout_tasks: dict[str, asyncio.Task] = {}
 
     async def restore_timeouts(self) -> None:
+        """插件重启后，为本地仍存在的待审批请求重新安排超时处理。"""
         for approval in await self.state.list_pending():
             self.schedule_timeout(approval)
 
     async def handle_pending(self, user: UserRef) -> str:
+        """刷新用户已绑定 session 的远端待审批列表，并展示当前可见项。"""
         bindings = await self.state.list_bindings(user)
         if not bindings:
             return "当前用户没有绑定 session，请先使用 /cloudcli bind <sessionId>。"
@@ -87,6 +96,7 @@ class ApprovalService:
         return body
 
     async def handle_allow(self, user: UserRef, args: list[str]) -> str:
+        """处理 `/cloudcli allow [序号]`，成功后移除本地待审批并写审计。"""
         if len(args) > 1:
             return "用法：/cloudcli allow [序号]"
         request_no, error = parse_optional_request_no(args)
@@ -97,6 +107,7 @@ class ApprovalService:
             return error
         assert approval is not None
         try:
+            # 先发送，再通过远端 pending 列表确认它已经消失，降低“本地删了但远端还等着”的风险。
             await self._send_permission_decision_confirmed(approval, True)
             await self.state.remove_pending(approval.session_id, approval.request_id)
             self.cancel_timeout(approval)
@@ -108,6 +119,7 @@ class ApprovalService:
             )
             return f"已允许：{approval.tool_name} ({approval.session_id})"
         except _DecisionSentUnconfirmed as exc:
+            # 决定可能已被远端收到，不能简单释放给用户再次点击；标记为 unconfirmed 等刷新确认。
             await self.state.mark_pending_decision_unconfirmed(
                 approval.session_id,
                 approval.request_id,
@@ -142,6 +154,7 @@ class ApprovalService:
             raise
 
     async def handle_deny(self, user: UserRef, args: list[str]) -> str:
+        """处理 `/cloudcli deny [序号] <原因>`，原因会同步给 CloudCLI 并写入审计。"""
         if not args:
             return "用法：/cloudcli deny [序号] <原因>"
 
@@ -162,6 +175,7 @@ class ApprovalService:
             return error
         assert approval is not None
         try:
+            # deny 和 allow 一样需要确认远端 pending 已消失。
             await self._send_permission_decision_confirmed(
                 approval,
                 False,
@@ -214,6 +228,7 @@ class ApprovalService:
             raise
 
     async def handle_audit(self, user: UserRef, args: list[str]) -> str:
+        """查看当前用户和当前会话可见的审批审计记录。"""
         if len(args) > 1:
             return "用法：/cloudcli audit [数量]"
         limit = 10
@@ -228,6 +243,7 @@ class ApprovalService:
         )
 
     async def on_permission_request(self, approval: PendingApproval) -> None:
+        """WebSocket 收到新权限请求时写入本地状态、安排超时并通知相关绑定用户。"""
         await self.state.upsert_pending(approval)
         self.schedule_timeout(approval)
         targets = self._approval_detail_targets(
@@ -242,6 +258,7 @@ class ApprovalService:
         await self._send_to_targets(targets, text)
 
     def schedule_timeout(self, approval: PendingApproval) -> None:
+        """为一条审批请求安排超时提醒或自动拒绝任务。"""
         timeout_seconds = self.settings.approval_timeout_seconds
         if timeout_seconds <= 0:
             return
@@ -252,6 +269,7 @@ class ApprovalService:
         if existing and not existing.done():
             return
         elapsed = max(0.0, time.time() - float(approval.received_at or time.time()))
+        # 重启恢复时要扣掉已经等待过的时间，而不是重新从完整 timeout 开始。
         delay_seconds = max(0.0, timeout_seconds - elapsed)
         task = asyncio.create_task(
             self._timeout_worker(
@@ -268,6 +286,7 @@ class ApprovalService:
         self.track_task(task)
 
     def cancel_timeout(self, approval: PendingApproval | str) -> None:
+        """审批被处理或远端已消失时取消本地超时任务。"""
         if isinstance(approval, PendingApproval):
             approval_key = pending_storage_key(approval.session_id, approval.request_id)
         else:
@@ -282,6 +301,7 @@ class ApprovalService:
         *,
         clear_unconfirmed: bool = False,
     ) -> str:
+        """从 CloudCLI 拉取每个绑定 session 的待审批列表，并同步到本地缓存。"""
         async def fetch_one(session_id: str) -> tuple[str, list[PendingApproval], str]:
             try:
                 return session_id, await self.client.get_pending_permissions(session_id), ""
@@ -299,6 +319,7 @@ class ApprovalService:
                 approvals,
                 preserve_unconfirmed=not clear_unconfirmed,
             )
+            # 远端已不存在的审批不再需要本地超时 worker。
             for approval_key in removed:
                 self.cancel_timeout(approval_key)
             for approval in approvals:
@@ -311,6 +332,7 @@ class ApprovalService:
         request_no: int | None,
         action: str,
     ) -> tuple[PendingApproval | None, str | None]:
+        """刷新后尝试占用一条可见审批，防止多人或多次命令同时处理同一请求。"""
         bindings = await self.state.list_bindings(user)
         if not bindings:
             return None, "当前用户没有绑定 session，请先使用 /cloudcli bind <sessionId>。"
@@ -331,6 +353,7 @@ class ApprovalService:
         delay_seconds: float,
         timeout_seconds: int,
     ) -> None:
+        """审批超时后台任务：按配置提醒或自动拒绝。"""
         actor = "system"
         action = self.settings.approval_timeout_action
         claimed_approval: PendingApproval | None = None
@@ -360,6 +383,7 @@ class ApprovalService:
                         targets,
                     )
                     claimed_approval = None
+                    # 自动拒绝失败时按指数退避重试，避免 CloudCLI 短暂断线导致审批永远卡住。
                     if sent or attempts >= max(1, int(self.timeout_deny_max_attempts)):
                         return
                     retry_delay = min(
@@ -376,6 +400,7 @@ class ApprovalService:
                     "请使用 /cloudcli pending 查看，然后 /cloudcli allow 或 /cloudcli deny 处理。"
                 )
                 await self._send_to_targets(targets, text)
+                # timeout-remind 只是提醒，不拥有审批决定，所以提醒后释放 claim。
                 await self.state.release_pending_claim(approval.session_id, approval.request_id, actor)
                 claimed_approval = None
                 return
@@ -402,6 +427,7 @@ class ApprovalService:
         timeout_seconds: int,
         targets: tuple[dict[str, Any], ...],
     ) -> bool:
+        """自动拒绝超时审批；返回 False 表示可稍后重试。"""
         reason = f"审批超时 {timeout_seconds} 秒，自动拒绝。"
         actor = "system"
         try:
@@ -469,6 +495,7 @@ class ApprovalService:
         *,
         message: str = "",
     ) -> None:
+        """发送审批决定，并确认远端 pending 列表中已不再包含该请求。"""
         await self.client.send_permission_decision(
             approval.request_id,
             allow,
@@ -481,6 +508,7 @@ class ApprovalService:
             raise _DecisionSentUnconfirmed(str(exc)) from exc
 
     async def _confirm_permission_decision(self, approval: PendingApproval) -> None:
+        """短轮询远端 pending 列表，确认审批决定已被 CloudCLI 消费。"""
         attempts = max(1, int(self.decision_confirm_attempts))
         delay = max(0.0, float(self.decision_confirm_delay_seconds))
         last_error = "permission decision not confirmed"
@@ -503,9 +531,11 @@ class ApprovalService:
         raise CloudCLIError(last_error)
 
     async def _send_to_targets(self, targets: tuple[dict[str, Any], ...], text: str) -> None:
+        """向每个目标用户记录的所有聊天 origin 主动推送消息。"""
         for target in targets:
             for origin in target.get("origins", []):
                 await self.send_proactive(origin, text)
 
     def _approval_detail_targets(self, targets: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+        """按通知策略过滤可接收详细审批内容的目标。"""
         return self.notifications.plan(targets).detailed_targets

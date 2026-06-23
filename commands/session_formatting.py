@@ -1,3 +1,5 @@
+"""CloudCLI session、健康检查和聊天记录的展示格式化。"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -11,6 +13,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 def format_sessions(payload: Any) -> str:
+    """展示 WebSocket 返回的活跃 session，兼容不同 provider 的字段形状。"""
     sessions = payload.get("sessions") if isinstance(payload, dict) else payload
     if not isinstance(sessions, dict):
         return "无法解析 CloudCLI session 响应。"
@@ -35,6 +38,7 @@ def format_session_overview(
     recent_error: str = "",
     text_limit: int = 1800,
 ) -> str:
+    """把活跃 session 和最近 session 合并成一条可绑定参考列表。"""
     lines: list[str] = []
     if active_payload is not None:
         lines.append(format_sessions(active_payload))
@@ -57,6 +61,7 @@ def format_session_overview(
 
 
 def format_health_report(report: dict[str, Any]) -> str:
+    """格式化 CloudCLIClient.health_check 返回的分项状态。"""
     base_url = redact_text(str(report.get("base_url") or "(未配置)"))
     lines = [f"CloudCLI 状态：{base_url}"]
     for key, label in (
@@ -76,6 +81,7 @@ def format_health_report(report: dict[str, Any]) -> str:
 
 
 def format_bindings(bindings: list[str]) -> str:
+    """展示当前用户在当前聊天会话里绑定的 session。"""
     if not bindings:
         return "当前用户没有绑定任何 session。"
     lines = ["当前用户绑定的 session："]
@@ -84,6 +90,7 @@ def format_bindings(bindings: list[str]) -> str:
 
 
 def format_chat_messages(session_id: str, payload: dict[str, Any], limit: int, text_limit: int) -> str:
+    """展示 session 最近消息，并按消息数量动态分配每条消息的长度预算。"""
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list):
         return "无法解析 CloudCLI session 消息响应。"
@@ -106,6 +113,7 @@ def format_chat_messages(session_id: str, payload: dict[str, Any], limit: int, t
 
 
 def _normalize_session_items(items: Any) -> list[str]:
+    """把 CloudCLI 活跃 session 的多种响应形状统一成字符串列表。"""
     if not items:
         return []
     if isinstance(items, list):
@@ -131,6 +139,7 @@ def _normalize_session_items(items: Any) -> list[str]:
 
 
 def _render_recent_session(item: dict[str, Any]) -> str:
+    """渲染一条最近 session，序号由上层循环生成。"""
     session_id = item.get("id") or item.get("sessionId") or item.get("session_id")
     provider = item.get("provider") or "unknown"
     project = clip_text(str(item.get("projectName") or item.get("projectPath") or ""), 180)
@@ -154,6 +163,7 @@ def _render_recent_session(item: dict[str, Any]) -> str:
 
 
 def _render_chat_message(message: Any, limit: int) -> str:
+    """把不同类型的历史消息转成适合聊天窗口阅读的短文本。"""
     if not isinstance(message, dict):
         return clip_text(str(message), limit)
 
@@ -179,6 +189,7 @@ def _render_chat_message(message: Any, limit: int) -> str:
 
 
 def _chat_prefix(kind: str, role: str) -> str:
+    """把 CloudCLI 内部消息类型映射成用户能看懂的前缀。"""
     if kind == "thinking":
         return "思考"
     if kind == "tool_use":

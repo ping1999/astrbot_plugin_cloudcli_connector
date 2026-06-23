@@ -1,3 +1,5 @@
+"""CloudCLI agent 任务服务：启动后台任务、消费流式事件、保存日志并支持取消。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +24,7 @@ try:
     from ..core.redaction import redact_exception_text, redact_text
     from ..persistence.state import PluginState
     from ..persistence.state_models import UserRef, is_valid_session_id
+    from ..security.authz import AuthorizationPolicy
     from ..security.identity import missing_identity_message
     from .run_requests import RunRequestBuilder
     from .runtime import RunQuota
@@ -44,6 +47,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from persistence.state_models import UserRef, is_valid_session_id
     from runs.run_requests import RunRequestBuilder
     from runs.runtime import RunQuota
+    from security.authz import AuthorizationPolicy
     from security.identity import missing_identity_message
 
 
@@ -53,14 +57,19 @@ logger = logging.getLogger(__name__)
 
 
 class _RunCancelledByUser(Exception):
+    """内部控制流异常：用户取消已经完成收尾，不再按普通失败处理。"""
+
     pass
 
 
 class RunService:
+    """处理 `/cloudcli run` 的创建、列表、日志、取消和后台事件消费。"""
+
     def __init__(
         self,
         *,
         settings: ConnectorSettings,
+        authz: AuthorizationPolicy,
         state: PluginState,
         client: CloudCLIClient,
         request_builder: RunRequestBuilder,
@@ -68,7 +77,9 @@ class RunService:
         send_proactive: SendProactive,
         track_task: TrackTask,
     ) -> None:
+        """注入依赖并初始化仅存在于当前进程内的运行中任务索引。"""
         self.settings = settings
+        self.authz = authz
         self.state = state
         self.client = client
         self.request_builder = request_builder
@@ -80,8 +91,13 @@ class RunService:
         self.abort_sent_run_ids: set[str] = set()
 
     async def handle_run(self, user: UserRef, args: list[str], raw_args: str = "") -> str:
+        """启动新任务，或转发到 run list/log/cancel 控制命令。"""
         if args and args[0] in {"list", "log", "cancel"}:
             return await self.handle_run_control(user, args)
+
+        decision = self.authz.can_run_agent(user)
+        if not decision.allowed:
+            return decision.message
 
         parsed, error = await self.request_builder.parse(user, args, raw_args=raw_args)
         if error:
@@ -92,6 +108,7 @@ class RunService:
         if quota_error:
             return quota_error
         try:
+            # 先写本地任务记录，再启动后台协程，这样用户马上可以用 run log 查看状态。
             run_id = await self.state.create_run_task(
                 user,
                 parsed.payload,
@@ -121,6 +138,7 @@ class RunService:
         )
 
     async def handle_run_control(self, user: UserRef, args: list[str]) -> str:
+        """处理 `/cloudcli run list|log|cancel`。"""
         if not user.identity_verified:
             return missing_identity_message(user)
         subcommand = args[0]
@@ -164,6 +182,7 @@ class RunService:
             session_id = str(task.get("session_id") or "")
             has_session_id = bool(session_id and is_valid_session_id(session_id))
             if local_task and not local_task.done() and not has_session_id:
+                # 有些 agent 启动后才返回 sessionId；先标记取消，等流里拿到 sessionId 再 abort 远端。
                 self.cancel_requested_run_ids.add(run_id)
                 await self.state.update_run_task(
                     run_id,
@@ -173,6 +192,7 @@ class RunService:
                 return f"已请求取消 CloudCLI 任务 #{run_id}，正在等待 CloudCLI sessionId。"
 
             if local_task and not local_task.done():
+                # 如果已经有 sessionId，先取消本地消费循环，再尝试发送远端 abort。
                 local_task.cancel()
 
             if has_session_id:
@@ -193,6 +213,7 @@ class RunService:
         return self.request_builder.usage()
 
     async def _run_agent_background(self, run_id: str, unified_msg_origin: str, payload: dict[str, Any]) -> None:
+        """后台消费 Agent SSE 事件，定期推送状态，最终保存摘要并通知用户。"""
         text_limit = self.settings.max_push_text_length
         status_interval = self.settings.run_status_interval_seconds
         max_status_pushes = self.settings.max_run_status_pushes
@@ -213,6 +234,7 @@ class RunService:
         last_status_at = 0.0
 
         async def finish_as_cancelled(message: str) -> None:
+            """把任务标记为 cancelled 并推送最终取消消息。"""
             await self.state.update_run_task(
                 run_id,
                 status="cancelled",
@@ -223,6 +245,7 @@ class RunService:
             await self.send_proactive(unified_msg_origin, message)
 
         async def consume_stream() -> None:
+            """读取 CloudCLI agent 流，并把重要事件合并到 summary 和任务日志。"""
             nonlocal assistant_text
             nonlocal assistant_text_truncated
             nonlocal status_pushes
@@ -245,6 +268,7 @@ class RunService:
 
                 extracted_text = extract_agent_text(event)
                 if extracted_text:
+                    # 完整输出可能很长，状态文件只保存一段摘要；完整内容仍可去 CloudCLI Web UI 查看。
                     if len(assistant_text) < summary_text_limit:
                         remaining = summary_text_limit - len(assistant_text)
                         chunk = extracted_text[:remaining]
@@ -267,6 +291,7 @@ class RunService:
                     and (status_pushes == 0 or now - last_status_at >= status_interval)
                 )
                 if should_push_status:
+                    # 主动推送做去重和限频，避免长任务刷屏。
                     await self.state.update_run_task(run_id, event=status_text)
                     await self.send_proactive(unified_msg_origin, status_text)
                     status_pushes += 1
@@ -351,6 +376,7 @@ class RunService:
             await self._prune_history()
             await self.send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{safe_error}")
         finally:
+            # 不管成功、失败还是取消，都清理进程内控制标记，避免复用 run_id 时误判。
             self.cancel_requested_run_ids.discard(run_id)
             self.abort_sent_run_ids.discard(run_id)
 
@@ -361,6 +387,7 @@ class RunService:
         *,
         run_id: str = "",
     ) -> str:
+        """尽力中止与任务关联的 CloudCLI session，并返回用户可读结果。"""
         session_id = str(summary.get("sessionId") or payload.get("sessionId") or "")
         if not session_id:
             return "\n尚未获得 CloudCLI sessionId，无法主动发送中止请求。"
@@ -369,6 +396,7 @@ class RunService:
         if run_id and run_id in self.abort_sent_run_ids:
             return f"\n已向 CloudCLI 发送过中止 session 请求：{session_id}"
         if run_id:
+            # 防止同一个取消路径多次向 CloudCLI 发送 abort。
             self.abort_sent_run_ids.add(run_id)
         try:
             result = await self.client.abort_session(session_id, str(payload.get("provider") or ""))
@@ -379,6 +407,7 @@ class RunService:
             return f"\n尝试中止 CloudCLI session 失败：{exc}"
 
     def merge_agent_event(self, summary: dict[str, Any], event: dict[str, Any]) -> None:
+        """把一条 agent 事件合并进最终摘要。"""
         event_type = str(event.get("type") or event.get("event") or "")
         if event.get("sessionId"):
             summary["sessionId"] = event.get("sessionId")
@@ -396,6 +425,7 @@ class RunService:
         elif event_type == "response":
             data = event.get("data")
             if isinstance(data, dict):
+                # 非 SSE JSON 响应或聚合响应也可能带同样的元数据字段。
                 if data.get("sessionId"):
                     summary["sessionId"] = data["sessionId"]
                 if data.get("projectPath"):
@@ -408,10 +438,12 @@ class RunService:
                     summary["errors"].append(data.get("error") or data)
 
     def _on_run_task_done(self, run_id: str, user_key: str) -> None:
+        """后台任务结束后从内存索引移除，并释放并发配额。"""
         self.run_tasks_by_id.pop(run_id, None)
         self.quota.release(user_key)
 
     async def _prune_history(self) -> None:
+        """按配置清理已结束的历史任务。"""
         await self.state.prune_run_history(
             self.settings.max_run_history_per_user,
             self.settings.max_run_history_global,

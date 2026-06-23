@@ -1,3 +1,5 @@
+"""命令行风格解析器：把聊天消息拆成命令名、参数列表和原始尾部文本。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +7,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CommandToken:
+    """一个解析后的命令片段，同时保留它在原始字符串中的起止位置。"""
+
     value: str
     start: int
     end: int
@@ -12,12 +16,15 @@ class CommandToken:
 
 @dataclass
 class ParsedCommand:
+    """供命令路由消费的标准结构。"""
+
     name: str
     args: list[str]
     raw_args: str
 
 
 def parse_command(message: str) -> ParsedCommand:
+    """解析整条消息，兼容带 `/cloudcli` 前缀和直接传入子命令两种形式。"""
     stripped = message.strip()
     if not stripped:
         return ParsedCommand("", [], "")
@@ -35,10 +42,12 @@ def parse_command(message: str) -> ParsedCommand:
 
 
 def tokenize_command(value: str) -> list[str]:
+    """只返回 token 值的简化入口，适合不关心原始位置的调用方。"""
     return [part.value for part in tokenize_command_parts(value)]
 
 
 def tokenize_command_parts_with_raw_tail(value: str) -> list[CommandToken]:
+    """解析参数，并把独立的 `--` 后面的内容作为原样任务文本保留下来。"""
     raw_tail_at = _find_standalone_double_dash(value)
     if raw_tail_at < 0:
         return tokenize_command_parts(value)
@@ -58,6 +67,7 @@ def tokenize_command_parts_with_raw_tail(value: str) -> list[CommandToken]:
 
 
 def tokenize_command_parts(value: str) -> list[CommandToken]:
+    """按空白切分参数，支持单引号和双引号包裹的空白内容。"""
     tokens: list[CommandToken] = []
     current: list[str] = []
     token_start: int | None = None
@@ -96,6 +106,7 @@ def tokenize_command_parts(value: str) -> list[CommandToken]:
 
 
 def _find_standalone_double_dash(value: str) -> int:
+    """寻找不在引号内、且前后由空白分隔的 `--` 分隔符。"""
     quote = ""
     index = 0
     while index < len(value):
@@ -122,6 +133,7 @@ def _find_standalone_double_dash(value: str) -> int:
 
 
 def parse_optional_request_no(args: list[str]) -> tuple[int | None, str | None]:
+    """解析审批序号；未传序号时返回 None，让上层在只有一条审批时自动选择。"""
     if not args:
         return None, None
     if not args[0].isdigit():
@@ -138,6 +150,7 @@ def parse_positive_int(
     minimum: int,
     maximum: int,
 ) -> tuple[int, str | None]:
+    """解析带上下限的整数，并返回适合直接展示给用户的错误信息。"""
     try:
         parsed = int(value)
     except ValueError:

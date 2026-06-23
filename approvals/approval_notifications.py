@@ -1,3 +1,5 @@
+"""审批通知策略：决定哪些绑定用户能收到包含工具输入的详细通知。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,10 +8,14 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ApprovalNotificationPlan:
+    """一次审批通知的投递计划。"""
+
     detailed_targets: tuple[dict[str, Any], ...]
 
 
 class ApprovalNotificationPolicy:
+    """根据审批访问模式过滤通知目标，避免敏感工具输入扩散。"""
+
     def __init__(
         self,
         *,
@@ -22,6 +28,7 @@ class ApprovalNotificationPolicy:
         self.approval_access_mode = approval_access_mode
 
     def plan(self, targets: list[dict[str, Any]]) -> ApprovalNotificationPlan:
+        """从绑定用户列表中挑出可接收详细审批内容的目标。"""
         detailed = [
             target
             for target in targets
@@ -30,6 +37,7 @@ class ApprovalNotificationPolicy:
         return ApprovalNotificationPlan(detailed_targets=tuple(detailed))
 
     def can_receive_details(self, user_key: str) -> bool:
+        """判断单个用户是否可收到审批详情。"""
         if user_key in self.approval_allowed_user_keys:
             return True
         if self.approval_access_mode == "authenticated":

@@ -1,3 +1,5 @@
+"""权限策略：集中决定用户能否查看 session、运行任务、中止任务和处理审批。"""
+
 from __future__ import annotations
 
 import os
@@ -16,22 +18,29 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 @dataclass(frozen=True)
 class Decision:
+    """通用授权结果；message 为空表示允许。"""
+
     allowed: bool
     message: str = ""
 
 
 @dataclass(frozen=True)
 class ProjectPathDecision:
+    """本地项目路径授权结果；path 是解析后的绝对路径。"""
+
     allowed: bool
     path: str = ""
     message: str = ""
 
 
 class AuthorizationPolicy:
+    """把配置中的访问模式、白名单和管理员身份组合成明确授权判断。"""
+
     def __init__(self, settings: ConnectorSettings) -> None:
         self.settings = settings
 
     def can_access_sessions(self, user: UserRef) -> Decision:
+        """判断用户是否能读取 CloudCLI session 列表和聊天记录。"""
         identity_error = self._identity_error(user)
         if identity_error:
             return Decision(False, identity_error)
@@ -49,6 +58,7 @@ class AuthorizationPolicy:
         )
 
     def can_bind_sessions(self, user: UserRef) -> Decision:
+        """判断用户是否能绑定 session；审批人可绑定自己负责审批的 session。"""
         session_decision = self.can_access_sessions(user)
         if session_decision.allowed:
             return session_decision
@@ -58,6 +68,7 @@ class AuthorizationPolicy:
         return session_decision
 
     def can_bind_direct_session_for_approval(self, user: UserRef) -> Decision:
+        """判断审批用户是否允许直接输入原始 sessionId 来绑定。"""
         identity_error = self._identity_error(user)
         if identity_error:
             return Decision(False, identity_error)
@@ -70,6 +81,7 @@ class AuthorizationPolicy:
         return self.can_use_direct_session_id(user)
 
     def can_use_direct_session_id(self, user: UserRef) -> Decision:
+        """判断用户能否绕过序号缓存，直接使用未绑定的 sessionId。"""
         identity_error = self._identity_error(user)
         if identity_error:
             return Decision(False, identity_error)
@@ -84,6 +96,7 @@ class AuthorizationPolicy:
         )
 
     def can_run_agent(self, user: UserRef) -> Decision:
+        """判断用户是否能发起新的 CloudCLI agent 任务。"""
         identity_error = self._identity_error(user)
         if identity_error:
             return Decision(False, identity_error)
@@ -101,6 +114,7 @@ class AuthorizationPolicy:
         )
 
     def can_stop_sessions(self, user: UserRef) -> Decision:
+        """判断用户是否能中止 CloudCLI session。"""
         identity_error = self._identity_error(user)
         if identity_error:
             return Decision(False, identity_error)
@@ -118,6 +132,7 @@ class AuthorizationPolicy:
         )
 
     def can_manage_approvals(self, user: UserRef) -> Decision:
+        """判断用户是否能查看、允许、拒绝和审计权限请求。"""
         identity_error = self._identity_error(user)
         if identity_error:
             return Decision(False, identity_error)
@@ -135,6 +150,7 @@ class AuthorizationPolicy:
         )
 
     def authorize_project_path(self, user: UserRef, project_path: str) -> ProjectPathDecision:
+        """校验本地项目路径是否在允许根目录内。"""
         if not project_path:
             return ProjectPathDecision(True, "")
 
@@ -157,6 +173,7 @@ class AuthorizationPolicy:
         return ProjectPathDecision(False, "", "projectPath 不在 allowed_project_roots 允许的目录内。")
 
     def validate_project_path(self, user: UserRef, project_path: str) -> str:
+        """旧调用方使用的便捷接口；返回空字符串表示通过。"""
         return self.authorize_project_path(user, project_path).message
 
     def _is_allowed(
@@ -166,6 +183,7 @@ class AuthorizationPolicy:
         allowed_keys: frozenset[str],
         access_mode: str,
     ) -> bool:
+        """按 allowlist、authenticated、admin_or_allowlist 三种模式判断通用权限。"""
         if user.user_key in allowed_keys:
             return True
         if access_mode == "authenticated":
@@ -175,12 +193,14 @@ class AuthorizationPolicy:
         return bool(user.is_admin)
 
     def _identity_error(self, user: UserRef) -> str:
+        """需要权限边界的操作必须有可靠 sender_id。"""
         if getattr(user, "identity_verified", True):
             return ""
         return missing_identity_message(user)
 
 
 def _resolve_path(value: str) -> str:
+    """展开环境变量和用户目录，并尽量解析成绝对路径。"""
     expanded = os.path.expandvars(os.path.expanduser(value))
     try:
         resolved = Path(expanded).resolve(strict=False)
@@ -190,10 +210,12 @@ def _resolve_path(value: str) -> str:
 
 
 def _normalize_path(value: str) -> str:
+    """按当前操作系统规则归一化路径大小写和分隔符。"""
     return os.path.normcase(_resolve_path(value))
 
 
 def _is_path_within(path: str, root: str) -> bool:
+    """判断 path 是否位于 root 内；不同盘符会触发 ValueError。"""
     try:
         return os.path.commonpath([path, root]) == root
     except ValueError:

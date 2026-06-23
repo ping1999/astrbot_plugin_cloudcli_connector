@@ -1,9 +1,13 @@
+"""运行中 CloudCLI agent 任务的内存配额控制。"""
+
 from __future__ import annotations
 
 from collections import Counter
 
 
 class RunQuota:
+    """限制单用户和全局并发任务数，防止聊天命令刷爆 CloudCLI。"""
+
     def __init__(self, per_user_limit: int, global_limit: int) -> None:
         self.per_user_limit = per_user_limit
         self.global_limit = global_limit
@@ -11,6 +15,7 @@ class RunQuota:
         self._active_total = 0
 
     def try_acquire(self, user_key: str) -> str:
+        """尝试占用一个任务配额；返回空字符串表示成功。"""
         if self.global_limit > 0 and self._active_total >= self.global_limit:
             return f"当前 CloudCLI 任务数已达全局上限 {self.global_limit}，请稍后再试。"
         if self.per_user_limit > 0 and self._active_by_user[user_key] >= self.per_user_limit:
@@ -20,6 +25,7 @@ class RunQuota:
         return ""
 
     def release(self, user_key: str) -> None:
+        """任务结束、失败或取消后释放配额。"""
         if self._active_by_user[user_key] > 0:
             self._active_by_user[user_key] -= 1
             if self._active_by_user[user_key] <= 0:

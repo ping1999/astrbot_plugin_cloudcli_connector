@@ -1,3 +1,5 @@
+"""离线回归测试：覆盖参数校验、身份权限、协议解析、状态持久化和异步服务边界。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +8,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+
+import aiohttp
 
 from approvals.approval_notifications import ApprovalNotificationPolicy
 from approvals.approval_service import ApprovalService
@@ -15,7 +20,7 @@ from cloudcli.cloudcli_agent import CloudCLIAgentClient
 from cloudcli.cloudcli_rest import CloudCLIRestClient
 import cloudcli.cloudcli_agent as cloudcli_agent_module
 from cloudcli.cloudcli_models import active_sessions_contains
-from cloudcli.cloudcli_protocol import build_ws_url, parse_sse_event
+from cloudcli.cloudcli_protocol import MAX_WS_MESSAGE_CHARS, build_ws_url, parse_sse_event
 from cloudcli.cloudcli_transport import WebSocketRequestMux
 from commands.command_parser import ParsedCommand, parse_command
 from commands.command_router import CommandRoute, CommandRouter
@@ -33,6 +38,8 @@ from core.redaction import redact_exception_text
 from persistence.state import PluginState
 from persistence.state_models import PendingApproval, UserRef
 from runs.run_requests import RunRequestBuilder
+from runs.run_service import RunService
+from runs.runtime import RunQuota
 from security.authz import AuthorizationPolicy
 from security.identity import build_user_ref
 from security.run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
@@ -40,12 +47,16 @@ from sessions.session_resolver import SessionResolver
 
 
 class ValidationTests(unittest.TestCase):
+    """校验 run 参数安全过滤，避免 URL、模型名和分支名携带危险字符。"""
+
     def test_github_url_accepts_standard_repo_urls(self) -> None:
+        """标准 GitHub HTTPS/SSH 仓库地址应该被允许。"""
         self.assertTrue(looks_like_github_url("https://github.com/user/repo"))
         self.assertTrue(looks_like_github_url("https://github.com/user/repo.git"))
         self.assertTrue(looks_like_github_url("git@github.com:user/repo.git"))
 
     def test_github_url_rejects_argument_shaped_values(self) -> None:
+        """像命令行参数、query 或非 GitHub 域名的 URL 必须被拒绝。"""
         self.assertFalse(looks_like_github_url("https://github.com/user/repo --upload-pack=/tmp/x"))
         self.assertFalse(looks_like_github_url("git@github.com:user/repo.git -c core.sshCommand=bad"))
         self.assertFalse(looks_like_github_url("https://github.com/user/repo?x=1"))
@@ -53,6 +64,7 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(looks_like_github_url("https://evil.example/user/repo"))
 
     def test_branch_name_rejects_git_ref_edge_cases(self) -> None:
+        """分支名要避开 Git refname 的边界情况，例如 `..`、隐藏组件和 `.lock`。"""
         self.assertTrue(is_safe_git_branch_name("feature/safe-name"))
         self.assertFalse(is_safe_git_branch_name("bad..branch"))
         self.assertFalse(is_safe_git_branch_name(".hidden/branch"))
@@ -61,6 +73,7 @@ class ValidationTests(unittest.TestCase):
         self.assertFalse(is_safe_git_branch_name("feature/lock.lock"))
 
     def test_provider_boundary_values_reject_shell_metacharacters(self) -> None:
+        """模型名和分支名不能包含 shell 元字符，防止下游命令拼接时被误用。"""
         for value in (
             "feature;calc",
             "feature$(whoami)",
@@ -75,7 +88,10 @@ class ValidationTests(unittest.TestCase):
 
 
 class IdentityTests(unittest.TestCase):
+    """验证 AstrBot 事件到 UserRef 的身份提取和权限失败关闭行为。"""
+
     def test_async_admin_checker_is_awaited(self) -> None:
+        """异步 is_admin 方法必须被 await，否则管理员判断会变成错误的 truthy 对象。"""
         class Event:
             unified_msg_origin = "origin"
 
@@ -96,6 +112,7 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(user.is_admin)
 
     def test_missing_sender_id_is_not_privileged(self) -> None:
+        """缺少 sender_id 的事件只能得到未验证身份，即使 role 字段伪装成 admin。"""
         class Event:
             unified_msg_origin = "platform:group:1"
             role = "admin"
@@ -114,6 +131,7 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(user.is_admin)
 
     def test_role_attribute_is_not_trusted_as_admin_source(self) -> None:
+        """普通 role 属性不能作为管理员来源，只信任 AstrBot 的 is_admin 接口。"""
         class Event:
             unified_msg_origin = "origin"
             role = "admin"
@@ -129,6 +147,7 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(user.is_admin)
 
     def test_async_sender_id_is_awaited(self) -> None:
+        """异步平台 ID、发送者 ID 和昵称都要正确 await 后写入 UserRef。"""
         class Event:
             unified_msg_origin = "origin"
 
@@ -147,6 +166,7 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(user.identity_verified)
 
     def test_missing_origin_uses_session_scoped_fallback(self) -> None:
+        """没有 unified_msg_origin 时，用 session 维度构造稳定且互相隔离的 fallback origin。"""
         class Event:
             def __init__(self, session_id: str) -> None:
                 self._session_id = session_id
@@ -168,6 +188,7 @@ class IdentityTests(unittest.TestCase):
         self.assertNotEqual(first.unified_msg_origin, second.unified_msg_origin)
 
     def test_display_name_is_single_line(self) -> None:
+        """昵称会被压成单行，避免用户通过换行伪造状态字段。"""
         class Event:
             unified_msg_origin = "origin"
 
@@ -184,6 +205,7 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(user.display_name, "Alice AstrBot 管理员：是")
 
     def test_authorization_fails_closed_for_unverified_identity(self) -> None:
+        """即使配置为 authenticated，缺少可靠 sender_id 的用户也不能通过权限检查。"""
         settings = load_connector_settings(
             {
                 "session_require_admin": False,
@@ -206,6 +228,7 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(authz.can_manage_approvals(user).allowed)
 
     def test_legacy_require_admin_false_is_allowlist_only(self) -> None:
+        """旧版 require_admin=false 应迁移为 allowlist_only，而不是开放给所有人。"""
         settings = load_connector_settings(
             {
                 "session_require_admin": False,
@@ -221,6 +244,7 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(authz.can_manage_approvals(user).allowed)
 
     def test_stop_permission_is_not_inherited_from_authenticated_session_access(self) -> None:
+        """session 读取权限不能自动继承成 stop 权限，防止普通读者中止远端任务。"""
         settings = load_connector_settings({"session_access_mode": "authenticated"})
         authz = AuthorizationPolicy(settings)
         user = UserRef("test:u1", "User", "origin")
@@ -237,6 +261,7 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(AuthorizationPolicy(allowed).can_stop_sessions(user).allowed)
 
     def test_approval_allowlist_can_bind_without_session_read_access(self) -> None:
+        """审批白名单用户即使不能读 session 列表，也能绑定用于处理审批的 session。"""
         settings = load_connector_settings(
             {
                 "session_require_admin": True,
@@ -254,6 +279,7 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(authz.can_bind_direct_session_for_approval(user).allowed)
 
     def test_approval_direct_bind_requires_explicit_flag(self) -> None:
+        """审批用户直接绑定原始 sessionId 需要显式打开 approval_allow_direct_session_bind。"""
         settings = load_connector_settings(
             {
                 "session_require_admin": True,
@@ -268,6 +294,7 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(authz.can_bind_direct_session_for_approval(user).allowed)
 
     def test_approval_allowlist_cannot_bind_cached_index_without_direct_flag(self) -> None:
+        """审批用户没有直连权限时，不能借缓存序号绕过 session 读取权限。"""
         class FakeClient:
             async def get_recent_sessions(self, limit: int = 100) -> list[dict[str, str]]:
                 return []
@@ -321,7 +348,10 @@ class IdentityTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    """验证配置读取会收紧不安全 URL，并在展示时脱敏。"""
+
     def test_base_url_strips_userinfo_and_health_report_redacts(self) -> None:
+        """base_url 中误填的用户名密码会被移除，健康检查展示也不会泄露凭据。"""
         settings = load_connector_settings(
             {"cloudcli_base_url": "http://user:pass@example.com:3001/cloudcli"}
         )
@@ -336,6 +366,7 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("user:pass", rendered)
 
     def test_plain_http_with_credentials_is_limited_to_loopback(self) -> None:
+        """携带凭据时，非本机 HTTP 明文地址会退回默认本机地址。"""
         remote = load_connector_settings(
             {
                 "cloudcli_base_url": "http://example.com:3001/cloudcli",
@@ -354,19 +385,24 @@ class ConfigTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    """覆盖 CloudCLI 协议辅助函数和 WebSocket 请求复用器。"""
+
     def test_ws_url_keeps_base_path_without_query_token(self) -> None:
+        """WebSocket URL 应保留 base path，但不把 token 拼进 query。"""
         self.assertEqual(
             build_ws_url("https://example.com/cloudcli", "a b"),
             "wss://example.com/cloudcli/ws",
         )
 
     def test_parse_sse_event(self) -> None:
+        """SSE parser 要支持 event 名称和 JSON data。"""
         self.assertEqual(
             parse_sse_event('event: status\ndata: {"message":"ok"}'),
             {"event": "status", "message": "ok"},
         )
 
     def test_active_session_lookup_handles_provider_scoped_shapes(self) -> None:
+        """活跃 session 查询要兼容按 provider 分组和嵌套结构。"""
         payload = {
             "sessions": {
                 "claude": [
@@ -383,6 +419,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(active_sessions_contains(payload, "sess-4", "codex"))
 
     def test_request_mux_serializes_same_key_requests(self) -> None:
+        """相同 request_key 的 WebSocket 请求必须串行，避免响应无法区分。"""
         async def scenario() -> tuple[int, dict[str, object], dict[str, object]]:
             mux = WebSocketRequestMux()
             sent: list[dict[str, object]] = []
@@ -424,6 +461,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(2, second_result["value"])
 
     def test_request_mux_cleans_up_request_locks(self) -> None:
+        """请求完成后 request_key 锁要回收，避免长期运行时内存增长。"""
         async def scenario() -> int:
             mux = WebSocketRequestMux()
 
@@ -444,7 +482,10 @@ class ProtocolTests(unittest.TestCase):
 
 
 class CommandRouterTests(unittest.TestCase):
+    """验证命令路由的基础错误处理。"""
+
     def test_no_arg_route_rejects_extra_args(self) -> None:
+        """声明 no_args 的命令收到额外参数时应返回 usage，而不是调用 handler。"""
         async def handler(user: UserRef, args: list[str]) -> str:
             return "ok"
 
@@ -467,6 +508,7 @@ class CommandRouterTests(unittest.TestCase):
         self.assertEqual("用法：/cloudcli status", asyncio.run(scenario()))
 
     def test_unknown_route_returns_help(self) -> None:
+        """未知命令要带上帮助文本，方便用户自助纠正。"""
         async def scenario() -> str:
             router = CommandRouter(help_text="help text", routes={})
             return await router.dispatch(
@@ -478,7 +520,10 @@ class CommandRouterTests(unittest.TestCase):
 
 
 class CommandHandlerTests(unittest.TestCase):
+    """验证高层命令 handler 的权限分流。"""
+
     def test_run_control_does_not_require_current_new_run_permission(self) -> None:
+        """run list/log/cancel 是控制已有任务，不应要求当前仍有新建任务权限。"""
         class FakeRunService:
             called = False
 
@@ -513,6 +558,7 @@ class CommandHandlerTests(unittest.TestCase):
         self.assertTrue(called)
 
     def test_starting_run_still_requires_current_run_permission(self) -> None:
+        """handler 只做路由；真正的新建 run 权限由 RunService 这个用例边界检查。"""
         class FakeRunService:
             called = False
 
@@ -522,7 +568,7 @@ class CommandHandlerTests(unittest.TestCase):
 
             async def handle_run(self, user: UserRef, args: list[str]) -> str:
                 self.called = True
-                return "run"
+                return "service-run"
 
         async def scenario() -> tuple[str, bool]:
             settings = load_connector_settings({"run_access_mode": "allowlist_only"})
@@ -543,19 +589,42 @@ class CommandHandlerTests(unittest.TestCase):
             return result, run_service.called
 
         result, called = asyncio.run(scenario())
-        self.assertIn("CloudCLI agent", result)
-        self.assertFalse(called)
+        self.assertEqual("service-run", result)
+        self.assertTrue(called)
+
+    def test_run_service_enforces_current_run_permission(self) -> None:
+        """即使未来出现新的入口直接调用 RunService，新建任务也不能绕过授权。"""
+        async def scenario() -> str:
+            settings = load_connector_settings({"run_access_mode": "allowlist_only"})
+            service = RunService(
+                settings=settings,
+                authz=AuthorizationPolicy(settings),
+                state=object(),  # type: ignore[arg-type]
+                client=object(),  # type: ignore[arg-type]
+                request_builder=object(),  # type: ignore[arg-type]
+                quota=RunQuota(1, 1),
+                send_proactive=lambda _origin, _text: asyncio.sleep(0),
+                track_task=lambda _task: None,
+            )
+            return await service.handle_run(UserRef("test:u1", "User", "origin"), ["doit"])
+
+        self.assertIn("CloudCLI agent", asyncio.run(scenario()))
 
 
 class FakeSessions:
+    """RunRequestTests 使用的轻量 session resolver 替身。"""
+
     def __init__(self, project_path: str, provider: str = "codex") -> None:
+        """保存要返回给 run request builder 的 projectPath 和 provider。"""
         self.project_path = project_path
         self.provider = provider
 
     async def infer_single_bound_session(self, user: UserRef) -> tuple[str, str | None]:
+        """模拟用户只有一个绑定 session。"""
         return "sess-1", None
 
     async def resolve_session_ref(self, user: UserRef, ref: str) -> tuple[dict[str, str] | None, str | None]:
+        """把任意 session 引用解析为固定 session 元数据。"""
         return {
             "id": "sess-1",
             "provider": self.provider,
@@ -563,9 +632,11 @@ class FakeSessions:
         }, None
 
     async def session_usage_error(self, user: UserRef, session_id: str) -> str:
+        """测试替身默认允许使用 session。"""
         return ""
 
     async def find_recent_session(self, session_id: str) -> dict[str, str] | None:
+        """模拟从最近 session 中补齐 projectPath 和 provider。"""
         return {
             "id": session_id,
             "provider": self.provider,
@@ -574,7 +645,10 @@ class FakeSessions:
 
 
 class RunRequestTests(unittest.TestCase):
+    """验证 `/cloudcli run` 参数解析、目标解析和项目路径授权。"""
+
     def test_run_rejects_mixed_targets(self) -> None:
+        """--project、--github、--session 只能选一种目标，不能混用。"""
         async def scenario() -> tuple[object | None, str | None]:
             settings = load_connector_settings(
                     {
@@ -598,6 +672,7 @@ class RunRequestTests(unittest.TestCase):
         self.assertIn("不能同时使用", error or "")
 
     def test_run_project_target_sends_authorized_absolute_path(self) -> None:
+        """本地项目路径要先经过授权解析，再把绝对路径放进 payload。"""
         async def scenario() -> tuple[str, str, str | None]:
             original_cwd = Path.cwd()
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -633,6 +708,7 @@ class RunRequestTests(unittest.TestCase):
         self.assertEqual(os.path.normcase(expected_path), os.path.normcase(project_path))
 
     def test_run_parser_preserves_raw_message_after_double_dash(self) -> None:
+        """`--` 后面的任务描述要保留原始空白和引号，不能被普通 token join 改写。"""
         async def scenario() -> tuple[dict[str, object] | None, str | None, str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 project = Path(temp_dir) / "repo with spaces"
@@ -666,6 +742,7 @@ class RunRequestTests(unittest.TestCase):
         self.assertEqual(os.path.normcase(expected_project), os.path.normcase(str(payload["projectPath"])))
 
     def test_run_session_target_validates_resolved_project_path(self) -> None:
+        """通过 session 解析出的 projectPath 也必须经过 allowed_project_roots 校验。"""
         async def scenario() -> tuple[object | None, str | None]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 base = Path(temp_dir)
@@ -695,6 +772,7 @@ class RunRequestTests(unittest.TestCase):
         self.assertIn("projectPath 不在 allowed_project_roots", error or "")
 
     def test_run_session_target_keeps_opencode_provider(self) -> None:
+        """session 元数据中的 opencode provider 应被保留到 Agent API payload。"""
         async def scenario() -> tuple[object | None, str | None]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 allowed = Path(temp_dir)
@@ -722,7 +800,10 @@ class RunRequestTests(unittest.TestCase):
 
 
 class FormattingTests(unittest.TestCase):
+    """验证聊天输出格式化会按长度预算裁剪。"""
+
     def test_session_overview_is_clipped(self) -> None:
+        """session overview 包含大量最近 session 时仍要被裁剪到推送上限。"""
         rendered = format_session_overview(
             None,
             [
@@ -739,6 +820,7 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("已截断", rendered)
 
     def test_pending_list_is_clipped_after_all_items_are_rendered(self) -> None:
+        """待审批列表先完整渲染再统一裁剪，避免单条输入破坏整体消息结构。"""
         rendered = format_pending(
             [
                 PendingApproval(f"request-{index}", "sess-1", "Tool", {"text": "x" * 1000})
@@ -750,6 +832,7 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("已截断", rendered)
 
     def test_run_task_list_is_clipped(self) -> None:
+        """任务列表过长时需要裁剪，防止超出平台消息长度。"""
         rendered = format_run_tasks(
             [
                 {
@@ -767,6 +850,7 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("已截断", rendered)
 
     def test_agent_start_and_status_messages_are_clipped(self) -> None:
+        """任务启动和状态消息中带长路径时也要裁剪。"""
         start = format_agent_start_message(
             {"provider": "codex", "projectPath": "C:/repo/" + ("x" * 1000)},
             "1",
@@ -784,7 +868,10 @@ class FormattingTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    """验证 JSON 状态层的迁移、作用域、脱敏、claim 和历史裁剪。"""
+
     def test_legacy_single_origin_state_migrates_to_scoped_data(self) -> None:
+        """旧版单 origin 绑定和 session_index 应懒迁移为按 origin 分组的数据。"""
         async def scenario() -> tuple[list[str], bool]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "state.json"
@@ -825,6 +912,7 @@ class StateTests(unittest.TestCase):
         self.assertTrue(has_index)
 
     def test_bindings_pending_runs_and_audit_are_origin_scoped(self) -> None:
+        """绑定、审批、任务和审计都只能在当前聊天 origin 中可见。"""
         async def scenario() -> tuple[list[str], int, int, int, bool]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -866,6 +954,7 @@ class StateTests(unittest.TestCase):
         self.assertTrue(index_isolated)
 
     def test_unbind_removes_only_current_origin_binding(self) -> None:
+        """解绑当前 origin 不应删除同一用户其他 origin 上的绑定。"""
         async def scenario() -> tuple[list[str], list[str]]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -882,6 +971,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual([], group_bindings)
 
     def test_pending_input_redacts_common_secret_key_shapes(self) -> None:
+        """pending input 中常见 secret 字段名应在落盘前被替换为 [redacted]。"""
         async def scenario() -> dict[str, object]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -913,6 +1003,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual("visible", stored["safe"])
 
     def test_pending_claim_blocks_double_decision_and_preserves_refresh(self) -> None:
+        """审批被 claim 后应阻止第二次处理，并在远端刷新时保留 claim 状态。"""
         async def scenario() -> tuple[bool, str, bool]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -936,6 +1027,7 @@ class StateTests(unittest.TestCase):
         self.assertTrue(third_claimed)
 
     def test_pending_upsert_preserves_active_claim(self) -> None:
+        """同一 pending 再次 upsert 时不能覆盖正在处理中的 claim 字段。"""
         async def scenario() -> tuple[bool, str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -959,6 +1051,7 @@ class StateTests(unittest.TestCase):
         self.assertIn("正在被处理", second_error)
 
     def test_permission_request_tool_name_is_single_line(self) -> None:
+        """CloudCLI 传入的工具名会被清洗成单行，防止伪造多行审批内容。"""
         approval = PendingApproval.from_cloudcli(
             {
                 "requestId": "request-1",
@@ -974,6 +1067,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual("claude fake", approval.provider)
 
     def test_stale_pending_claim_is_cleared_on_load(self) -> None:
+        """加载旧状态时会清理过期 claim，避免重启后审批永久卡住。"""
         async def scenario() -> bool:
             with tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "state.json"
@@ -993,6 +1087,7 @@ class StateTests(unittest.TestCase):
         self.assertTrue(asyncio.run(scenario()))
 
     def test_loaded_legacy_sensitive_state_is_redacted(self) -> None:
+        """敏感持久化关闭时，加载旧状态会立即清理 prompt、assistantText 和审批输入。"""
         async def scenario() -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "state.json"
@@ -1073,6 +1168,7 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("audit-input-secret", rendered)
 
     def test_sensitive_state_details_are_not_persisted_by_default(self) -> None:
+        """默认状态文件不保存审批原始输入、任务 prompt、助手正文和审计输入摘要。"""
         async def scenario() -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "state.json"
@@ -1114,6 +1210,7 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("bare-pending-secret", json.dumps(reloaded_input, ensure_ascii=False))
 
     def test_session_index_omits_sensitive_display_fields_by_default(self) -> None:
+        """默认 session 序号缓存只保存必要字段，不落盘项目路径和摘要。"""
         async def scenario() -> str:
             with tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "state.json"
@@ -1144,6 +1241,7 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("secret summary text", rendered)
 
     def test_run_event_updates_are_batched_until_flush(self) -> None:
+        """频繁的 run event 更新会延迟批量写盘，flush 后再落到状态文件。"""
         async def scenario() -> tuple[str, str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "state.json"
@@ -1167,6 +1265,7 @@ class StateTests(unittest.TestCase):
         self.assertIn("streamed chunk", after_flush)
 
     def test_pending_request_ids_are_scoped_by_session(self) -> None:
+        """相同 requestId 出现在不同 session 时必须作为两条独立 pending 保存。"""
         async def scenario() -> list[PendingApproval]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -1190,6 +1289,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(["sess-2"], [item.session_id for item in remaining])
 
     def test_mark_interrupted_runs_on_startup(self) -> None:
+        """插件启动时应把旧进程遗留的 running 任务标记为 interrupted。"""
         async def scenario() -> dict[str, object]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -1213,6 +1313,7 @@ class StateTests(unittest.TestCase):
         self.assertTrue(task["finished_at"])
 
     def test_run_history_prunes_completed_tasks(self) -> None:
+        """已结束任务历史应按每用户和全局上限裁剪。"""
         async def scenario() -> list[str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 state = PluginState(Path(temp_dir) / "state.json")
@@ -1234,7 +1335,10 @@ class StateTests(unittest.TestCase):
 
 
 class CloudCLIClientTests(unittest.TestCase):
+    """验证 CloudCLI 客户端的认证、重定向防护、SSE 和 WebSocket 行为。"""
+
     def test_agent_headers_include_jwt_and_api_key(self) -> None:
+        """Agent API 请求头应同时包含 JWT 和 X-API-Key。"""
         async def scenario() -> dict[str, str]:
             client = CloudCLIClient(
                 CloudCLIConfig(
@@ -1251,6 +1355,7 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual("api-secret", headers.get("X-API-Key"))
 
     def test_rest_refreshes_expired_static_jwt_when_login_credentials_exist(self) -> None:
+        """REST 返回 401 时，如果有用户名密码，应清理旧 token 并重新登录再试。"""
         class FakeContent:
             def __init__(self, text: str) -> None:
                 self.payload = text.encode("utf-8")
@@ -1317,6 +1422,7 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual([{"username": "user", "password": "password"}], login_payloads)
 
     def test_rest_refuses_redirects_to_avoid_api_key_leak(self) -> None:
+        """REST 请求遇到 3xx 要拒绝跟随，避免把 API key 发给跳转目标。"""
         class FakeContent:
             async def iter_chunked(self, _size: int):
                 yield b""
@@ -1374,8 +1480,12 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertNotIn("secret-value", error)
 
     def test_login_refuses_redirects_to_avoid_api_key_leak(self) -> None:
+        """登录请求遇到 3xx 也要拒绝，避免凭据被跳转泄露。"""
         class FakeContent:
+            read = False
+
             async def iter_chunked(self, _size: int):
+                self.read = True
                 yield b""
 
         class FakeResponse:
@@ -1398,8 +1508,10 @@ class CloudCLIClientTests(unittest.TestCase):
                 self.allow_redirects.append(allow_redirects)
                 return FakeResponse()
 
-        async def scenario() -> tuple[list[object], str]:
+        async def scenario() -> tuple[list[object], str, bool]:
             session = FakeSession()
+            response = FakeResponse()
+            response.content = FakeContent()
             config = CloudCLIConfig(
                 base_url="http://127.0.0.1:3001",
                 username="user",
@@ -1411,18 +1523,23 @@ class CloudCLIClientTests(unittest.TestCase):
                 ensure_session=lambda: asyncio.sleep(0, result=session),
                 api_url=lambda path: f"http://127.0.0.1:3001{path}",
             )
+            session.post = lambda _url, *, json=None, headers=None, allow_redirects=None: (  # type: ignore[method-assign]
+                session.allow_redirects.append(allow_redirects) or response
+            )
             try:
                 await auth.get_token()
             except CloudCLIError as exc:
-                return session.allow_redirects, str(exc)
-            return session.allow_redirects, ""
+                return session.allow_redirects, str(exc), response.content.read
+            return session.allow_redirects, "", response.content.read
 
-        allow_redirects, error = asyncio.run(scenario())
+        allow_redirects, error, body_read = asyncio.run(scenario())
         self.assertEqual([False], allow_redirects)
         self.assertIn("redirect refused", error)
         self.assertNotIn("secret-value", error)
+        self.assertFalse(body_read)
 
     def test_agent_refuses_redirects_to_avoid_api_key_leak(self) -> None:
+        """Agent API 遇到重定向时应失败，而不是带着凭据继续请求。"""
         class FakeContent:
             async def iter_chunked(self, _size: int):
                 yield b""
@@ -1486,6 +1603,7 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertNotIn("secret-value", error)
 
     def test_agent_stream_refreshes_expired_cached_login_token(self) -> None:
+        """Agent API 首次 401 且可登录时，应刷新 token 后重试一次。"""
         class FakeContent:
             def __init__(self, text: str) -> None:
                 self.payload = text.encode("utf-8")
@@ -1563,6 +1681,7 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual([{"type": "response", "data": {"success": True}}], events)
 
     def test_unauthenticated_ws_does_not_require_token(self) -> None:
+        """允许匿名 WebSocket 时，连接流程不应强制要求 JWT。"""
         class FakeWebSocket:
             closed = False
 
@@ -1609,6 +1728,7 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual("ws://127.0.0.1:3001/ws", asyncio.run(scenario()))
 
     def test_websocket_connect_sends_api_key_header(self) -> None:
+        """WebSocket 握手需要带上 API key，以支持 CloudCLI 的 API key 鉴权。"""
         class FakeWebSocket:
             closed = False
 
@@ -1658,6 +1778,7 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual("api-secret", headers.get("X-API-Key"))
 
     def test_recent_sessions_do_not_inherit_unauthenticated_ws_setting(self) -> None:
+        """REST 最近 session 查询不能因为 WebSocket 允许匿名而跳过 REST 认证。"""
         async def scenario() -> list[bool]:
             client = CloudCLIClient(
                 CloudCLIConfig(
@@ -1683,6 +1804,7 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual([False], asyncio.run(scenario()))
 
     def test_supervisor_reconnects_after_websocket_disconnect(self) -> None:
+        """读取循环断开后，连接监督任务应自动触发重连。"""
         class FakeWebSocket:
             closed = False
 
@@ -1741,9 +1863,47 @@ class CloudCLIClientTests(unittest.TestCase):
 
         self.assertGreaterEqual(asyncio.run(scenario()), 2)
 
+    def test_websocket_reader_rejects_oversized_text_frames(self) -> None:
+        """WebSocket 入站消息必须在 JSON 解析前限长，避免异常大帧压垮内存。"""
+        class FakeWebSocket:
+            closed = False
+
+            def __aiter__(self):
+                self.sent = False
+                return self
+
+            async def __anext__(self):
+                if self.sent:
+                    raise StopAsyncIteration
+                self.sent = True
+                return SimpleNamespace(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data="x" * (MAX_WS_MESSAGE_CHARS + 1),
+                )
+
+            async def close(self) -> None:
+                self.closed = True
+
+        async def scenario() -> tuple[bool, bool]:
+            client = CloudCLIClient(
+                CloudCLIConfig(base_url="http://127.0.0.1:3001"),
+                on_permission_request=lambda _approval: asyncio.sleep(0),
+            )
+            ws = FakeWebSocket()
+            client._ws = ws  # type: ignore[assignment]
+            await client._reader_loop(ws)  # type: ignore[arg-type]
+            return ws.closed, client._ws is None
+
+        closed, cleared = asyncio.run(scenario())
+        self.assertTrue(closed)
+        self.assertTrue(cleared)
+
 
 class ApprovalServiceTests(unittest.TestCase):
+    """验证审批服务的通知范围、刷新失败保护、确认失败和超时处理。"""
+
     def test_legacy_approval_require_admin_false_does_not_push_to_everyone(self) -> None:
+        """旧配置 approval_require_admin=false 不应导致审批详情推送给所有绑定用户。"""
         policy = ApprovalNotificationPolicy(
             approval_allowed_user_keys=frozenset(),
             approval_require_admin=False,
@@ -1753,6 +1913,7 @@ class ApprovalServiceTests(unittest.TestCase):
         self.assertFalse(policy.can_receive_details("test:u1"))
 
     def test_decision_is_blocked_when_pending_refresh_fails(self) -> None:
+        """allow/deny 前刷新远端 pending 失败时，不应发送审批决定。"""
         class FailingClient:
             decision_sent = False
 
@@ -1792,6 +1953,7 @@ class ApprovalServiceTests(unittest.TestCase):
         self.assertFalse(decision_sent)
 
     def test_allow_marks_pending_unconfirmed_when_confirmation_fails(self) -> None:
+        """审批决定已发送但确认失败时，pending 要进入 unconfirmed 状态。"""
         class UnconfirmedClient:
             decision_count = 0
 
@@ -1846,6 +2008,7 @@ class ApprovalServiceTests(unittest.TestCase):
         self.assertEqual(1, decision_count)
 
     def test_cancelled_allow_releases_pending_claim(self) -> None:
+        """allow 处理协程被取消时必须释放 claim，避免审批永远被占用。"""
         class CancellingClient:
             async def get_pending_permissions(self, session_id: str):
                 return [PendingApproval("request-1", session_id, "Tool", {"value": 1})]
@@ -1886,6 +2049,7 @@ class ApprovalServiceTests(unittest.TestCase):
         self.assertEqual("", error)
 
     def test_cancelled_timeout_worker_releases_pending_claim(self) -> None:
+        """超时 worker 被取消时也必须释放系统 claim。"""
         async def scenario() -> tuple[bool, str]:
             with tempfile.TemporaryDirectory() as temp_dir:
                 settings = load_connector_settings({"approval_allowed_user_keys": "test:u1"})
@@ -1923,6 +2087,7 @@ class ApprovalServiceTests(unittest.TestCase):
         self.assertEqual("", error)
 
     def test_timeout_deny_retries_after_temporary_send_failure(self) -> None:
+        """自动拒绝遇到临时发送失败时应重试，最终成功后移除 pending。"""
         class FlakyClient:
             attempts = 0
 
@@ -1973,13 +2138,22 @@ class ApprovalServiceTests(unittest.TestCase):
 
 
 class RedactionTests(unittest.TestCase):
+    """验证异常堆栈脱敏。"""
+
     def test_exception_traceback_is_redacted(self) -> None:
+        """日志中的 traceback 不能暴露 Authorization、API key 或密码。"""
         try:
             raise ValueError("client_secret=secret-value token=token-value")
         except ValueError as exc:
             rendered = redact_exception_text(exc)
         self.assertNotIn("secret-value", rendered)
         self.assertNotIn("token-value", rendered)
+
+    def test_cloudcli_error_redacts_message_by_default(self) -> None:
+        """CloudCLIError 创建时就脱敏，降低调用方直接展示异常的泄露风险。"""
+        rendered = str(CloudCLIError("Authorization: Bearer token-value api_key=secret-value"))
+        self.assertNotIn("token-value", rendered)
+        self.assertNotIn("secret-value", rendered)
 
 
 if __name__ == "__main__":

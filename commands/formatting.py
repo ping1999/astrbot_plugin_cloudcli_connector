@@ -1,3 +1,5 @@
+"""格式化函数的聚合出口，兼容历史上从 `commands.formatting` 导入的调用方。"""
+
 from __future__ import annotations
 
 try:

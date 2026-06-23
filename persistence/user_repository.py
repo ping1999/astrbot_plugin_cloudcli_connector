@@ -1,3 +1,5 @@
+"""用户绑定和最近 session 序号缓存的仓库。"""
+
 from __future__ import annotations
 
 import time
@@ -15,10 +17,13 @@ MAX_SESSION_INDEX_ITEMS = 100
 
 
 class UserStateRepository:
+    """只操作状态字典中的 `users` 区域，不负责加锁和落盘。"""
+
     def __init__(self, data: dict[str, Any]) -> None:
         self.data = data
 
     def remember_user(self, user: UserRef) -> None:
+        """记录用户最近出现的聊天 origin，供后续主动推送和迁移旧数据使用。"""
         entry = self.entry(user.user_key)
         entry["display_name"] = user.display_name
         origins = _read_list(entry.get("origins"))
@@ -29,6 +34,7 @@ class UserStateRepository:
         entry["last_seen_at"] = time.time()
 
     def bind_session(self, user: UserRef, session_id: str, max_bindings: int) -> tuple[bool, str]:
+        """把 session 绑定到当前聊天 origin；同一用户不同群/私聊互不干扰。"""
         if not is_valid_session_id(session_id):
             return False, "sessionId 格式不合法。"
         if max_bindings < 1:
@@ -46,6 +52,7 @@ class UserStateRepository:
         session_origins = binding_origins.get(session_id, [])
         origin_added = False
         if origin not in session_origins:
+            # 一个 session 可绑定到同一用户的多个聊天 origin，以便审批通知发回正确会话。
             session_origins.append(origin)
             binding_origins[session_id] = session_origins[-5:]
             entry["binding_origins"] = binding_origins
@@ -64,6 +71,7 @@ class UserStateRepository:
         return True, f"已绑定 session：{session_id}"
 
     def unbind_session(self, user: UserRef, session_id: str) -> tuple[bool, str]:
+        """只解除当前 origin 的绑定；其他 origin 仍可继续收到通知。"""
         if not is_valid_session_id(session_id):
             return False, "sessionId 格式不合法。"
         entry = self.entry(user.user_key)
@@ -84,6 +92,7 @@ class UserStateRepository:
         return True, f"已解绑 session：{session_id}"
 
     def unbind_all(self, user: UserRef) -> tuple[bool, str]:
+        """解除当前 origin 下的全部绑定。"""
         entry = self.entry(user.user_key)
         bindings = _read_list(entry.get("bindings"))
         binding_origins = read_origin_map(entry.get("binding_origins"))
@@ -107,9 +116,11 @@ class UserStateRepository:
         return True, f"已解绑全部 session，共 {count} 个。"
 
     def list_bindings(self, user: UserRef) -> list[str]:
+        """列出当前 origin 下绑定的 session。"""
         return bindings_for_origin(self.entry(user.user_key), origin_key(user))
 
     def has_binding(self, user: UserRef, session_id: str) -> bool:
+        """判断当前 origin 是否绑定了某个 session。"""
         if not is_valid_session_id(session_id):
             return False
         return session_id in bindings_for_origin(self.entry(user.user_key), origin_key(user))
@@ -120,6 +131,7 @@ class UserStateRepository:
         sessions: list[dict[str, Any]],
         max_items: int = MAX_SESSION_INDEX_ITEMS,
     ) -> None:
+        """缓存 `/cloudcli session` 展示出来的最近 session，供后续用序号引用。"""
         entry = self.entry(user.user_key)
         seen: set[str] = set()
         normalized: list[dict[str, str]] = []
@@ -149,6 +161,7 @@ class UserStateRepository:
             "items": normalized,
             "at": time.time(),
         }
+        # 只保留最近几个 origin 的序号缓存，避免状态文件无限膨胀。
         known_origins = set(_read_list(entry.get("origins"))[-5:])
         entry["session_indexes"] = {
             origin: value
@@ -157,6 +170,7 @@ class UserStateRepository:
         }
 
     def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
+        """在当前 origin 的序号缓存中查找 session 元数据。"""
         if not is_valid_session_id(session_id):
             return None
         entry = self.entry(user.user_key)
@@ -171,6 +185,7 @@ class UserStateRepository:
         return None
 
     def resolve_session_ref(self, user: UserRef, ref: str) -> tuple[dict[str, str] | None, str | None]:
+        """把 `last`、数字序号或直接 sessionId 解析成统一字典。"""
         ref = ref.strip()
         if not ref:
             return None, "sessionId 不能为空。"
@@ -201,6 +216,7 @@ class UserStateRepository:
         }, None
 
     def users_bound_to_session(self, session_id: str) -> list[dict[str, Any]]:
+        """查找绑定了某 session 的用户和 origin，用于审批主动通知。"""
         users = _read_dict(self.data.get("users"))
         result = []
         for user_key, entry in users.items():
@@ -221,6 +237,7 @@ class UserStateRepository:
         return result
 
     def entry(self, user_key: str) -> dict[str, Any]:
+        """读取或创建用户记录，并把旧版字段懒迁移到按 origin 分组的新结构。"""
         users = _read_dict(self.data.get("users"))
         self.data["users"] = users
         entry = users.setdefault(user_key, _empty_user_entry())
@@ -228,6 +245,7 @@ class UserStateRepository:
             entry = _empty_user_entry()
             users[user_key] = entry
         if "binding_origins" not in entry:
+            # 旧版本只有 bindings/origins；如果只有一个 origin，可以安全迁移为按 origin 绑定。
             origins = _read_list(entry.get("origins"))
             bindings = _read_list(entry.get("bindings"))
             if len(origins) == 1 and bindings:
@@ -239,6 +257,7 @@ class UserStateRepository:
             else:
                 entry["binding_origins"] = {}
         if "session_indexes" not in entry:
+            # 同样把旧版单份 session_index 迁移到当前唯一 origin 下。
             origins = _read_list(entry.get("origins"))
             legacy_items = _read_dict_list(entry.get("session_index"))
             if len(origins) == 1 and legacy_items:
@@ -254,12 +273,14 @@ class UserStateRepository:
 
 
 def origin_key(user: UserRef | None) -> str:
+    """返回当前聊天会话作用域；没有用户时用于系统记录。"""
     if user is None:
         return ""
     return user.unified_msg_origin or "__default__"
 
 
 def bindings_for_origin(entry: dict[str, Any], origin: str) -> list[str]:
+    """从用户记录中提取某个 origin 下可见的 session 绑定。"""
     binding_origins = read_origin_map(entry.get("binding_origins"))
     return sorted(
         session_id
@@ -269,6 +290,7 @@ def bindings_for_origin(entry: dict[str, Any], origin: str) -> list[str]:
 
 
 def read_origin_map(value: Any) -> dict[str, list[str]]:
+    """读取 `{session_id: [origin...]}` 结构，并过滤非法 sessionId。"""
     if not isinstance(value, dict):
         return {}
     result: dict[str, list[str]] = {}
@@ -283,6 +305,7 @@ def read_origin_map(value: Any) -> dict[str, list[str]]:
 
 
 def read_session_indexes(value: Any) -> dict[str, dict[str, Any]]:
+    """读取按 origin 分组的 session 序号缓存。"""
     if not isinstance(value, dict):
         return {}
     result: dict[str, dict[str, Any]] = {}
@@ -297,6 +320,7 @@ def read_session_indexes(value: Any) -> dict[str, dict[str, Any]]:
 
 
 def session_index_for_origin(entry: dict[str, Any], origin: str) -> list[dict[str, Any]]:
+    """获取当前 origin 下的最近 session 缓存列表。"""
     scoped = read_session_indexes(entry.get("session_indexes")).get(origin)
     if isinstance(scoped, dict):
         return _read_dict_list(scoped.get("items"))
@@ -304,6 +328,7 @@ def session_index_for_origin(entry: dict[str, Any], origin: str) -> list[dict[st
 
 
 def _empty_user_entry() -> dict[str, Any]:
+    """创建新用户记录的默认结构。"""
     return {
         "display_name": "",
         "origins": [],

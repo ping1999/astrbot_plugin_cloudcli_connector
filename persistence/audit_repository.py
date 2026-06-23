@@ -1,3 +1,5 @@
+"""审批审计记录仓库。"""
+
 from __future__ import annotations
 
 import time
@@ -17,6 +19,8 @@ MAX_AUDIT_ITEMS = 500
 
 
 class AuditRepository:
+    """只操作状态字典中的 `audit` 区域，不负责加锁和落盘。"""
+
     def __init__(self, data: dict[str, Any]) -> None:
         self.data = data
 
@@ -30,6 +34,7 @@ class AuditRepository:
         result: str = "sent",
         input_summary: str = "",
     ) -> None:
+        """追加一条审批审计记录，并保留最近 MAX_AUDIT_ITEMS 条。"""
         audit = _read_dict_list(self.data.get("audit"))
         audit.append(
             {
@@ -50,6 +55,7 @@ class AuditRepository:
         self.data["audit"] = audit[-MAX_AUDIT_ITEMS:]
 
     def list(self, user: UserRef, entry: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+        """列出当前用户和当前 origin 可见的审计记录。"""
         origin = origin_key(user)
         bindings = set(bindings_for_origin(entry, origin))
         audit = _read_dict_list(self.data.get("audit"))
@@ -70,6 +76,7 @@ class AuditRepository:
         return items[: max(1, min(limit, 50))]
 
     def scrub_sensitive(self, omitted_text: str) -> None:
+        """关闭敏感状态持久化时，清除审计中的工具输入摘要。"""
         audit = _read_dict_list(self.data.get("audit"))
         for item in audit:
             if item.get("input_summary"):
@@ -78,6 +85,7 @@ class AuditRepository:
 
 
 def normalize_audit_records(value: Any) -> list[dict[str, Any]]:
+    """加载状态文件时清洗审计记录。"""
     records: list[dict[str, Any]] = []
     for item in _read_dict_list(value):
         records.append(
@@ -100,6 +108,7 @@ def normalize_audit_records(value: Any) -> list[dict[str, Any]]:
 
 
 def audit_origin_visible(item: dict[str, Any], entry: dict[str, Any], origin: str) -> bool:
+    """判断旧/新审计记录是否属于当前聊天 origin。"""
     item_origin = _read_str(item.get("origin"))
     if item_origin:
         return item_origin == origin
