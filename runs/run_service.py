@@ -79,11 +79,11 @@ class RunService:
         self.cancel_requested_run_ids: set[str] = set()
         self.abort_sent_run_ids: set[str] = set()
 
-    async def handle_run(self, user: UserRef, args: list[str]) -> str:
+    async def handle_run(self, user: UserRef, args: list[str], raw_args: str = "") -> str:
         if args and args[0] in {"list", "log", "cancel"}:
             return await self.handle_run_control(user, args)
 
-        parsed, error = await self.request_builder.parse(user, args)
+        parsed, error = await self.request_builder.parse(user, args, raw_args=raw_args)
         if error:
             return error
         assert parsed is not None

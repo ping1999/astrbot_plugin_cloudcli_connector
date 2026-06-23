@@ -9,13 +9,15 @@ from pathlib import Path
 
 from approvals.approval_notifications import ApprovalNotificationPolicy
 from approvals.approval_service import ApprovalService
+from cloudcli.cloudcli_auth import CloudCLIAuth
 from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIConfig, CloudCLIError
 from cloudcli.cloudcli_agent import CloudCLIAgentClient
+from cloudcli.cloudcli_rest import CloudCLIRestClient
 import cloudcli.cloudcli_agent as cloudcli_agent_module
 from cloudcli.cloudcli_models import active_sessions_contains
 from cloudcli.cloudcli_protocol import build_ws_url, parse_sse_event
 from cloudcli.cloudcli_transport import WebSocketRequestMux
-from commands.command_parser import ParsedCommand
+from commands.command_parser import ParsedCommand, parse_command
 from commands.command_router import CommandRoute, CommandRouter
 from commands.formatting import (
     format_agent_start_message,
@@ -217,6 +219,22 @@ class IdentityTests(unittest.TestCase):
         self.assertFalse(authz.can_access_sessions(user).allowed)
         self.assertFalse(authz.can_run_agent(user).allowed)
         self.assertFalse(authz.can_manage_approvals(user).allowed)
+
+    def test_stop_permission_is_not_inherited_from_authenticated_session_access(self) -> None:
+        settings = load_connector_settings({"session_access_mode": "authenticated"})
+        authz = AuthorizationPolicy(settings)
+        user = UserRef("test:u1", "User", "origin")
+
+        self.assertTrue(authz.can_access_sessions(user).allowed)
+        self.assertFalse(authz.can_stop_sessions(user).allowed)
+
+        allowed = load_connector_settings(
+            {
+                "session_access_mode": "authenticated",
+                "stop_allowed_user_keys": "test:u1",
+            }
+        )
+        self.assertTrue(AuthorizationPolicy(allowed).can_stop_sessions(user).allowed)
 
     def test_approval_allowlist_can_bind_without_session_read_access(self) -> None:
         settings = load_connector_settings(
@@ -613,6 +631,39 @@ class RunRequestTests(unittest.TestCase):
         project_path, expected_path, error = asyncio.run(scenario())
         self.assertIsNone(error)
         self.assertEqual(os.path.normcase(expected_path), os.path.normcase(project_path))
+
+    def test_run_parser_preserves_raw_message_after_double_dash(self) -> None:
+        async def scenario() -> tuple[dict[str, object] | None, str | None, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                project = Path(temp_dir) / "repo with spaces"
+                project.mkdir()
+                settings = load_connector_settings(
+                    {
+                        "run_access_mode": "authenticated",
+                        "allowed_project_roots": str(Path(temp_dir)),
+                    }
+                )
+                builder = RunRequestBuilder(
+                    settings=settings,
+                    authz=AuthorizationPolicy(settings),
+                    sessions=FakeSessions("unused"),
+                )
+                command = parse_command(
+                    f'/cloudcli run --project="{project}" -- Say "hello world" exactly and "keep open'
+                )
+                parsed, error = await builder.parse(
+                    UserRef("test:u1", "User", "origin"),
+                    command.args,
+                    raw_args=command.raw_args,
+                )
+                return None if parsed is None else parsed.payload, error, str(project.resolve(strict=False))
+
+        payload, error, expected_project = asyncio.run(scenario())
+        self.assertIsNone(error)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual("Say \"hello world\" exactly and \"keep open", payload["message"])
+        self.assertEqual(os.path.normcase(expected_project), os.path.normcase(str(payload["projectPath"])))
 
     def test_run_session_target_validates_resolved_project_path(self) -> None:
         async def scenario() -> tuple[object | None, str | None]:
@@ -1146,6 +1197,72 @@ class CloudCLIClientTests(unittest.TestCase):
         self.assertEqual("Bearer jwt-token", headers.get("Authorization"))
         self.assertEqual("api-secret", headers.get("X-API-Key"))
 
+    def test_rest_refreshes_expired_static_jwt_when_login_credentials_exist(self) -> None:
+        class FakeContent:
+            def __init__(self, text: str) -> None:
+                self.payload = text.encode("utf-8")
+
+            async def iter_chunked(self, _size: int):
+                yield self.payload
+
+        class FakeResponse:
+            def __init__(self, status: int, body: str = "") -> None:
+                self.status = status
+                self.content = FakeContent(body)
+                self.charset = "utf-8"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.get_headers: list[dict[str, str]] = []
+                self.login_payloads: list[dict[str, str]] = []
+
+            def get(self, _url: str, *, params=None, headers=None):
+                self.get_headers.append(dict(headers or {}))
+                if len(self.get_headers) == 1:
+                    return FakeResponse(401)
+                return FakeResponse(200, '{"projects": []}')
+
+            def post(self, _url: str, *, json=None, headers=None):
+                self.login_payloads.append(dict(json or {}))
+                return FakeResponse(200, '{"token": "fresh-token"}')
+
+        async def scenario() -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+            session = FakeSession()
+            config = CloudCLIConfig(
+                base_url="http://127.0.0.1:3001",
+                jwt_token="expired-token",
+                username="user",
+                password="password",
+            )
+
+            async def ensure_session() -> FakeSession:
+                return session
+
+            auth = CloudCLIAuth(
+                config=config,
+                ensure_session=ensure_session,
+                api_url=lambda path: f"http://127.0.0.1:3001{path}",
+            )
+            rest = CloudCLIRestClient(
+                config=config,
+                auth=auth,
+                ensure_session=ensure_session,
+                api_url=lambda path: f"http://127.0.0.1:3001{path}",
+            )
+            await rest.get_recent_sessions(1)
+            return session.get_headers, session.login_payloads
+
+        get_headers, login_payloads = asyncio.run(scenario())
+        self.assertEqual("Bearer expired-token", get_headers[0].get("Authorization"))
+        self.assertEqual("Bearer fresh-token", get_headers[1].get("Authorization"))
+        self.assertEqual([{"username": "user", "password": "password"}], login_payloads)
+
     def test_agent_stream_refreshes_expired_cached_login_token(self) -> None:
         class FakeContent:
             def __init__(self, text: str) -> None:
@@ -1195,7 +1312,8 @@ class CloudCLIClientTests(unittest.TestCase):
                 self.calls += 1
                 return {"Authorization": f"Bearer token-{self.calls}"}
 
-            async def clear_cached_token(self) -> None:
+            async def clear_cached_token(self, *, force: bool = False) -> None:
+                self.force = force
                 self.cleared += 1
 
         async def scenario() -> tuple[int, list[dict[str, str]], list[dict[str, object]]]:

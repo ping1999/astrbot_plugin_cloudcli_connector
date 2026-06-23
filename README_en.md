@@ -42,7 +42,7 @@ Options: `--project <path>`, `--github <url>`, `--session <sessionId>`, `--provi
 
 Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run log <taskId>`, and `/cloudcli run cancel <taskId>` to inspect or cancel tasks.
 
-`/cloudcli stop <sessionId|index|last> [provider]` sends `abort-session` through the CloudCLI WebSocket.
+`/cloudcli stop <sessionId|index|last> [provider]` sends `abort-session` through the CloudCLI WebSocket. It uses independent `stop_access_mode` / `stop_allowed_user_keys` permissions, so `session_access_mode=authenticated` does not automatically grant stop access.
 
 `/cloudcli audit [count]` shows visible approval audit records. `/cloudcli whoami` prints the current AstrBot user key for approval allowlist configuration.
 
@@ -56,7 +56,7 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - Users only receive push notifications for sessions they have bound.
 - Session bindings, session indexes, pending approvals, audit entries, and run logs are scoped to the current chat origin by default. A private-chat binding is not automatically visible in a group chat for the same user.
 - The WebSocket connection is supervised and reconnects with backoff after CloudCLI restarts or transient network failures.
-- By default, only AstrBot admins or users in `session_allowed_user_keys` can list, bind, read, or stop CloudCLI sessions.
+- By default, only AstrBot admins or users in `session_allowed_user_keys` can list, bind, or read CloudCLI sessions; stopping sessions is controlled by independent `stop_allowed_user_keys` / `stop_access_mode` settings.
 - By default, only AstrBot admins or users in `run_allowed_user_keys` can start `/cloudcli run` agent tasks.
 - For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
 - By default, `persist_sensitive_state=false`, so approval input bodies, audit input summaries, and raw `/cloudcli run` task text are not written in full to local `state.json`. Fresh approval details are still available in memory after a push or refresh.
@@ -80,6 +80,9 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `session_access_mode`: session access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
 - `session_require_admin`: legacy compatibility flag. Prefer `session_access_mode`; setting this to `false` without an access mode now means allowlist-only, not all users.
 - `allow_direct_session_id`: allow non-admin users to use raw session IDs that are not bound and not in their current session index
+- `stop_allowed_user_keys`: comma-separated allowlist for `/cloudcli stop`
+- `stop_access_mode`: independent `/cloudcli stop` access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
+- `stop_require_admin`: legacy compatibility flag. Prefer `stop_access_mode`
 - `recent_sessions_limit`: number of recent sessions shown by `/cloudcli session`
 - `chat_messages_limit`: default recent message count shown by `/cloudcli chat`
 - `max_run_message_length`: maximum task text length accepted by `/cloudcli run`

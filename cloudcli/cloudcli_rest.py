@@ -104,10 +104,10 @@ class CloudCLIRestClient:
         data, unauthorized = await self._get_json(path, params, headers)
         if not unauthorized:
             return data
-        if self.config.jwt_token.strip() or not (self.config.username and self.config.password):
+        if not (self.config.username and self.config.password):
             raise CloudCLIError("CloudCLI REST 认证失败，请检查 JWT token 或用户名/密码。")
 
-        await self.auth.clear_cached_token()
+        await self.auth.clear_cached_token(force=True)
         token = await self.auth.get_token()
         data, unauthorized = await self._get_json(path, params, self.auth.headers(token))
         if unauthorized:

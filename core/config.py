@@ -34,6 +34,9 @@ class ConnectorSettings:
     session_allowed_user_keys: frozenset[str]
     session_require_admin: bool
     session_access_mode: str
+    stop_allowed_user_keys: frozenset[str]
+    stop_require_admin: bool
+    stop_access_mode: str
     allow_direct_session_id: bool
     run_allowed_user_keys: frozenset[str]
     run_require_admin: bool
@@ -55,6 +58,7 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
     api_key = _read_str(get("cloudcli_api_key"), "")
     approval_require_admin = _read_bool(get("approval_require_admin"), True)
     session_require_admin = _read_bool(get("session_require_admin"), True)
+    stop_require_admin = _read_bool(get("stop_require_admin"), True)
     run_require_admin = _read_bool(get("run_require_admin"), True)
     has_cloudcli_credentials = bool(jwt_token or api_key or (username and password))
     return ConnectorSettings(
@@ -105,6 +109,12 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
         session_access_mode=_read_access_mode(
             get("session_access_mode"),
             legacy_require_admin=session_require_admin,
+        ),
+        stop_allowed_user_keys=frozenset(_read_str_list(get("stop_allowed_user_keys"))),
+        stop_require_admin=stop_require_admin,
+        stop_access_mode=_read_access_mode(
+            get("stop_access_mode"),
+            legacy_require_admin=stop_require_admin,
         ),
         allow_direct_session_id=_read_bool(get("allow_direct_session_id"), False),
         run_allowed_user_keys=frozenset(_read_str_list(get("run_allowed_user_keys"))),

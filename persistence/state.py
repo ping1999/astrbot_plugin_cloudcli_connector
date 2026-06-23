@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
-import time
 from pathlib import Path
 from typing import Any
 
 try:
     from ..core.sanitizer import compact_json, safe_json_value, safe_text
+    from .audit_repository import AuditRepository, MAX_AUDIT_ITEMS, normalize_audit_records
     from .state_models import (
         PendingApproval,
         UserRef,
@@ -17,10 +16,33 @@ try:
         pending_storage_key,
     )
     from .pending_repository import PendingApprovalRepository, normalize_pending_records
+    from .run_repository import (
+        DEFAULT_MAX_RUN_HISTORY_GLOBAL,
+        DEFAULT_MAX_RUN_HISTORY_PER_USER,
+        RUN_ID_RE,
+        RunRepository,
+        guess_next_run_id,
+        normalize_run_records,
+    )
     from .state_storage import JsonStateStore
+    from .user_repository import (
+        MAX_SESSION_INDEX_ITEMS,
+        UserStateRepository,
+        bindings_for_origin,
+        origin_key,
+    )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from core.sanitizer import compact_json, safe_json_value, safe_text
+    from persistence.audit_repository import AuditRepository, MAX_AUDIT_ITEMS, normalize_audit_records
     from persistence.pending_repository import PendingApprovalRepository, normalize_pending_records
+    from persistence.run_repository import (
+        DEFAULT_MAX_RUN_HISTORY_GLOBAL,
+        DEFAULT_MAX_RUN_HISTORY_PER_USER,
+        RUN_ID_RE,
+        RunRepository,
+        guess_next_run_id,
+        normalize_run_records,
+    )
     from persistence.state_models import (
         PendingApproval,
         UserRef,
@@ -28,14 +50,13 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         pending_storage_key,
     )
     from persistence.state_storage import JsonStateStore
+    from persistence.user_repository import (
+        MAX_SESSION_INDEX_ITEMS,
+        UserStateRepository,
+        bindings_for_origin,
+        origin_key,
+    )
 
-RUN_ID_RE = re.compile(r"^[0-9]{1,12}$")
-
-MAX_SESSION_INDEX_ITEMS = 100
-MAX_RUN_LOG_ITEMS = 80
-MAX_AUDIT_ITEMS = 500
-DEFAULT_MAX_RUN_HISTORY_PER_USER = 50
-DEFAULT_MAX_RUN_HISTORY_GLOBAL = 500
 MAX_STORED_TEXT = 1200
 OMITTED_SENSITIVE_TEXT = "[omitted by persist_sensitive_state=false]"
 OMITTED_SENSITIVE_INPUT = {
@@ -71,11 +92,11 @@ class PluginState:
                     self._data["version"] = 3
                     self._data["users"] = _read_dict(loaded.get("users"))
                     self._data["pending"] = normalize_pending_records(_read_dict(loaded.get("pending")))
-                    self._data["runs"] = _normalize_run_records(_read_dict(loaded.get("runs")))
-                    self._data["audit"] = _normalize_audit_records(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
+                    self._data["runs"] = normalize_run_records(_read_dict(loaded.get("runs")))
+                    self._data["audit"] = normalize_audit_records(loaded.get("audit"))[-MAX_AUDIT_ITEMS:]
                     self._data["next_run_id"] = _read_positive_int(
                         loaded.get("next_run_id"),
-                        self._guess_next_run_id(self._data["runs"]),
+                        guess_next_run_id(self._data["runs"]),
                     )
                     if not self.persist_sensitive_state:
                         self._scrub_sensitive_state_locked()
@@ -94,14 +115,7 @@ class PluginState:
 
     async def remember_user(self, user: UserRef) -> None:
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            entry["display_name"] = user.display_name
-            origins = _read_list(entry.get("origins"))
-            origin = _origin_key(user)
-            if origin not in origins:
-                origins.append(origin)
-            entry["origins"] = origins[-5:]
-            entry["last_seen_at"] = time.time()
+            self._users_locked().remember_user(user)
             await self._save_locked()
 
     async def bind_session(
@@ -115,93 +129,33 @@ class PluginState:
         if max_bindings < 1:
             max_bindings = 1
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            entry["display_name"] = user.display_name
-            origins = _read_list(entry.get("origins"))
-            origin = _origin_key(user)
-            if origin not in origins:
-                origins.append(origin)
-            entry["origins"] = origins[-5:]
-            binding_origins = _read_origin_map(entry.get("binding_origins"))
-            session_origins = binding_origins.get(session_id, [])
-            origin_added = False
-            if origin not in session_origins:
-                session_origins.append(origin)
-                binding_origins[session_id] = session_origins[-5:]
-                entry["binding_origins"] = binding_origins
-                origin_added = True
-            bindings = _read_list(entry.get("bindings"))
-            if session_id in bindings:
-                if origin_added:
-                    await self._save_locked()
-                    return False, f"已绑定 session：{session_id}，并已为当前会话启用通知。"
-                return False, f"已绑定 session：{session_id}"
-            if len(bindings) >= max_bindings:
-                return False, f"绑定数量已达上限 {max_bindings}。"
-            bindings.append(session_id)
-            entry["bindings"] = sorted(bindings)
-            entry["binding_origins"] = binding_origins
+            changed, message = self._users_locked().bind_session(user, session_id, max_bindings)
             await self._save_locked()
-            return True, f"已绑定 session：{session_id}"
+            return changed, message
 
     async def unbind_session(self, user: UserRef, session_id: str) -> tuple[bool, str]:
         if not is_valid_session_id(session_id):
             return False, "sessionId 格式不合法。"
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            bindings = _read_list(entry.get("bindings"))
-            binding_origins = _read_origin_map(entry.get("binding_origins"))
-            origins = binding_origins.get(session_id, [])
-            origin = _origin_key(user)
-            if session_id not in bindings or origin not in origins:
-                return False, f"未绑定 session：{session_id}"
-            origins.remove(origin)
-            if origins:
-                binding_origins[session_id] = origins
-            else:
-                binding_origins.pop(session_id, None)
-                bindings.remove(session_id)
-            entry["bindings"] = sorted(bindings)
-            entry["binding_origins"] = binding_origins
+            changed, message = self._users_locked().unbind_session(user, session_id)
             await self._save_locked()
-            return True, f"已解绑 session：{session_id}"
+            return changed, message
 
     async def unbind_all(self, user: UserRef) -> tuple[bool, str]:
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            bindings = _read_list(entry.get("bindings"))
-            binding_origins = _read_origin_map(entry.get("binding_origins"))
-            origin = _origin_key(user)
-            current = _bindings_for_origin(entry, origin)
-            count = len(current)
-            for session_id in current:
-                origins = binding_origins.get(session_id, [])
-                if origin in origins:
-                    origins.remove(origin)
-                if origins:
-                    binding_origins[session_id] = origins
-                else:
-                    binding_origins.pop(session_id, None)
-                    if session_id in bindings:
-                        bindings.remove(session_id)
-            entry["bindings"] = sorted(bindings)
-            entry["binding_origins"] = binding_origins
+            changed, message = self._users_locked().unbind_all(user)
             await self._save_locked()
-            if count == 0:
-                return False, "当前没有绑定任何 session。"
-            return True, f"已解绑全部 session，共 {count} 个。"
+            return changed, message
 
     async def list_bindings(self, user: UserRef) -> list[str]:
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            return _bindings_for_origin(entry, _origin_key(user))
+            return self._users_locked().list_bindings(user)
 
     async def has_binding(self, user: UserRef, session_id: str) -> bool:
         if not is_valid_session_id(session_id):
             return False
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            return session_id in _bindings_for_origin(entry, _origin_key(user))
+            return self._users_locked().has_binding(user, session_id)
 
     async def remember_session_index(
         self,
@@ -210,56 +164,14 @@ class PluginState:
         max_items: int = MAX_SESSION_INDEX_ITEMS,
     ) -> None:
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            seen: set[str] = set()
-            normalized: list[dict[str, str]] = []
-            for item in sessions:
-                if not isinstance(item, dict):
-                    continue
-                session_id = _read_str(
-                    item.get("id") or item.get("sessionId") or item.get("session_id")
-                ).strip()
-                if not is_valid_session_id(session_id) or session_id in seen:
-                    continue
-                seen.add(session_id)
-                normalized.append(
-                    {
-                        "id": session_id,
-                        "provider": safe_text(item.get("provider"), 60),
-                        "projectName": safe_text(item.get("projectName"), 160),
-                        "projectPath": safe_text(item.get("projectPath"), 500),
-                        "summary": safe_text(item.get("summary"), 240),
-                        "lastActivity": safe_text(item.get("lastActivity"), 80),
-                    }
-                )
-                if len(normalized) >= max(1, min(max_items, MAX_SESSION_INDEX_ITEMS)):
-                    break
-            session_indexes = _read_session_indexes(entry.get("session_indexes"))
-            session_indexes[_origin_key(user)] = {
-                "items": normalized,
-                "at": time.time(),
-            }
-            known_origins = set(_read_list(entry.get("origins"))[-5:])
-            entry["session_indexes"] = {
-                origin: value
-                for origin, value in session_indexes.items()
-                if origin in known_origins or origin == _origin_key(user)
-            }
+            self._users_locked().remember_session_index(user, sessions, max_items)
             await self._save_locked()
 
     async def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
         if not is_valid_session_id(session_id):
             return None
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            for item in _session_index_for_origin(entry, _origin_key(user)):
-                if _read_str(item.get("id")) == session_id:
-                    return {
-                        "id": session_id,
-                        "provider": _read_str(item.get("provider")),
-                        "projectName": _read_str(item.get("projectName")),
-                        "projectPath": _read_str(item.get("projectPath")),
-                    }
+            return self._users_locked().find_session_index_item(user, session_id)
         return None
 
     async def resolve_session_ref(
@@ -267,56 +179,12 @@ class PluginState:
         user: UserRef,
         ref: str,
     ) -> tuple[dict[str, str] | None, str | None]:
-        ref = ref.strip()
-        if not ref:
-            return None, "sessionId 不能为空。"
-        if ref.lower() in {"last", "latest"}:
-            index = 1
-        elif ref.isdigit():
-            index = int(ref)
-        else:
-            if not is_valid_session_id(ref):
-                return None, "sessionId 格式不合法，只允许字母、数字、点、下划线、冒号和短横线。"
-            return {"id": ref, "provider": ""}, None
-
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            cached = _session_index_for_origin(entry, _origin_key(user))
-            if not cached:
-                return None, "没有可用的 session 序号缓存，请先执行 /cloudcli session。"
-            if index < 1 or index > len(cached):
-                return None, f"session 序号无效，请输入 1-{len(cached)}。"
-            item = cached[index - 1]
-            session_id = _read_str(item.get("id"))
-            if not is_valid_session_id(session_id):
-                return None, "缓存中的 sessionId 格式不合法，请重新执行 /cloudcli session。"
-            return {
-                "id": session_id,
-                "provider": _read_str(item.get("provider")),
-                "projectName": _read_str(item.get("projectName")),
-                "projectPath": _read_str(item.get("projectPath")),
-            }, None
+            return self._users_locked().resolve_session_ref(user, ref)
 
     async def users_bound_to_session(self, session_id: str) -> list[dict[str, Any]]:
         async with self._lock:
-            users = _read_dict(self._data.get("users"))
-            result = []
-            for user_key, entry in users.items():
-                if not isinstance(entry, dict):
-                    continue
-                if session_id in _read_list(entry.get("bindings")):
-                    binding_origins = _read_origin_map(entry.get("binding_origins"))
-                    origins = binding_origins.get(session_id, [])
-                    if not origins:
-                        continue
-                    result.append(
-                        {
-                            "user_key": user_key,
-                            "display_name": _read_str(entry.get("display_name")),
-                            "origins": origins,
-                        }
-                    )
-            return result
+            return self._users_locked().users_bound_to_session(session_id)
 
     async def upsert_pending(self, approval: PendingApproval) -> None:
         async with self._lock:
@@ -375,8 +243,8 @@ class PluginState:
         max_items: int,
     ) -> list[PendingApproval]:
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            bindings = _bindings_for_origin(entry, _origin_key(user))
+            entry = self._users_locked().entry(user.user_key)
+            bindings = bindings_for_origin(entry, origin_key(user))
             return self._with_cached_pending_inputs(
                 self._pending_repo_locked().visible_for_bindings(bindings, max_items)
             )
@@ -406,8 +274,8 @@ class PluginState:
         action: str,
     ) -> tuple[PendingApproval | None, str | None]:
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            bindings = _bindings_for_origin(entry, _origin_key(user))
+            entry = self._users_locked().entry(user.user_key)
+            bindings = bindings_for_origin(entry, origin_key(user))
             repo = self._pending_repo_locked()
             visible = repo.visible_for_bindings(bindings, max_items)
             if not visible:
@@ -482,30 +350,14 @@ class PluginState:
         max_history_global: int = DEFAULT_MAX_RUN_HISTORY_GLOBAL,
     ) -> str:
         async with self._lock:
-            run_id = str(_read_positive_int(self._data.get("next_run_id"), 1))
-            self._data["next_run_id"] = int(run_id) + 1
-            runs = _read_dict(self._data.get("runs"))
-            now = time.time()
-            runs[run_id] = {
-                "id": run_id,
-                "user_key": user.user_key,
-                "display_name": user.display_name,
-                "origin": _origin_key(user),
-                "status": "running",
-                "provider": safe_text(payload.get("provider"), 60) or "claude",
-                "session_id": safe_text(payload.get("sessionId"), 200),
-                "project_path": safe_text(payload.get("projectPath"), 500),
-                "github_url": safe_text(payload.get("githubUrl"), 500),
-                "target": safe_text(display_target, 500),
-                "message": self._sensitive_text_for_storage(payload.get("message")),
-                "started_at": now,
-                "updated_at": now,
-                "finished_at": 0,
-                "log": [],
-                "summary": {},
-            }
-            self._prune_runs_locked(runs, max_history_per_user, max_history_global)
-            self._data["runs"] = runs
+            run_id = self._runs_locked().create_task(
+                user,
+                payload,
+                display_target,
+                message_for_storage=self._sensitive_text_for_storage,
+                max_history_per_user=max_history_per_user,
+                max_history_global=max_history_global,
+            )
             await self._save_locked()
             return run_id
 
@@ -523,85 +375,35 @@ class PluginState:
         if not RUN_ID_RE.fullmatch(run_id):
             return
         async with self._lock:
-            runs = _read_dict(self._data.get("runs"))
-            item = runs.get(run_id)
-            if not isinstance(item, dict):
-                return
-            now = time.time()
-            if status:
-                item["status"] = safe_text(status, 40)
-            if session_id and is_valid_session_id(session_id):
-                item["session_id"] = session_id
-            if summary is not None:
-                item["summary"] = safe_json_value(self._summary_for_storage(summary))
-            if error:
-                item["error"] = safe_text(error, MAX_STORED_TEXT)
-            if event:
-                log = _read_dict_list(item.get("log"))
-                log.append({"ts": now, "text": safe_text(event, MAX_STORED_TEXT)})
-                item["log"] = log[-MAX_RUN_LOG_ITEMS:]
-            if finished:
-                item["finished_at"] = now
-            item["updated_at"] = now
-            runs[run_id] = item
-            self._data["runs"] = runs
-            await self._save_locked()
+            if self._runs_locked().update_task(
+                run_id,
+                status=status,
+                event=event,
+                session_id=session_id,
+                summary=summary,
+                summary_for_storage=self._summary_for_storage,
+                error=error,
+                finished=finished,
+            ):
+                await self._save_locked()
 
     async def prune_run_history(self, max_history_per_user: int, max_history_global: int) -> None:
         async with self._lock:
-            runs = _read_dict(self._data.get("runs"))
-            before = len(runs)
-            self._prune_runs_locked(runs, max_history_per_user, max_history_global)
-            if len(runs) != before:
-                self._data["runs"] = runs
+            if self._runs_locked().prune_history(max_history_per_user, max_history_global):
                 await self._save_locked()
 
     async def list_run_tasks(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
         async with self._lock:
-            runs = _read_dict(self._data.get("runs"))
-            items = [
-                dict(item)
-                for item in runs.values()
-                if isinstance(item, dict)
-                and item.get("user_key") == user.user_key
-                and _run_visible_in_origin(item, user)
-            ]
-            items.sort(key=lambda item: float(item.get("started_at") or 0), reverse=True)
-            return items[: max(1, min(limit, 50))]
+            return self._runs_locked().list_tasks(user, limit)
 
     async def get_run_task(self, user: UserRef, run_id: str) -> tuple[dict[str, Any] | None, str | None]:
-        if not RUN_ID_RE.fullmatch(run_id):
-            return None, "任务编号格式不合法。"
         async with self._lock:
-            item = _read_dict(self._data.get("runs")).get(run_id)
-            if not isinstance(item, dict):
-                return None, f"没有找到任务 #{run_id}。"
-            if item.get("user_key") != user.user_key:
-                return None, "只能查看或操作自己发起的 CloudCLI 任务。"
-            if not _run_visible_in_origin(item, user):
-                return None, "只能在发起任务的聊天会话中查看或操作该任务。"
-            return dict(item), None
+            return self._runs_locked().get_task(user, run_id)
 
     async def mark_interrupted_runs(self, reason: str) -> int:
         async with self._lock:
-            runs = _read_dict(self._data.get("runs"))
-            now = time.time()
-            changed = 0
-            for item in runs.values():
-                if not isinstance(item, dict):
-                    continue
-                status = _read_str(item.get("status"))
-                if status not in {"running", "queued", "pending"}:
-                    continue
-                item["status"] = "interrupted"
-                item["updated_at"] = now
-                item["finished_at"] = now
-                log = _read_dict_list(item.get("log"))
-                log.append({"ts": now, "text": safe_text(reason, MAX_STORED_TEXT)})
-                item["log"] = log[-MAX_RUN_LOG_ITEMS:]
-                changed += 1
+            changed = self._runs_locked().mark_interrupted(reason)
             if changed:
-                self._data["runs"] = runs
                 await self._save_locked()
             return changed
 
@@ -615,47 +417,20 @@ class PluginState:
         result: str = "sent",
     ) -> None:
         async with self._lock:
-            audit = _read_dict_list(self._data.get("audit"))
-            audit.append(
-                {
-                    "ts": time.time(),
-                    "user_key": user.user_key if user else "system",
-                    "display_name": user.display_name if user else "system",
-                    "origin": _origin_key(user) if user else "",
-                    "action": safe_text(action, 40),
-                    "result": safe_text(result, 80),
-                    "request_id": approval.request_id,
-                    "session_id": approval.session_id,
-                    "tool_name": approval.tool_name,
-                    "provider": approval.provider,
-                    "reason": safe_text(reason, 500),
-                    "input_summary": self._approval_input_summary_for_storage(approval),
-                }
+            self._audit_locked().append(
+                user=user,
+                action=action,
+                approval=approval,
+                reason=reason,
+                result=result,
+                input_summary=self._approval_input_summary_for_storage(approval),
             )
-            self._data["audit"] = audit[-MAX_AUDIT_ITEMS:]
             await self._save_locked()
 
     async def list_audit(self, user: UserRef, limit: int) -> list[dict[str, Any]]:
         async with self._lock:
-            entry = self._user_entry(user.user_key)
-            origin = _origin_key(user)
-            bindings = set(_bindings_for_origin(entry, origin))
-            audit = _read_dict_list(self._data.get("audit"))
-            items = [
-                dict(item)
-                for item in audit
-                if (
-                    item.get("user_key") == user.user_key
-                    and _audit_origin_visible(item, entry, origin)
-                )
-                or (
-                    item.get("user_key") == "system"
-                    and bindings
-                    and item.get("session_id") in bindings
-                )
-            ]
-            items.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
-            return items[: max(1, min(limit, 50))]
+            entry = self._users_locked().entry(user.user_key)
+            return self._audit_locked().list(user, entry, limit)
 
     def _approval_for_storage(self, approval: PendingApproval) -> PendingApproval:
         if self.persist_sensitive_state:
@@ -726,114 +501,20 @@ class PluginState:
                 item["input_data"] = dict(OMITTED_SENSITIVE_INPUT)
         self._data["pending"] = pending
 
-        runs = _read_dict(self._data.get("runs"))
-        for item in runs.values():
-            if not isinstance(item, dict):
-                continue
-            item["message"] = OMITTED_SENSITIVE_TEXT
-            summary = item.get("summary")
-            if isinstance(summary, dict) and summary.get("assistantText"):
-                summary["assistantText"] = OMITTED_SENSITIVE_TEXT
-                item["summary"] = summary
-        self._data["runs"] = runs
-
-        audit = _read_dict_list(self._data.get("audit"))
-        for item in audit:
-            if item.get("input_summary"):
-                item["input_summary"] = OMITTED_SENSITIVE_TEXT
-        self._data["audit"] = audit[-MAX_AUDIT_ITEMS:]
+        self._runs_locked().scrub_sensitive(OMITTED_SENSITIVE_TEXT)
+        self._audit_locked().scrub_sensitive(OMITTED_SENSITIVE_TEXT)
 
     def _pending_repo_locked(self) -> PendingApprovalRepository:
         return PendingApprovalRepository(self._data)
 
-    def _user_entry(self, user_key: str) -> dict[str, Any]:
-        users = _read_dict(self._data.get("users"))
-        self._data["users"] = users
-        entry = users.setdefault(
-            user_key,
-            {
-                "display_name": "",
-                "origins": [],
-                "bindings": [],
-                "binding_origins": {},
-                "last_seen_at": 0,
-                "session_index": [],
-                "session_index_at": 0,
-                "session_indexes": {},
-            },
-        )
-        if not isinstance(entry, dict):
-            entry = {
-                "display_name": "",
-                "origins": [],
-                "bindings": [],
-                "binding_origins": {},
-                "last_seen_at": 0,
-                "session_index": [],
-                "session_index_at": 0,
-                "session_indexes": {},
-            }
-            users[user_key] = entry
-        if "binding_origins" not in entry:
-            origins = _read_list(entry.get("origins"))
-            bindings = _read_list(entry.get("bindings"))
-            if len(origins) == 1 and bindings:
-                entry["binding_origins"] = {
-                    session_id: origins[:]
-                    for session_id in bindings
-                    if is_valid_session_id(session_id)
-                }
-            else:
-                entry["binding_origins"] = {}
-        if "session_indexes" not in entry:
-            origins = _read_list(entry.get("origins"))
-            legacy_items = _read_dict_list(entry.get("session_index"))
-            if len(origins) == 1 and legacy_items:
-                entry["session_indexes"] = {
-                    origins[0]: {
-                        "items": legacy_items,
-                        "at": _parse_timestamp(entry.get("session_index_at")),
-                    }
-                }
-            else:
-                entry["session_indexes"] = {}
-        return entry
+    def _users_locked(self) -> UserStateRepository:
+        return UserStateRepository(self._data)
 
-    def _guess_next_run_id(self, runs: dict[str, Any]) -> int:
-        ids = [int(key) for key in runs if isinstance(key, str) and RUN_ID_RE.fullmatch(key)]
-        return max(ids, default=0) + 1
+    def _runs_locked(self) -> RunRepository:
+        return RunRepository(self._data)
 
-    def _prune_runs_locked(
-        self,
-        runs: dict[str, Any],
-        max_history_per_user: int,
-        max_history_global: int,
-    ) -> None:
-        removable = [
-            (str(run_id), item)
-            for run_id, item in runs.items()
-            if isinstance(item, dict)
-            and _read_str(item.get("status")) not in {"running", "queued", "pending"}
-        ]
-        if max_history_per_user > 0:
-            by_user: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-            for run_id, item in removable:
-                by_user.setdefault(_read_str(item.get("user_key")), []).append((run_id, item))
-            for items in by_user.values():
-                items.sort(key=lambda pair: float(pair[1].get("started_at") or 0), reverse=True)
-                for run_id, _item in items[max_history_per_user:]:
-                    runs.pop(run_id, None)
-
-        if max_history_global > 0:
-            remaining = [
-                (str(run_id), item)
-                for run_id, item in runs.items()
-                if isinstance(item, dict)
-                and _read_str(item.get("status")) not in {"running", "queued", "pending"}
-            ]
-            remaining.sort(key=lambda pair: float(pair[1].get("started_at") or 0), reverse=True)
-            for run_id, _item in remaining[max_history_global:]:
-                runs.pop(run_id, None)
+    def _audit_locked(self) -> AuditRepository:
+        return AuditRepository(self._data)
 
     async def _save_locked(self) -> None:
         self.store.write(self._data)
@@ -852,150 +533,8 @@ def resolve_data_path(plugin_file: str, plugin_name: str) -> Path:
     return plugin_dir / ".runtime_data"
 
 
-def _normalize_run_records(value: dict[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, item in value.items():
-        run_id = _read_str(key)
-        if not RUN_ID_RE.fullmatch(run_id) or not isinstance(item, dict):
-            continue
-        normalized = {
-            "id": run_id,
-            "user_key": safe_text(item.get("user_key"), 200),
-            "display_name": safe_text(item.get("display_name"), 160),
-            "origin": safe_text(item.get("origin"), 500),
-            "status": safe_text(item.get("status"), 40) or "unknown",
-            "provider": safe_text(item.get("provider"), 60) or "claude",
-            "session_id": safe_text(item.get("session_id"), 200),
-            "project_path": safe_text(item.get("project_path"), 500),
-            "github_url": safe_text(item.get("github_url"), 500),
-            "target": safe_text(item.get("target"), 500),
-            "message": safe_text(item.get("message"), MAX_STORED_TEXT),
-            "started_at": _parse_timestamp(item.get("started_at")),
-            "updated_at": _parse_timestamp(item.get("updated_at")),
-            "finished_at": _parse_timestamp(item.get("finished_at")),
-            "log": _normalize_run_log(item.get("log")),
-            "summary": safe_json_value(item.get("summary")),
-        }
-        if item.get("error"):
-            normalized["error"] = safe_text(item.get("error"), MAX_STORED_TEXT)
-        result[run_id] = normalized
-    return result
-
-
-def _normalize_run_log(value: Any) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for item in _read_dict_list(value):
-        items.append(
-            {
-                "ts": _parse_timestamp(item.get("ts")),
-                "text": safe_text(item.get("text"), MAX_STORED_TEXT),
-            }
-        )
-    return items[-MAX_RUN_LOG_ITEMS:]
-
-
-def _normalize_audit_records(value: Any) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for item in _read_dict_list(value):
-        records.append(
-            {
-                "ts": _parse_timestamp(item.get("ts")),
-                "user_key": safe_text(item.get("user_key"), 200),
-                "display_name": safe_text(item.get("display_name"), 160),
-                "origin": safe_text(item.get("origin"), 500),
-                "action": safe_text(item.get("action"), 40),
-                "result": safe_text(item.get("result"), 80),
-                "request_id": safe_text(item.get("request_id"), 200),
-                "session_id": safe_text(item.get("session_id"), 200),
-                "tool_name": safe_text(item.get("tool_name"), 120),
-                "provider": safe_text(item.get("provider"), 60) or "claude",
-                "reason": safe_text(item.get("reason"), 500),
-                "input_summary": safe_text(item.get("input_summary"), 500),
-            }
-        )
-    return records
-
-
-def _read_str(value: Any) -> str:
-    return value if isinstance(value, str) else ""
-
-
 def _read_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
-
-
-def _read_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, str)]
-
-
-def _origin_key(user: UserRef | None) -> str:
-    if user is None:
-        return ""
-    return user.unified_msg_origin or "__default__"
-
-
-def _bindings_for_origin(entry: dict[str, Any], origin: str) -> list[str]:
-    binding_origins = _read_origin_map(entry.get("binding_origins"))
-    return sorted(
-        session_id
-        for session_id, origins in binding_origins.items()
-        if origin in origins
-    )
-
-
-def _read_session_indexes(value: Any) -> dict[str, dict[str, Any]]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, dict[str, Any]] = {}
-    for origin, raw in value.items():
-        if not isinstance(origin, str) or not isinstance(raw, dict):
-            continue
-        result[origin] = {
-            "items": _read_dict_list(raw.get("items")),
-            "at": _parse_timestamp(raw.get("at")),
-        }
-    return result
-
-
-def _session_index_for_origin(entry: dict[str, Any], origin: str) -> list[dict[str, Any]]:
-    scoped = _read_session_indexes(entry.get("session_indexes")).get(origin)
-    if isinstance(scoped, dict):
-        return _read_dict_list(scoped.get("items"))
-    return []
-
-
-def _run_visible_in_origin(item: dict[str, Any], user: UserRef) -> bool:
-    return _read_str(item.get("origin")) == _origin_key(user)
-
-
-def _audit_origin_visible(item: dict[str, Any], entry: dict[str, Any], origin: str) -> bool:
-    item_origin = _read_str(item.get("origin"))
-    if item_origin:
-        return item_origin == origin
-    origins = _read_list(entry.get("origins"))
-    return len(origins) == 1 and origins[0] == origin
-
-
-def _read_origin_map(value: Any) -> dict[str, list[str]]:
-    if not isinstance(value, dict):
-        return {}
-    result: dict[str, list[str]] = {}
-    for key, raw_origins in value.items():
-        session_id = _read_str(key)
-        if not is_valid_session_id(session_id):
-            continue
-        origins = _read_list(raw_origins)
-        if origins:
-            result[session_id] = origins[-5:]
-    return result
-
-
-def _read_dict_list(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, dict)]
 
 
 def _read_positive_int(value: Any, default: int) -> int:
@@ -1004,16 +543,3 @@ def _read_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
-
-
-def _parse_timestamp(value: Any) -> float:
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            from datetime import datetime
-
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return 0
-    return 0

@@ -66,19 +66,37 @@
     "description": "Comma-separated AstrBot user keys allowed to access sessions",
     "type": "string",
     "default": "",
-    "hint": "Users in this list can list, bind, read, and stop CloudCLI sessions even if they are not AstrBot admins."
+    "hint": "Users in this list can list, bind, and read CloudCLI sessions even if they are not AstrBot admins. Stopping sessions uses stop_allowed_user_keys."
   },
   "session_require_admin": {
     "description": "Require AstrBot admin for session commands",
     "type": "bool",
     "default": true,
-    "hint": "When enabled, only AstrBot admins or session_allowed_user_keys can list, bind, read, or stop sessions."
+    "hint": "When enabled, only AstrBot admins or session_allowed_user_keys can list, bind, or read sessions."
   },
   "session_access_mode": {
     "description": "Session command access mode",
     "type": "string",
     "default": "admin_or_allowlist",
     "hint": "Supported values: admin_or_allowlist, allowlist_only, authenticated. This explicit mode is preferred over session_require_admin."
+  },
+  "stop_allowed_user_keys": {
+    "description": "Comma-separated AstrBot user keys allowed to stop CloudCLI sessions",
+    "type": "string",
+    "default": "",
+    "hint": "Users in this list can use /cloudcli stop even if they are not AstrBot admins."
+  },
+  "stop_require_admin": {
+    "description": "Require AstrBot admin for /cloudcli stop",
+    "type": "bool",
+    "default": true,
+    "hint": "When enabled, only AstrBot admins or stop_allowed_user_keys can stop sessions."
+  },
+  "stop_access_mode": {
+    "description": "Stop command access mode",
+    "type": "string",
+    "default": "admin_or_allowlist",
+    "hint": "Supported values: admin_or_allowlist, allowlist_only, authenticated. This is intentionally separate from session_access_mode."
   },
   "allow_direct_session_id": {
     "description": "Allow direct raw sessionId usage",

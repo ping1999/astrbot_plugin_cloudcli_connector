@@ -100,6 +100,23 @@ class AuthorizationPolicy:
             "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 run_allowed_user_keys。",
         )
 
+    def can_stop_sessions(self, user: UserRef) -> Decision:
+        identity_error = self._identity_error(user)
+        if identity_error:
+            return Decision(False, identity_error)
+        if self._is_allowed(
+            user,
+            allowed_keys=self.settings.stop_allowed_user_keys,
+            access_mode=self.settings.stop_access_mode,
+        ):
+            return Decision(True)
+        return Decision(
+            False,
+            "当前用户没有权限中止 CloudCLI session。\n"
+            f"当前用户标识：{user.user_key}\n"
+            "请使用 AstrBot 管理员账号操作，或让管理员把该标识加入 stop_allowed_user_keys。",
+        )
+
     def can_manage_approvals(self, user: UserRef) -> Decision:
         identity_error = self._identity_error(user)
         if identity_error:

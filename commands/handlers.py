@@ -15,7 +15,7 @@ try:
     from ..security.authz import AuthorizationPolicy
     from ..security.identity import missing_identity_message
     from ..sessions.session_resolver import SessionResolver
-    from .command_parser import parse_positive_int
+    from .command_parser import ParsedCommand, parse_positive_int
     from .command_router import CommandHandler, CommandRoute, CommandRouter
     from .formatting import (
         HELP_TEXT,
@@ -28,7 +28,7 @@ try:
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from approvals.approval_service import ApprovalService
     from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
-    from commands.command_parser import parse_positive_int
+    from commands.command_parser import ParsedCommand, parse_positive_int
     from commands.command_router import CommandHandler, CommandRoute, CommandRouter
     from commands.formatting import (
         HELP_TEXT,
@@ -89,7 +89,7 @@ class CloudCLICommandHandlers:
                 "bind": CommandRoute(self.handle_bind),
                 "unbind": CommandRoute(self.handle_unbind),
                 "chat": CommandRoute(self.handle_chat),
-                "run": CommandRoute(self.handle_run),
+                "run": CommandRoute(self.handle_run_command, pass_command=True),
                 "stop": CommandRoute(self.handle_stop),
                 "pending": CommandRoute(
                     self._no_args(self.handle_pending),
@@ -260,6 +260,15 @@ class CloudCLICommandHandlers:
 
         return await self.run_service.handle_run(user, args)
 
+    async def handle_run_command(self, user: UserRef, command: ParsedCommand) -> str:
+        if command.args and command.args[0] in {"list", "log", "cancel"}:
+            return await self.run_service.handle_run_control(user, command.args)
+        decision = self.authz.can_run_agent(user)
+        if not decision.allowed:
+            return decision.message
+
+        return await self.run_service.handle_run(user, command.args, raw_args=command.raw_args)
+
     async def handle_pending(self, user: UserRef) -> str:
         approval_error = self._approval_permission_error(user)
         if approval_error:
@@ -267,7 +276,7 @@ class CloudCLICommandHandlers:
         return await self.approval_service.handle_pending(user)
 
     async def handle_stop(self, user: UserRef, args: list[str]) -> str:
-        decision = self.authz.can_access_sessions(user)
+        decision = self.authz.can_stop_sessions(user)
         if not decision.allowed:
             return decision.message
         if len(args) not in {1, 2}:

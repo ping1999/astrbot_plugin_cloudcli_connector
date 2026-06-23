@@ -323,8 +323,8 @@ class CloudCLIClient:
             )
             self._ws = ws
         except Exception as exc:  # noqa: BLE001
-            if token and not self.config.jwt_token.strip() and self.config.username and self.config.password:
-                await self._clear_cached_token()
+            if token and self.config.username and self.config.password:
+                await self._clear_cached_token(force=True)
                 try:
                     token = await self._get_token()
                     headers = self._auth_headers(token)
@@ -402,8 +402,8 @@ class CloudCLIClient:
     async def _get_token(self, *, allow_anonymous: bool = False) -> str:
         return await self._auth.get_token(allow_anonymous=allow_anonymous)
 
-    async def _clear_cached_token(self) -> None:
-        await self._auth.clear_cached_token()
+    async def _clear_cached_token(self, *, force: bool = False) -> None:
+        await self._auth.clear_cached_token(force=force)
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return self._auth.headers(token)

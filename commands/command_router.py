@@ -12,13 +12,15 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
 
 
 CommandHandler = Callable[[UserRef, list[str]], Awaitable[str]]
+ParsedCommandHandler = Callable[[UserRef, ParsedCommand], Awaitable[str]]
 
 
 @dataclass(frozen=True)
 class CommandRoute:
-    handler: CommandHandler
+    handler: CommandHandler | ParsedCommandHandler
     usage: str = ""
     no_args: bool = False
+    pass_command: bool = False
 
 
 class CommandRouter:
@@ -43,4 +45,6 @@ class CommandRouter:
 
         if route.no_args and command.args:
             return route.usage
+        if route.pass_command:
+            return await route.handler(user, command)  # type: ignore[misc]
         return await route.handler(user, command.args)

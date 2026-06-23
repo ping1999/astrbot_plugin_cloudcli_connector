@@ -1,7 +1,13 @@
 from __future__ import annotations
 
-import shlex
 from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class CommandToken:
+    value: str
+    start: int
+    end: int
 
 
 @dataclass
@@ -16,18 +22,103 @@ def parse_command(message: str) -> ParsedCommand:
     if not stripped:
         return ParsedCommand("", [], "")
     try:
-        lexer = shlex.shlex(stripped, posix=False)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = [_strip_wrapping_quotes(token) for token in lexer]
+        parts = tokenize_command_parts_with_raw_tail(stripped)
     except ValueError:
         return ParsedCommand("help", [], "")
-    if tokens and tokens[0].lstrip("/") == "cloudcli":
-        tokens = tokens[1:]
-    if not tokens:
+    if parts and parts[0].value.lstrip("/") == "cloudcli":
+        parts = parts[1:]
+    if not parts:
         return ParsedCommand("help", [], "")
-    raw_args = stripped.split(None, 1)[1] if len(stripped.split(None, 1)) > 1 else ""
-    return ParsedCommand(tokens[0].lower(), tokens[1:], raw_args)
+    command = parts[0]
+    raw_args = stripped[command.end :].strip()
+    return ParsedCommand(command.value.lower(), [part.value for part in parts[1:]], raw_args)
+
+
+def tokenize_command(value: str) -> list[str]:
+    return [part.value for part in tokenize_command_parts(value)]
+
+
+def tokenize_command_parts_with_raw_tail(value: str) -> list[CommandToken]:
+    raw_tail_at = _find_standalone_double_dash(value)
+    if raw_tail_at < 0:
+        return tokenize_command_parts(value)
+
+    before = value[:raw_tail_at].rstrip()
+    parts = tokenize_command_parts(before) if before else []
+    parts.append(CommandToken("--", raw_tail_at, raw_tail_at + 2))
+
+    raw_tail = value[raw_tail_at + 2 :]
+    if raw_tail.strip():
+        leading = len(raw_tail) - len(raw_tail.lstrip())
+        trailing = len(raw_tail) - len(raw_tail.rstrip())
+        start = raw_tail_at + 2 + leading
+        end = len(value) - trailing
+        parts.append(CommandToken(value[start:end], start, end))
+    return parts
+
+
+def tokenize_command_parts(value: str) -> list[CommandToken]:
+    tokens: list[CommandToken] = []
+    current: list[str] = []
+    token_start: int | None = None
+    quote = ""
+
+    for index, char in enumerate(value):
+        if quote:
+            if char == quote:
+                quote = ""
+            else:
+                current.append(char)
+            continue
+
+        if char in {"'", '"'}:
+            if token_start is None:
+                token_start = index
+            quote = char
+            continue
+
+        if char.isspace():
+            if token_start is not None:
+                tokens.append(CommandToken("".join(current), token_start, index))
+                current = []
+                token_start = None
+            continue
+
+        if token_start is None:
+            token_start = index
+        current.append(char)
+
+    if quote:
+        raise ValueError("unclosed quote")
+    if token_start is not None:
+        tokens.append(CommandToken("".join(current), token_start, len(value)))
+    return tokens
+
+
+def _find_standalone_double_dash(value: str) -> int:
+    quote = ""
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote:
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if (
+            char == "-"
+            and index + 1 < len(value)
+            and value[index + 1] == "-"
+            and (index == 0 or value[index - 1].isspace())
+            and (index + 2 == len(value) or value[index + 2].isspace())
+        ):
+            return index
+        index += 1
+    return -1
 
 
 def parse_optional_request_no(args: list[str]) -> tuple[int | None, str | None]:
@@ -54,9 +145,3 @@ def parse_positive_int(
     if parsed < minimum or parsed > maximum:
         return minimum, f"{name} 必须在 {minimum}-{maximum} 之间。"
     return parsed, None
-
-
-def _strip_wrapping_quotes(value: str) -> str:
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    return value

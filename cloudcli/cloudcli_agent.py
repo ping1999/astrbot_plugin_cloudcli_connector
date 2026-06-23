@@ -65,7 +65,7 @@ class CloudCLIAgentClient:
                             and attempt == 0
                             and self._can_refresh_auth()
                         ):
-                            await self.auth.clear_cached_token()
+                            await self.auth.clear_cached_token(force=True)
                             continue
                         if response.status >= 400:
                             body = await read_response_text_limited(
@@ -101,7 +101,6 @@ class CloudCLIAgentClient:
 
     def _can_refresh_auth(self) -> bool:
         return (
-            not str(getattr(self.config, "jwt_token", "") or "").strip()
-            and bool(getattr(self.config, "username", ""))
+            bool(getattr(self.config, "username", ""))
             and bool(getattr(self.config, "password", ""))
         )

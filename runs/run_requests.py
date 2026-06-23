@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
+    from ..commands.command_parser import tokenize_command_parts_with_raw_tail
     from ..core.config import ConnectorSettings
     from ..core.constants import RUN_PROVIDERS
     from ..persistence.state_models import UserRef, is_valid_session_id
@@ -16,6 +17,7 @@ try:
     )
     from ..sessions.session_resolver import SessionResolver
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from commands.command_parser import tokenize_command_parts_with_raw_tail
     from core.config import ConnectorSettings
     from core.constants import RUN_PROVIDERS
     from persistence.state_models import UserRef, is_valid_session_id
@@ -107,19 +109,27 @@ class RunRequestBuilder:
         self.authz = authz
         self.sessions = sessions
 
-    async def parse(self, user: UserRef, args: list[str]) -> tuple[ParsedRun | None, str | None]:
+    async def parse(
+        self,
+        user: UserRef,
+        args: list[str],
+        raw_args: str = "",
+    ) -> tuple[ParsedRun | None, str | None]:
         if not args:
             return None, self.usage()
 
         options = RunOptions()
         message_parts: list[str] = []
+        message_start_index = -1
         index = 0
         while index < len(args):
             token = args[index]
             if token == "--":
+                message_start_index = index + 1
                 message_parts = args[index + 1 :]
                 break
             if not token.startswith("--"):
+                message_start_index = index
                 message_parts = args[index:]
                 break
 
@@ -132,7 +142,10 @@ class RunRequestBuilder:
                 return None, error
             index += 2 if consumed_next else 1
 
-        message = " ".join(message_parts).strip()
+        message = _raw_message_from_args(raw_args, message_start_index)
+        if message is None:
+            message = " ".join(message_parts)
+        message = message.strip()
         if not message:
             return None, "任务内容不能为空。\n" + self.usage()
         max_message_len = self.settings.max_run_message_length
@@ -336,3 +349,15 @@ class RunRequestBuilder:
         if provider not in RUN_PROVIDERS:
             provider = ""
         return SessionTarget(session_id=session_id, project_path=project_path, provider=provider), None
+
+
+def _raw_message_from_args(raw_args: str, message_start_index: int) -> str | None:
+    if not raw_args or message_start_index < 0:
+        return None
+    try:
+        parts = tokenize_command_parts_with_raw_tail(raw_args)
+    except ValueError:
+        return None
+    if message_start_index >= len(parts):
+        return ""
+    return raw_args[parts[message_start_index].start :]

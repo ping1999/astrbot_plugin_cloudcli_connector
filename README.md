@@ -44,7 +44,7 @@
 
 每个 `/cloudcli run` 会生成任务编号，可用 `/cloudcli run list` 查看，`/cloudcli run log <任务编号>` 查看状态日志，`/cloudcli run cancel <任务编号>` 取消本地任务并尽量中止关联的 CloudCLI session。
 
-`/cloudcli stop <sessionId|序号|last> [provider]` 会向 CloudCLI WebSocket 发送 `abort-session`，用于中止正在执行的 session。
+`/cloudcli stop <sessionId|序号|last> [provider]` 会向 CloudCLI WebSocket 发送 `abort-session`，用于中止正在执行的 session。它使用独立的 `stop_access_mode` / `stop_allowed_user_keys` 权限，不会因为 `session_access_mode=authenticated` 自动开放。
 
 `/cloudcli audit [数量]` 会展示当前用户可见的审批审计记录。`/cloudcli whoami` 用于查看当前用户标识，方便配置审批白名单。
 
@@ -58,7 +58,7 @@
 - 用户只会收到自己已绑定 session 的主动审批推送。
 - session 绑定、序号缓存、审批列表、审计记录和任务日志默认按当前聊天会话隔离；同一用户在私聊中的绑定不会自动出现在群聊中。
 - WebSocket 断开后插件会自动退避重连，避免 CloudCLI 重启或短暂网络抖动后审批推送长期失效。
-- 默认只有 AstrBot 管理员或 `session_allowed_user_keys` 白名单用户可以查看、绑定、读取和中止 CloudCLI session。
+- 默认只有 AstrBot 管理员或 `session_allowed_user_keys` 白名单用户可以查看、绑定和读取 CloudCLI session；中止 session 由独立的 `stop_allowed_user_keys` / `stop_access_mode` 控制。
 - 默认只有 AstrBot 管理员或 `run_allowed_user_keys` 白名单用户可以使用 `/cloudcli run` 发起 agent 任务。
 - 非管理员使用 `/cloudcli run --project` 时建议配置 `allowed_project_roots`，否则默认会拒绝访问本地任意目录。
 - 默认 `persist_sensitive_state=false`，审批输入、审计输入摘要和 `/cloudcli run` 原始任务文本不会完整写入本地 `state.json`；当前进程内刚收到或刚刷新的审批详情仍可正常查看。
@@ -82,6 +82,9 @@
 - `session_access_mode`：session 权限模式，可选 `admin_or_allowlist`、`allowlist_only`、`authenticated`
 - `session_require_admin`：兼容旧配置。建议改用 `session_access_mode`；不配置 access mode 时，把它设为 `false` 现在表示仅白名单，而不是所有用户。
 - `allow_direct_session_id`：是否允许非管理员直接使用未绑定、未出现在当前 session 序号缓存中的 sessionId
+- `stop_allowed_user_keys`：`/cloudcli stop` 白名单，多个用户标识用英文逗号分隔
+- `stop_access_mode`：`/cloudcli stop` 独立权限模式，可选 `admin_or_allowlist`、`allowlist_only`、`authenticated`
+- `stop_require_admin`：兼容旧配置。建议改用 `stop_access_mode`
 - `recent_sessions_limit`：`/cloudcli session` 展示的最近会话数量
 - `chat_messages_limit`：`/cloudcli chat` 默认展示的最近消息数量
 - `max_run_message_length`：`/cloudcli run` 接受的任务文本长度上限

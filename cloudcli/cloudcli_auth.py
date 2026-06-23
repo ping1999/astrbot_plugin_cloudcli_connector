@@ -37,7 +37,8 @@ class CloudCLIAuth:
         self.config = config
         self.ensure_session = ensure_session
         self.api_url = api_url
-        self._cached_token = str(getattr(config, "jwt_token", "") or "").strip()
+        self._configured_token = str(getattr(config, "jwt_token", "") or "").strip()
+        self._cached_token = self._configured_token
 
     async def get_token(self, *, allow_anonymous: bool = False) -> str:
         if self._cached_token:
@@ -47,6 +48,9 @@ class CloudCLIAuth:
                 return ""
             raise CloudCLIError("未配置 CloudCLI JWT token，也没有配置用户名/密码。")
 
+        return await self._login()
+
+    async def _login(self) -> str:
         session = await self.ensure_session()
         headers = {"Content-Type": "application/json"}
         if self.config.api_key:
@@ -82,8 +86,8 @@ class CloudCLIAuth:
         self._cached_token = str(data["token"])
         return self._cached_token
 
-    async def clear_cached_token(self) -> None:
-        if not self.config.jwt_token.strip():
+    async def clear_cached_token(self, *, force: bool = False) -> None:
+        if force or not self._configured_token:
             self._cached_token = ""
 
     def headers(self, token: str) -> dict[str, str]:
