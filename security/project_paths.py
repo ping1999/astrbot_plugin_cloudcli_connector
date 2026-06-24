@@ -36,12 +36,12 @@ class ProjectPathPolicy:
 
         roots = self.settings.allowed_project_roots
         if not roots:
-            if not user.is_admin and not self.settings.allow_unrestricted_project_paths:
+            if not self.settings.allow_unrestricted_project_paths:
                 return ProjectPathDecision(
                     False,
                     "",
-                    "未配置 allowed_project_roots，非管理员不能使用本地 --project。"
-                    "请让管理员配置允许的项目根目录，或改用 --github。",
+                    "未配置 allowed_project_roots，不能使用本地 --project。"
+                    "请配置允许的项目根目录，或显式开启 allow_unrestricted_project_paths。",
                 )
             if _is_windows_special_path(project_path):
                 return ProjectPathDecision(

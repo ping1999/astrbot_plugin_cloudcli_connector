@@ -147,12 +147,21 @@ class UserStateRepository:
             if origin in known_origins or origin == origin_key(user)
         }
 
-    def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
+    def find_session_index_item(
+        self,
+        user: UserRef,
+        session_id: str,
+        max_age_seconds: int = 0,
+    ) -> dict[str, str] | None:
         """在当前 origin 的序号缓存中查找 session 元数据。"""
         if not is_valid_session_id(session_id):
             return None
         entry = self.entry(user.user_key)
-        for item in session_index_for_origin(entry, origin_key(user)):
+        for item in session_index_for_origin(
+            entry,
+            origin_key(user),
+            max_age_seconds=max_age_seconds,
+        ):
             if _read_str(item.get("id")) == session_id:
                 return {
                     "id": session_id,
@@ -162,7 +171,12 @@ class UserStateRepository:
                 }
         return None
 
-    def resolve_session_ref(self, user: UserRef, ref: str) -> tuple[dict[str, str] | None, str | None]:
+    def resolve_session_ref(
+        self,
+        user: UserRef,
+        ref: str,
+        max_age_seconds: int = 0,
+    ) -> tuple[dict[str, str] | None, str | None]:
         """把 `last`、数字序号或直接 sessionId 解析成统一字典。"""
         ref = ref.strip()
         if not ref:
@@ -177,7 +191,11 @@ class UserStateRepository:
             return {"id": ref, "provider": ""}, None
 
         entry = self.entry(user.user_key)
-        cached = session_index_for_origin(entry, origin_key(user))
+        cached = session_index_for_origin(
+            entry,
+            origin_key(user),
+            max_age_seconds=max_age_seconds,
+        )
         if not cached:
             return None, "没有可用的 session 序号缓存，请先执行 /cloudcli session。"
         if index < 1 or index > len(cached):
@@ -297,10 +315,21 @@ def read_session_indexes(value: Any) -> dict[str, dict[str, Any]]:
     return result
 
 
-def session_index_for_origin(entry: dict[str, Any], origin: str) -> list[dict[str, Any]]:
+def session_index_for_origin(
+    entry: dict[str, Any],
+    origin: str,
+    max_age_seconds: int = 0,
+) -> list[dict[str, Any]]:
     """获取当前 origin 下的最近 session 缓存列表。"""
     scoped = read_session_indexes(entry.get("session_indexes")).get(origin)
     if isinstance(scoped, dict):
+        cached_at = _parse_timestamp(scoped.get("at"))
+        # The index is a temporary capability: once it is stale, users should
+        # refresh `/cloudcli session` or use a durable explicit binding.
+        if max_age_seconds > 0 and (
+            cached_at <= 0 or time.time() - cached_at > max_age_seconds
+        ):
+            return []
         return _read_dict_list(scoped.get("items"))
     return []
 

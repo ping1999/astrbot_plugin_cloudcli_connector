@@ -47,7 +47,11 @@ class SessionResolver:
 
     async def resolve_session_ref(self, user: UserRef, ref: str) -> tuple[dict[str, str] | None, str | None]:
         """把 `1`、`last` 或 sessionId 解析为包含 id/provider/projectPath 的字典。"""
-        resolved, error = await self.state.resolve_session_ref(user, ref)
+        resolved, error = await self.state.resolve_session_ref(
+            user,
+            ref,
+            max_age_seconds=self.settings.session_index_ttl_seconds,
+        )
         if error or resolved is None:
             return resolved, error
         provider = resolved.get("provider") or ""
@@ -74,7 +78,11 @@ class SessionResolver:
         if not session_decision.allowed:
             decision = self.authz.can_bind_direct_session_for_approval(user)
             return "" if decision.allowed else decision.message
-        indexed = await self.state.find_session_index_item(user, ref.strip())
+        indexed = await self.state.find_session_index_item(
+            user,
+            ref.strip(),
+            max_age_seconds=self.settings.session_index_ttl_seconds,
+        )
         if indexed:
             return ""
         decision = self.authz.can_bind_direct_session_for_approval(user)
@@ -92,7 +100,11 @@ class SessionResolver:
         """判断用户是否能使用某个 session：已绑定、来自当前序号缓存或具备直连权限。"""
         if await self.state.has_binding(user, session_id):
             return ""
-        if await self.state.find_session_index_item(user, session_id):
+        if await self.state.find_session_index_item(
+            user,
+            session_id,
+            max_age_seconds=self.settings.session_index_ttl_seconds,
+        ):
             return ""
         decision = self.authz.can_use_direct_session_id(user)
         return "" if decision.allowed else decision.message

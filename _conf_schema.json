@@ -109,6 +109,12 @@
     "type": "int",
     "default": 20
   },
+  "session_index_ttl_seconds": {
+    "description": "Seconds before /cloudcli session index cache expires",
+    "type": "int",
+    "default": 3600,
+    "hint": "Session indexes let users refer to sessions by number. Expiring them reduces stale authorization risk; values are clamped to 60-86400 seconds."
+  },
   "chat_messages_limit": {
     "description": "Default recent messages shown by /cloudcli chat",
     "type": "int",
@@ -147,7 +153,7 @@
     "description": "Allow unrestricted /cloudcli run --project paths",
     "type": "bool",
     "default": false,
-    "hint": "Only applies to non-admin users when allowed_project_roots is empty. Only enable in fully trusted chats. Admin users are allowed even when this is false."
+    "hint": "Only applies when allowed_project_roots is empty. Enable only in fully trusted deployments; otherwise all users, including admins, must use configured roots."
   },
   "max_active_runs_per_user": {
     "description": "Max concurrent /cloudcli run tasks per user",

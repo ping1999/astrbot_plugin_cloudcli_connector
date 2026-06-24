@@ -20,6 +20,7 @@ class ConnectorSettings:
     cloudcli: CloudCLIConfig
     auto_connect: bool
     recent_sessions_limit: int
+    session_index_ttl_seconds: int
     chat_messages_limit: int
     max_bindings_per_user: int
     max_run_message_length: int
@@ -89,6 +90,12 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
         ),
         auto_connect=_read_bool(get("auto_connect"), True),
         recent_sessions_limit=_read_limited_int(get("recent_sessions_limit"), 20, 1, 100),
+        session_index_ttl_seconds=_read_limited_int(
+            get("session_index_ttl_seconds"),
+            3600,
+            60,
+            86400,
+        ),
         chat_messages_limit=_read_limited_int(get("chat_messages_limit"), 12, 1, 50),
         max_bindings_per_user=_read_limited_int(get("max_bindings_per_user"), 20, 1, 100),
         max_run_message_length=_read_limited_int(get("max_run_message_length"), 4000, 1, 20000),

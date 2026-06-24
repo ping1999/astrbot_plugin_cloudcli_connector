@@ -9,10 +9,12 @@ from typing import Any
 
 try:
     from ..core.sanitizer import safe_json_value, safe_text
+    from .privacy import StoragePrivacyPolicy
     from .state_models import UserRef, is_valid_session_id
     from .user_repository import origin_key
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from core.sanitizer import safe_json_value, safe_text
+    from persistence.privacy import StoragePrivacyPolicy
     from persistence.state_models import UserRef, is_valid_session_id
     from persistence.user_repository import origin_key
 
@@ -36,7 +38,7 @@ class RunRepository:
         payload: dict[str, Any],
         display_target: str,
         *,
-        message_for_storage: Callable[[Any], str],
+        privacy: StoragePrivacyPolicy,
         max_history_per_user: int = DEFAULT_MAX_RUN_HISTORY_PER_USER,
         max_history_global: int = DEFAULT_MAX_RUN_HISTORY_GLOBAL,
     ) -> str:
@@ -53,10 +55,10 @@ class RunRepository:
             "status": "running",
             "provider": safe_text(payload.get("provider"), 60) or "claude",
             "session_id": safe_text(payload.get("sessionId"), 200),
-            "project_path": safe_text(payload.get("projectPath"), 500),
-            "github_url": safe_text(payload.get("githubUrl"), 500),
-            "target": safe_text(display_target, 500),
-            "message": message_for_storage(payload.get("message")),
+            "project_path": privacy.target_for_storage(payload.get("projectPath")),
+            "github_url": privacy.target_for_storage(payload.get("githubUrl")),
+            "target": privacy.target_for_storage(display_target),
+            "message": privacy.sensitive_text_for_storage(payload.get("message")),
             "started_at": now,
             "updated_at": now,
             "finished_at": 0,
@@ -77,6 +79,7 @@ class RunRepository:
         session_id: str | None = None,
         summary: dict[str, Any] | None = None,
         summary_for_storage: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        event_for_storage: Callable[[Any], str] | None = None,
         error: str | None = None,
         finished: bool = False,
     ) -> bool:
@@ -99,7 +102,13 @@ class RunRepository:
             item["error"] = safe_text(error, MAX_STORED_TEXT)
         if event:
             log = _read_dict_list(item.get("log"))
-            log.append({"ts": now, "text": safe_text(event, MAX_STORED_TEXT)})
+            stored_event = (
+                event_for_storage(event)
+                if event_for_storage is not None
+                else safe_text(event, MAX_STORED_TEXT)
+            )
+            if stored_event:
+                log.append({"ts": now, "text": stored_event})
             # 只保留最近日志，完整输出不应无限写入本地状态文件。
             item["log"] = log[-MAX_RUN_LOG_ITEMS:]
         if finished:
@@ -168,15 +177,24 @@ class RunRepository:
         return changed
 
     def scrub_sensitive(self, omitted_text: str) -> None:
-        """关闭敏感状态持久化时，清除历史任务中的用户 prompt 和助手摘要。"""
+        """关闭敏感状态持久化时，清除历史任务中的用户 prompt、目标和助手摘要。"""
         runs = _read_dict(self.data.get("runs"))
         for item in runs.values():
             if not isinstance(item, dict):
                 continue
             item["message"] = omitted_text
+            if item.get("error"):
+                item["error"] = omitted_text
+            for key in ("project_path", "github_url", "target"):
+                if item.get(key):
+                    item[key] = omitted_text
             summary = item.get("summary")
-            if isinstance(summary, dict) and summary.get("assistantText"):
-                summary["assistantText"] = omitted_text
+            if isinstance(summary, dict):
+                for key in ("projectPath", "branch", "pullRequest", "assistantText"):
+                    if summary.get(key):
+                        summary[key] = omitted_text
+                if summary.get("errors"):
+                    summary["errors"] = omitted_text
                 item["summary"] = summary
         self.data["runs"] = runs
 

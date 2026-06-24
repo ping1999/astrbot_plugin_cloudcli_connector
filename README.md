@@ -60,7 +60,7 @@
 - WebSocket 断开后插件会自动退避重连，避免 CloudCLI 重启或短暂网络抖动后审批推送长期失效。
 - 默认只有 AstrBot 管理员或 `session_allowed_user_keys` 白名单用户可以查看、绑定和读取 CloudCLI session；中止 session 由独立的 `stop_allowed_user_keys` / `stop_access_mode` 控制。
 - 默认只有 AstrBot 管理员或 `run_allowed_user_keys` 白名单用户可以使用 `/cloudcli run` 发起 agent 任务。
-- 非管理员使用 `/cloudcli run --project` 时建议配置 `allowed_project_roots`，否则默认会拒绝访问本地任意目录。
+- 使用 `/cloudcli run --project` 时建议配置 `allowed_project_roots`，否则默认会拒绝访问本地任意目录；只有显式开启 `allow_unrestricted_project_paths` 才会放开。
 - 默认 `persist_sensitive_state=false`，审批输入、审计输入摘要和 `/cloudcli run` 原始任务文本不会完整写入本地 `state.json`；当前进程内刚收到或刚刷新的审批详情仍可正常查看。
 - 非管理员默认不能直接手填未绑定的 sessionId；请先执行 `/cloudcli session` 后使用序号，或由管理员开启 `allow_direct_session_id`。
 - 默认只有 AstrBot 管理员或 `approval_allowed_user_keys` 白名单用户可以查看、接收和处理审批请求。
@@ -86,13 +86,14 @@
 - `stop_access_mode`：`/cloudcli stop` 独立权限模式，可选 `admin_or_allowlist`、`allowlist_only`、`authenticated`
 - `stop_require_admin`：兼容旧配置。建议改用 `stop_access_mode`
 - `recent_sessions_limit`：`/cloudcli session` 展示的最近会话数量
+- `session_index_ttl_seconds`：`/cloudcli session` 序号缓存有效期，默认 3600 秒
 - `chat_messages_limit`：`/cloudcli chat` 默认展示的最近消息数量
 - `max_run_message_length`：`/cloudcli run` 接受的任务文本长度上限
 - `run_allowed_user_keys`：`/cloudcli run` 白名单，多个用户标识用英文逗号分隔
 - `run_access_mode`：run 权限模式，可选 `admin_or_allowlist`、`allowlist_only`、`authenticated`
 - `run_require_admin`：兼容旧配置。建议改用 `run_access_mode`；不配置 access mode 时，把它设为 `false` 现在表示仅白名单，而不是所有用户。
 - `allowed_project_roots`：允许 `/cloudcli run --project` 访问的本地根目录，多个目录用英文逗号分隔
-- `allow_unrestricted_project_paths`：是否允许非管理员在未配置 `allowed_project_roots` 时访问任意本地路径；如果已经配置了 `allowed_project_roots`，非管理员仍必须落在这些根目录内
+- `allow_unrestricted_project_paths`：是否在未配置 `allowed_project_roots` 时允许访问任意本地路径；如果已经配置了 `allowed_project_roots`，所有用户都必须落在这些根目录内
 - `max_active_runs_per_user` / `max_active_runs_global`：限制并发 `/cloudcli run` 任务数量，`0` 表示不限制
 - `max_run_history_per_user` / `max_run_history_global`：保留已完成 `/cloudcli run` 历史的上限，`0` 表示不裁剪
 - `persist_sensitive_state`：是否把审批输入、审计输入摘要和原始 run 任务文本完整持久化到 `state.json`；默认 `false`

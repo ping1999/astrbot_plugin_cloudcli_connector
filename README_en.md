@@ -58,7 +58,7 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - The WebSocket connection is supervised and reconnects with backoff after CloudCLI restarts or transient network failures.
 - By default, only AstrBot admins or users in `session_allowed_user_keys` can list, bind, or read CloudCLI sessions; stopping sessions is controlled by independent `stop_allowed_user_keys` / `stop_access_mode` settings.
 - By default, only AstrBot admins or users in `run_allowed_user_keys` can start `/cloudcli run` agent tasks.
-- For non-admin `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default.
+- For `/cloudcli run --project`, configure `allowed_project_roots`; otherwise arbitrary local paths are rejected by default unless `allow_unrestricted_project_paths` is explicitly enabled.
 - By default, `persist_sensitive_state=false`, so approval input bodies, audit input summaries, and raw `/cloudcli run` task text are not written in full to local `state.json`. Fresh approval details are still available in memory after a push or refresh.
 - Non-admin users cannot directly type an unbound raw sessionId by default. They should use an index from `/cloudcli session`, or an admin can enable `allow_direct_session_id`.
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
@@ -84,13 +84,14 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `stop_access_mode`: independent `/cloudcli stop` access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
 - `stop_require_admin`: legacy compatibility flag. Prefer `stop_access_mode`
 - `recent_sessions_limit`: number of recent sessions shown by `/cloudcli session`
+- `session_index_ttl_seconds`: TTL for `/cloudcli session` index references, default 3600 seconds
 - `chat_messages_limit`: default recent message count shown by `/cloudcli chat`
 - `max_run_message_length`: maximum task text length accepted by `/cloudcli run`
 - `run_allowed_user_keys`: comma-separated allowlist for `/cloudcli run`
 - `run_access_mode`: run access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
 - `run_require_admin`: legacy compatibility flag. Prefer `run_access_mode`; setting this to `false` without an access mode now means allowlist-only, not all users.
 - `allowed_project_roots`: comma-separated local roots allowed for `/cloudcli run --project`
-- `allow_unrestricted_project_paths`: allow non-admin users to use arbitrary local paths only when `allowed_project_roots` is empty; once roots are configured, non-admin paths must stay inside them
+- `allow_unrestricted_project_paths`: allow arbitrary local paths only when `allowed_project_roots` is empty; once roots are configured, all users must stay inside them
 - `max_active_runs_per_user` / `max_active_runs_global`: concurrent `/cloudcli run` limits; `0` disables a limit
 - `max_run_history_per_user` / `max_run_history_global`: retain completed `/cloudcli run` history up to these limits; `0` disables pruning
 - `persist_sensitive_state`: persist approval inputs, audit input summaries, and raw run task text to `state.json`; default is `false`

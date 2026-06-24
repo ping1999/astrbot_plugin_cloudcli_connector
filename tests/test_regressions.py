@@ -705,6 +705,29 @@ class RunRequestTests(unittest.TestCase):
         self.assertEqual([], calls)
         self.assertIn("未配置 allowed_project_roots", decision.message)
 
+    def test_admin_project_path_requires_roots_or_explicit_unrestricted_flag(self) -> None:
+        """Admins are chat admins, not necessarily trusted filesystem operators."""
+        settings = load_connector_settings({"run_access_mode": "authenticated"})
+        decision = AuthorizationPolicy(settings).authorize_project_path(
+            UserRef("test:admin", "Admin", "origin", is_admin=True),
+            "C:/sensitive/repo",
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertIn("未配置 allowed_project_roots", decision.message)
+
+        unrestricted = load_connector_settings(
+            {
+                "run_access_mode": "authenticated",
+                "allow_unrestricted_project_paths": True,
+            }
+        )
+        allowed = AuthorizationPolicy(unrestricted).authorize_project_path(
+            UserRef("test:admin", "Admin", "origin", is_admin=True),
+            "C:/sensitive/repo",
+        )
+        self.assertTrue(allowed.allowed)
+
     def test_unc_project_path_rejects_outside_roots_before_resolve(self) -> None:
         """未显式允许同一 UNC 根时，UNC projectPath 不能进入 Path.resolve。"""
         original_resolve = project_paths_module._resolve_path
@@ -1204,10 +1227,18 @@ class StateTests(unittest.TestCase):
                                     "origin": "origin",
                                     "status": "completed",
                                     "provider": "codex",
-                                    "target": "C:/repo",
+                                    "project_path": "C:/legacy-secret/repo",
+                                    "github_url": "https://github.com/private/legacy",
+                                    "target": "C:/legacy-secret/repo",
                                     "message": "password=run-secret",
                                     "log": [{"ts": 1, "text": "token=log-secret"}],
-                                    "summary": {"api_key": "summary-secret"},
+                                    "error": "password=error-secret",
+                                    "summary": {
+                                        "projectPath": "C:/legacy-secret/repo",
+                                        "branch": "legacy-secret-branch",
+                                        "pullRequest": {"url": "https://github.com/private/legacy/pull/1"},
+                                        "assistantText": "summary-secret",
+                                    },
                                 }
                             },
                             "audit": [
@@ -1247,7 +1278,11 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("pending-secret", rendered)
         self.assertNotIn("run-secret", rendered)
         self.assertNotIn("log-secret", rendered)
+        self.assertNotIn("error-secret", rendered)
         self.assertNotIn("summary-secret", rendered)
+        self.assertNotIn("C:/legacy-secret/repo", rendered)
+        self.assertNotIn("https://github.com/private/legacy", rendered)
+        self.assertNotIn("legacy-secret-branch", rendered)
         self.assertNotIn("audit-secret", rendered)
         self.assertNotIn("audit-input-secret", rendered)
 
@@ -1268,14 +1303,28 @@ class StateTests(unittest.TestCase):
                 )
                 await state.upsert_pending(approval)
                 await state.append_audit(user=user, action="allow", approval=approval)
-                await state.create_run_task(
+                run_id = await state.create_run_task(
                     user,
                     {
                         "provider": "codex",
-                        "projectPath": "C:/repo",
+                        "projectPath": "C:/secret/repo",
+                        "githubUrl": "https://github.com/private/repo",
                         "message": "bare-run-secret",
                     },
-                    "C:/repo",
+                    "C:/secret/repo",
+                )
+                await state.update_run_task(
+                    run_id,
+                    event="assistant: streamed private output from C:/secret/repo",
+                    summary={
+                        "projectPath": "C:/secret/repo",
+                        "branch": "secret-branch",
+                        "pullRequest": {"url": "https://github.com/private/repo/pull/1"},
+                        "assistantText": "private assistant text",
+                        "errors": ["private error body"],
+                    },
+                    error="private error body",
+                    finished=True,
                 )
                 visible = await state.visible_pending_for_user(user, 10)
 
@@ -1290,6 +1339,11 @@ class StateTests(unittest.TestCase):
         rendered_disk = json.dumps(disk_state, ensure_ascii=False)
         self.assertNotIn("bare-pending-secret", rendered_disk)
         self.assertNotIn("bare-run-secret", rendered_disk)
+        self.assertNotIn("C:/secret/repo", rendered_disk)
+        self.assertNotIn("https://github.com/private/repo", rendered_disk)
+        self.assertNotIn("secret-branch", rendered_disk)
+        self.assertNotIn("private assistant text", rendered_disk)
+        self.assertNotIn("private error body", rendered_disk)
         self.assertIn("persist_sensitive_state=false", rendered_disk)
         self.assertNotIn("bare-pending-secret", json.dumps(reloaded_input, ensure_ascii=False))
 
@@ -1357,6 +1411,39 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("C:/secret/repo", rendered_disk)
         self.assertNotIn("secret summary text", rendered_disk)
 
+    def test_session_index_expires_for_authorization_refs(self) -> None:
+        """Stale session indexes should not keep authorizing numeric references."""
+        async def scenario() -> tuple[dict[str, str] | None, dict[str, str] | None]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.remember_user(user)
+                await state.remember_session_index(
+                    user,
+                    [{"id": "sess-1", "provider": "codex", "projectPath": "C:/repo"}],
+                )
+                fresh, fresh_error = await state.resolve_session_ref(
+                    user,
+                    "1",
+                    max_age_seconds=60,
+                )
+                assert fresh_error is None
+                cache_key = (user.user_key, user.unified_msg_origin)
+                state._session_index_cache[cache_key]["at"] = 1
+                state._data["users"][user.user_key]["session_indexes"][user.unified_msg_origin]["at"] = 1
+                expired, _expired_error = await state.resolve_session_ref(
+                    user,
+                    "1",
+                    max_age_seconds=60,
+                )
+                return fresh, expired
+
+        fresh, expired = asyncio.run(scenario())
+        self.assertIsNotNone(fresh)
+        self.assertIsNone(expired)
+
     def test_run_event_updates_are_batched_until_flush(self) -> None:
         """频繁的 run event 更新会延迟批量写盘，flush 后再落到状态文件。"""
         async def scenario() -> tuple[str, str]:
@@ -1379,7 +1466,8 @@ class StateTests(unittest.TestCase):
 
         before_flush, after_flush = asyncio.run(scenario())
         self.assertNotIn("streamed chunk", before_flush)
-        self.assertIn("streamed chunk", after_flush)
+        self.assertNotIn("streamed chunk", after_flush)
+        self.assertIn("persist_sensitive_state=false", after_flush)
 
     def test_pending_request_ids_are_scoped_by_session(self) -> None:
         """相同 requestId 出现在不同 session 时必须作为两条独立 pending 保存。"""

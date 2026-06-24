@@ -6,12 +6,18 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 try:
-    from ..core.sanitizer import compact_json, safe_json_value, safe_text
+    from ..core.sanitizer import safe_json_value
     from .audit_repository import AuditRepository, MAX_AUDIT_ITEMS, normalize_audit_records
+    from .privacy import (
+        OMITTED_SENSITIVE_INPUT,
+        OMITTED_SENSITIVE_TEXT,
+        StoragePrivacyPolicy,
+    )
     from .state_models import (
         PendingApproval,
         UserRef,
@@ -36,8 +42,13 @@ try:
         origin_key,
     )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from core.sanitizer import compact_json, safe_json_value, safe_text
+    from core.sanitizer import safe_json_value
     from persistence.audit_repository import AuditRepository, MAX_AUDIT_ITEMS, normalize_audit_records
+    from persistence.privacy import (
+        OMITTED_SENSITIVE_INPUT,
+        OMITTED_SENSITIVE_TEXT,
+        StoragePrivacyPolicy,
+    )
     from persistence.pending_repository import PendingApprovalRepository, normalize_pending_records
     from persistence.run_repository import (
         DEFAULT_MAX_RUN_HISTORY_GLOBAL,
@@ -62,11 +73,6 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         origin_key,
     )
 
-MAX_STORED_TEXT = 1200
-OMITTED_SENSITIVE_TEXT = "[omitted by persist_sensitive_state=false]"
-OMITTED_SENSITIVE_INPUT = {
-    "notice": "approval input is kept only in memory unless persist_sensitive_state is enabled"
-}
 DEFAULT_SAVE_BATCH_DELAY_SECONDS = 1.0
 logger = logging.getLogger(__name__)
 
@@ -85,10 +91,13 @@ class PluginState:
         self.path = path
         self.store = JsonStateStore(path)
         self.persist_sensitive_state = persist_sensitive_state
+        self.privacy = StoragePrivacyPolicy(
+            persist_sensitive_state=persist_sensitive_state
+        )
         self.exclusive_runtime_lock = exclusive_runtime_lock
         self._runtime_lock: StateProcessLock | None = None
         self._pending_input_cache: dict[str, Any] = {}
-        self._session_index_cache: dict[tuple[str, str], list[dict[str, str]]] = {}
+        self._session_index_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = asyncio.Lock()
         self._save_pending = False
         self._scheduled_save_task: asyncio.Task | None = None
@@ -223,33 +232,55 @@ class PluginState:
             self._remember_session_index_cache_locked(user, sessions, max_items)
             self._users_locked().remember_session_index(
                 user,
-                self._session_index_for_storage(sessions),
+                self.privacy.session_index_for_storage(sessions),
                 max_items,
             )
             await self._save_locked()
 
-    async def find_session_index_item(self, user: UserRef, session_id: str) -> dict[str, str] | None:
+    async def find_session_index_item(
+        self,
+        user: UserRef,
+        session_id: str,
+        max_age_seconds: int = 0,
+    ) -> dict[str, str] | None:
         """在当前 origin 的序号缓存中查找 session。"""
         if not is_valid_session_id(session_id):
             return None
         async with self._lock:
-            cached = self._find_session_index_cache_item_locked(user, session_id)
+            cached = self._find_session_index_cache_item_locked(
+                user,
+                session_id,
+                max_age_seconds=max_age_seconds,
+            )
             if cached:
                 return cached
-            return self._users_locked().find_session_index_item(user, session_id)
+            return self._users_locked().find_session_index_item(
+                user,
+                session_id,
+                max_age_seconds=max_age_seconds,
+            )
         return None
 
     async def resolve_session_ref(
         self,
         user: UserRef,
         ref: str,
+        max_age_seconds: int = 0,
     ) -> tuple[dict[str, str] | None, str | None]:
         """把用户输入的 session 引用解析为 session 字典。"""
         async with self._lock:
-            cached, error = self._resolve_session_index_cache_ref_locked(user, ref)
+            cached, error = self._resolve_session_index_cache_ref_locked(
+                user,
+                ref,
+                max_age_seconds=max_age_seconds,
+            )
             if cached is not None or error is not None:
                 return cached, error
-            return self._users_locked().resolve_session_ref(user, ref)
+            return self._users_locked().resolve_session_ref(
+                user,
+                ref,
+                max_age_seconds=max_age_seconds,
+            )
 
     async def users_bound_to_session(self, session_id: str) -> list[dict[str, Any]]:
         """查找绑定了该 session 的用户和 origin，用于主动推送。"""
@@ -437,7 +468,7 @@ class PluginState:
                 user,
                 payload,
                 display_target,
-                message_for_storage=self._sensitive_text_for_storage,
+                privacy=self.privacy,
                 max_history_per_user=max_history_per_user,
                 max_history_global=max_history_global,
             )
@@ -465,8 +496,9 @@ class PluginState:
                 event=event,
                 session_id=session_id,
                 summary=summary,
-                summary_for_storage=self._summary_for_storage,
-                error=error,
+                summary_for_storage=self.privacy.run_summary_for_storage,
+                event_for_storage=self.privacy.run_event_for_storage,
+                error=self.privacy.run_event_for_storage(error) if error else None,
                 finished=finished,
             ):
                 await self._save_locked(
@@ -521,7 +553,7 @@ class PluginState:
                 approval=approval,
                 reason=reason,
                 result=result,
-                input_summary=self._approval_input_summary_for_storage(approval),
+                input_summary=self.privacy.approval_input_summary_for_storage(approval),
             )
             await self._save_locked()
 
@@ -533,16 +565,7 @@ class PluginState:
 
     def _approval_for_storage(self, approval: PendingApproval) -> PendingApproval:
         """按敏感状态配置决定审批输入是否允许写入磁盘。"""
-        if self.persist_sensitive_state:
-            return approval
-        return PendingApproval(
-            request_id=approval.request_id,
-            session_id=approval.session_id,
-            tool_name=approval.tool_name,
-            input_data=dict(OMITTED_SENSITIVE_INPUT),
-            provider=approval.provider,
-            received_at=approval.received_at,
-        )
+        return self.privacy.approval_for_storage(approval)
 
     def _remember_pending_input_locked(self, approval: PendingApproval) -> None:
         """敏感持久化关闭时，把审批输入仅缓存在内存，供当前进程展示。"""
@@ -580,42 +603,23 @@ class PluginState:
 
     def _sensitive_text_for_storage(self, value: Any) -> str:
         """决定任务 prompt 是否写入磁盘；默认只记录字符数。"""
-        if self.persist_sensitive_state:
-            return safe_text(value, MAX_STORED_TEXT)
-        text = value if isinstance(value, str) else str(value or "")
-        return f"{OMITTED_SENSITIVE_TEXT}; chars={len(text)}"
+        # Keep legacy helper behavior delegated to the central privacy policy.
+        return self.privacy.sensitive_text_for_storage(value)
 
     def _approval_input_summary_for_storage(self, approval: PendingApproval) -> str:
         """决定审计记录中是否保存工具输入摘要。"""
-        if self.persist_sensitive_state:
-            return safe_text(compact_json(approval.input_data), 500)
-        return OMITTED_SENSITIVE_TEXT
+        # Keep legacy helper behavior delegated to the central privacy policy.
+        return self.privacy.approval_input_summary_for_storage(approval)
 
     def _summary_for_storage(self, summary: dict[str, Any]) -> dict[str, Any]:
         """决定任务最终助手文本是否写入磁盘。"""
-        if self.persist_sensitive_state:
-            return summary
-        stored = dict(summary)
-        if stored.get("assistantText"):
-            stored["assistantText"] = OMITTED_SENSITIVE_TEXT
-        return stored
+        # Keep legacy helper behavior delegated to the central privacy policy.
+        return self.privacy.run_summary_for_storage(summary)
 
     def _session_index_for_storage(self, sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """决定最近 session 缓存可落盘字段；默认不保存项目路径和摘要。"""
-        if self.persist_sensitive_state:
-            return sessions
-        stored_sessions: list[dict[str, Any]] = []
-        for item in sessions:
-            if not isinstance(item, dict):
-                continue
-            stored_sessions.append(
-                {
-                    "id": item.get("id") or item.get("sessionId") or item.get("session_id") or "",
-                    "provider": item.get("provider") or "",
-                    "lastActivity": item.get("lastActivity") or "",
-                }
-            )
-        return stored_sessions
+        # Keep legacy helper behavior delegated to the central privacy policy.
+        return self.privacy.session_index_for_storage(sessions)
 
     def _remember_session_index_cache_locked(
         self,
@@ -629,16 +633,19 @@ class PluginState:
         still has the freshly fetched projectPath available without another REST
         round-trip.
         """
-        self._session_index_cache[self._session_index_cache_key(user)] = (
-            normalize_session_index_items(sessions, max_items)
-        )
+        self._session_index_cache[self._session_index_cache_key(user)] = {
+            "items": normalize_session_index_items(sessions, max_items),
+            "at": time.time(),
+        }
 
     def _find_session_index_cache_item_locked(
         self,
         user: UserRef,
         session_id: str,
+        *,
+        max_age_seconds: int = 0,
     ) -> dict[str, str] | None:
-        for item in self._session_index_cache.get(self._session_index_cache_key(user), []):
+        for item in self._session_index_cache_items_locked(user, max_age_seconds):
             if item.get("id") == session_id:
                 return dict(item)
         return None
@@ -647,11 +654,13 @@ class PluginState:
         self,
         user: UserRef,
         ref: str,
+        *,
+        max_age_seconds: int = 0,
     ) -> tuple[dict[str, str] | None, str | None]:
         ref = ref.strip()
         if not ref:
             return None, None
-        cached = self._session_index_cache.get(self._session_index_cache_key(user))
+        cached = self._session_index_cache_items_locked(user, max_age_seconds)
         if not cached:
             return None, None
         if ref.lower() in {"last", "latest"}:
@@ -661,11 +670,33 @@ class PluginState:
         else:
             if not is_valid_session_id(ref):
                 return None, None
-            item = self._find_session_index_cache_item_locked(user, ref)
+            item = self._find_session_index_cache_item_locked(
+                user,
+                ref,
+                max_age_seconds=max_age_seconds,
+            )
             return item, None
         if index < 1 or index > len(cached):
             return None, f"session 序号无效，请输入 1-{len(cached)}。"
         return dict(cached[index - 1]), None
+
+    def _session_index_cache_items_locked(
+        self,
+        user: UserRef,
+        max_age_seconds: int,
+    ) -> list[dict[str, str]]:
+        cached = self._session_index_cache.get(self._session_index_cache_key(user))
+        if not isinstance(cached, dict):
+            return []
+        cached_at = float(cached.get("at") or 0)
+        # Session indexes can authorize later commands by number, so stale
+        # entries must stop granting access after the configured TTL.
+        if max_age_seconds > 0 and (
+            cached_at <= 0 or time.time() - cached_at > max_age_seconds
+        ):
+            return []
+        items = cached.get("items")
+        return items if isinstance(items, list) else []
 
     def _session_index_cache_key(self, user: UserRef) -> tuple[str, str]:
         return (user.user_key, origin_key(user))
