@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 try:
+    from ..core.sanitizer import safe_single_line_text
     from ..core.redaction import redact_text
     from .formatting_common import clip_text, extract_text, read_int, read_str, render_input
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from core.sanitizer import safe_single_line_text
     from core.redaction import redact_text
     from commands.formatting_common import clip_text, extract_text, read_int, read_str, render_input
 
@@ -120,7 +122,7 @@ def _normalize_session_items(items: Any) -> list[str]:
         result = []
         for item in items:
             if isinstance(item, str):
-                result.append(item)
+                result.append(safe_single_line_text(item, 200))
             elif isinstance(item, dict):
                 session_id = item.get("id") or item.get("sessionId") or item.get("session_id")
                 status = item.get("status")
@@ -128,23 +130,23 @@ def _normalize_session_items(items: Any) -> list[str]:
                 if session_id:
                     suffix = ""
                     if status:
-                        suffix += f" [{status}]"
+                        suffix += f" [{safe_single_line_text(status, 80)}]"
                     if started:
-                        suffix += f" started={started}"
-                    result.append(f"{session_id}{suffix}")
+                        suffix += f" started={safe_single_line_text(started, 80)}"
+                    result.append(f"{safe_single_line_text(session_id, 200)}{suffix}")
         return result
     if isinstance(items, dict):
-        return [str(key) for key in items]
+        return [safe_single_line_text(key, 200) for key in items]
     return []
 
 
 def _render_recent_session(item: dict[str, Any]) -> str:
     """渲染一条最近 session，序号由上层循环生成。"""
-    session_id = item.get("id") or item.get("sessionId") or item.get("session_id")
-    provider = item.get("provider") or "unknown"
-    project = clip_text(str(item.get("projectName") or item.get("projectPath") or ""), 180)
-    summary = str(item.get("summary") or "")
-    last_activity = clip_text(str(item.get("lastActivity") or ""), 80)
+    session_id = safe_single_line_text(item.get("id") or item.get("sessionId") or item.get("session_id"), 200)
+    provider = safe_single_line_text(item.get("provider") or "unknown", 80)
+    project = clip_text(safe_single_line_text(item.get("projectName") or item.get("projectPath") or "", 500), 180)
+    summary = safe_single_line_text(item.get("summary") or "", 240)
+    last_activity = clip_text(safe_single_line_text(item.get("lastActivity") or "", 80), 80)
     message_count = item.get("messageCount")
 
     parts = [f"{session_id} [{provider}]"]

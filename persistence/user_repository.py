@@ -6,10 +6,10 @@ import time
 from typing import Any
 
 try:
-    from ..core.sanitizer import safe_text
+    from ..core.sanitizer import safe_single_line_text
     from .state_models import UserRef, is_valid_session_id
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from core.sanitizer import safe_text
+    from core.sanitizer import safe_single_line_text
     from persistence.state_models import UserRef, is_valid_session_id
 
 
@@ -133,29 +133,7 @@ class UserStateRepository:
     ) -> None:
         """缓存 `/cloudcli session` 展示出来的最近 session，供后续用序号引用。"""
         entry = self.entry(user.user_key)
-        seen: set[str] = set()
-        normalized: list[dict[str, str]] = []
-        for item in sessions:
-            if not isinstance(item, dict):
-                continue
-            session_id = _read_str(
-                item.get("id") or item.get("sessionId") or item.get("session_id")
-            ).strip()
-            if not is_valid_session_id(session_id) or session_id in seen:
-                continue
-            seen.add(session_id)
-            normalized.append(
-                {
-                    "id": session_id,
-                    "provider": safe_text(item.get("provider"), 60),
-                    "projectName": safe_text(item.get("projectName"), 160),
-                    "projectPath": safe_text(item.get("projectPath"), 500),
-                    "summary": safe_text(item.get("summary"), 240),
-                    "lastActivity": safe_text(item.get("lastActivity"), 80),
-                }
-            )
-            if len(normalized) >= max(1, min(max_items, MAX_SESSION_INDEX_ITEMS)):
-                break
+        normalized = normalize_session_index_items(sessions, max_items)
         session_indexes = read_session_indexes(entry.get("session_indexes"))
         session_indexes[origin_key(user)] = {
             "items": normalized,
@@ -325,6 +303,41 @@ def session_index_for_origin(entry: dict[str, Any], origin: str) -> list[dict[st
     if isinstance(scoped, dict):
         return _read_dict_list(scoped.get("items"))
     return []
+
+
+def normalize_session_index_items(
+    sessions: list[dict[str, Any]],
+    max_items: int = MAX_SESSION_INDEX_ITEMS,
+) -> list[dict[str, str]]:
+    """Normalize recent session metadata before storing or caching it.
+
+    The same helper is used by disk-backed state and in-memory state so index
+    references resolve consistently, while display-oriented text is single-line.
+    """
+    seen: set[str] = set()
+    normalized: list[dict[str, str]] = []
+    for item in sessions:
+        if not isinstance(item, dict):
+            continue
+        session_id = _read_str(
+            item.get("id") or item.get("sessionId") or item.get("session_id")
+        ).strip()
+        if not is_valid_session_id(session_id) or session_id in seen:
+            continue
+        seen.add(session_id)
+        normalized.append(
+            {
+                "id": session_id,
+                "provider": safe_single_line_text(item.get("provider"), 60),
+                "projectName": safe_single_line_text(item.get("projectName"), 160),
+                "projectPath": safe_single_line_text(item.get("projectPath"), 500),
+                "summary": safe_single_line_text(item.get("summary"), 240),
+                "lastActivity": safe_single_line_text(item.get("lastActivity"), 80),
+            }
+        )
+        if len(normalized) >= max(1, min(max_items, MAX_SESSION_INDEX_ITEMS)):
+            break
+    return normalized
 
 
 def _empty_user_entry() -> dict[str, Any]:

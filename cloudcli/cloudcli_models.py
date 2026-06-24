@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+try:
+    from ..core.sanitizer import safe_single_line_text
+except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from core.sanitizer import safe_single_line_text
+
 
 @dataclass(frozen=True)
 class RecentSession:
@@ -137,12 +142,12 @@ def _normalize_recent_session(
         return None
     return RecentSession(
         provider=provider,
-        id=str(session_id),
-        summary=str(summary) if summary else "",
+        id=safe_single_line_text(session_id, 160),
+        summary=safe_single_line_text(summary, 240),
         messageCount=message_count,
-        lastActivity=str(last_activity) if last_activity else "",
-        projectName=project_name,
-        projectPath=project_path,
+        lastActivity=safe_single_line_text(last_activity, 80),
+        projectName=safe_single_line_text(project_name, 160),
+        projectPath=safe_single_line_text(project_path, 500),
     )
 
 

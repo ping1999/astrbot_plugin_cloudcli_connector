@@ -27,7 +27,7 @@ try:
     from ..security.authz import AuthorizationPolicy
     from ..security.identity import missing_identity_message
     from .run_requests import RunRequestBuilder
-    from .runtime import RunQuota
+    from .runtime import RunQuota, RunRuntimeRegistry
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
     from commands.command_parser import parse_positive_int
@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from persistence.state import PluginState
     from persistence.state_models import UserRef, is_valid_session_id
     from runs.run_requests import RunRequestBuilder
-    from runs.runtime import RunQuota
+    from runs.runtime import RunQuota, RunRuntimeRegistry
     from security.authz import AuthorizationPolicy
     from security.identity import missing_identity_message
 
@@ -86,9 +86,7 @@ class RunService:
         self.quota = quota
         self.send_proactive = send_proactive
         self.track_task = track_task
-        self.run_tasks_by_id: dict[str, asyncio.Task] = {}
-        self.cancel_requested_run_ids: set[str] = set()
-        self.abort_sent_run_ids: set[str] = set()
+        self.runtime = RunRuntimeRegistry()
 
     async def handle_run(self, user: UserRef, args: list[str], raw_args: str = "") -> str:
         """启动新任务，或转发到 run list/log/cancel 控制命令。"""
@@ -126,7 +124,7 @@ class RunService:
                 parsed.payload,
             )
         )
-        self.run_tasks_by_id[run_id] = task
+        self.runtime.track_task(run_id, task)
         task.add_done_callback(
             lambda _task, task_id=run_id, user_key=user.user_key: self._on_run_task_done(task_id, user_key)
         )
@@ -177,13 +175,13 @@ class RunService:
             if status in {"completed", "failed", "cancelled"}:
                 return f"任务 #{run_id} 已经是 {status} 状态。"
 
-            local_task = self.run_tasks_by_id.get(run_id)
+            local_task = self.runtime.get_task(run_id)
             abort_message = ""
             session_id = str(task.get("session_id") or "")
             has_session_id = bool(session_id and is_valid_session_id(session_id))
             if local_task and not local_task.done() and not has_session_id:
                 # 有些 agent 启动后才返回 sessionId；先标记取消，等流里拿到 sessionId 再 abort 远端。
-                self.cancel_requested_run_ids.add(run_id)
+                self.runtime.request_cancel(run_id)
                 await self.state.update_run_task(
                     run_id,
                     status="cancelling",
@@ -257,7 +255,7 @@ class RunService:
                 self.merge_agent_event(summary, event)
                 if summary.get("sessionId"):
                     await self.state.update_run_task(run_id, session_id=str(summary["sessionId"]))
-                    if run_id in self.cancel_requested_run_ids:
+                    if self.runtime.cancel_requested(run_id):
                         message = "用户取消任务。"
                         message += await self.abort_run_session(summary, payload, run_id=run_id)
                         await finish_as_cancelled(message)
@@ -305,7 +303,7 @@ class RunService:
             else:
                 await consume_stream()
 
-            if run_id in self.cancel_requested_run_ids:
+            if self.runtime.cancel_requested(run_id):
                 message = "用户取消任务。"
                 message += await self.abort_run_session(summary, payload, run_id=run_id)
                 await finish_as_cancelled(message)
@@ -377,8 +375,7 @@ class RunService:
             await self.send_proactive(unified_msg_origin, f"CloudCLI 任务异常：{safe_error}")
         finally:
             # 不管成功、失败还是取消，都清理进程内控制标记，避免复用 run_id 时误判。
-            self.cancel_requested_run_ids.discard(run_id)
-            self.abort_sent_run_ids.discard(run_id)
+            self.runtime.clear_run(run_id)
 
     async def abort_run_session(
         self,
@@ -393,17 +390,14 @@ class RunService:
             return "\n尚未获得 CloudCLI sessionId，无法主动发送中止请求。"
         if not is_valid_session_id(session_id):
             return "\nCloudCLI sessionId 格式异常，未发送中止请求。"
-        if run_id and run_id in self.abort_sent_run_ids:
+        if run_id and not self.runtime.mark_abort_sent_once(run_id):
             return f"\n已向 CloudCLI 发送过中止 session 请求：{session_id}"
-        if run_id:
-            # 防止同一个取消路径多次向 CloudCLI 发送 abort。
-            self.abort_sent_run_ids.add(run_id)
         try:
             result = await self.client.abort_session(session_id, str(payload.get("provider") or ""))
             return "\n" + format_abort_result(result, self.settings.max_push_text_length)
         except CloudCLIError as exc:
             if run_id:
-                self.abort_sent_run_ids.discard(run_id)
+                self.runtime.release_abort_sent(run_id)
             return f"\n尝试中止 CloudCLI session 失败：{exc}"
 
     def merge_agent_event(self, summary: dict[str, Any], event: dict[str, Any]) -> None:
@@ -439,7 +433,7 @@ class RunService:
 
     def _on_run_task_done(self, run_id: str, user_key: str) -> None:
         """后台任务结束后从内存索引移除，并释放并发配额。"""
-        self.run_tasks_by_id.pop(run_id, None)
+        self.runtime.remove_task(run_id)
         self.quota.release(user_key)
 
     async def _prune_history(self) -> None:

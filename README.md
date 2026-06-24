@@ -65,7 +65,7 @@
 - 非管理员默认不能直接手填未绑定的 sessionId；请先执行 `/cloudcli session` 后使用序号，或由管理员开启 `allow_direct_session_id`。
 - 默认只有 AstrBot 管理员或 `approval_allowed_user_keys` 白名单用户可以查看、接收和处理审批请求。
 - `approval_allowed_user_keys` 用户可以处理已绑定 session 的审批。审批白名单用户默认不能直接绑定任意已知 sessionId；只应在可信聊天中显式开启 `approval_allow_direct_session_bind=true`。
-- 为避免历史管理员状态失效导致敏感审批内容误推，主动审批详情只会推送到绑定该 session 的聊天会话，并且默认只主动推给 `approval_allowed_user_keys` 中的用户；只有显式设置 `approval_access_mode=authenticated` 时才会推给所有已验证绑定用户。管理员仍可主动执行 `/cloudcli pending` 查看并处理。
+- 为避免历史管理员状态失效导致敏感审批内容误推，主动审批详情只会推送到绑定该 session 的聊天会话，并且默认只主动推给 `approval_allowed_user_keys` 中的用户；只有同时显式设置 `approval_access_mode=authenticated` 和 `approval_push_details_to_authenticated=true` 时才会推给所有已验证绑定用户。管理员仍可主动执行 `/cloudcli pending` 查看并处理。
 - `/cloudcli pending` 会按 CloudCLI 当前返回结果刷新本地待审批缓存，已不存在的审批会从本地清理。
 - `/cloudcli allow` 和 `/cloudcli deny` 在同步待审批列表失败时不会使用旧缓存继续决策。
 - 审批超时默认只提醒，不会自动允许。只有把 `approval_timeout_action` 设置为 `deny` 时才会自动拒绝。
@@ -103,6 +103,7 @@
 - `approval_allowed_user_keys`：审批白名单，多个用户标识用英文逗号分隔；用 `/cloudcli whoami` 获取当前用户标识
 - `approval_access_mode`：审批权限模式，可选 `admin_or_allowlist`、`allowlist_only`、`authenticated`
 - `approval_require_admin`：兼容旧配置。建议改用 `approval_access_mode`；不配置 access mode 时，把它设为 `false` 现在表示仅白名单，而不是所有用户。
+- `approval_push_details_to_authenticated`：是否在 `approval_access_mode=authenticated` 时把包含工具输入的主动审批详情推给所有已验证绑定用户；默认 `false`
 - `approval_allow_direct_session_bind`：是否允许审批用户在无 session 浏览权限时直接绑定已知 sessionId；默认 `false`
 - `approval_timeout_seconds`：审批超时时间，`0` 表示关闭超时处理
 - `approval_timeout_action`：超时动作，支持 `remind` 或 `deny`

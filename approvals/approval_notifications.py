@@ -22,10 +22,12 @@ class ApprovalNotificationPolicy:
         approval_allowed_user_keys: frozenset[str],
         approval_require_admin: bool,
         approval_access_mode: str = "admin_or_allowlist",
+        push_details_to_authenticated: bool = False,
     ) -> None:
         self.approval_allowed_user_keys = approval_allowed_user_keys
         self.approval_require_admin = approval_require_admin
         self.approval_access_mode = approval_access_mode
+        self.push_details_to_authenticated = push_details_to_authenticated
 
     def plan(self, targets: list[dict[str, Any]]) -> ApprovalNotificationPlan:
         """从绑定用户列表中挑出可接收详细审批内容的目标。"""
@@ -40,6 +42,8 @@ class ApprovalNotificationPolicy:
         """判断单个用户是否可收到审批详情。"""
         if user_key in self.approval_allowed_user_keys:
             return True
-        if self.approval_access_mode == "authenticated":
+        # Detailed proactive pushes include tool input. Keep them narrower than
+        # command access unless the operator explicitly opts in.
+        if self.push_details_to_authenticated and self.approval_access_mode == "authenticated":
             return True
         return False

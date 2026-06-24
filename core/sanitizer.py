@@ -29,6 +29,11 @@ def safe_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
     return text
 
 
+def safe_single_line_text(value: Any, limit: int = MAX_STORED_TEXT) -> str:
+    """Return sanitized text that cannot inject extra chat or state lines."""
+    return safe_text(value, limit).replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+
+
 def safe_json_value(value: Any, depth: int = 0) -> Any:
     """递归清洗 JSON-like 数据，限制深度、条目数并按敏感键脱敏。"""
     if depth >= MAX_STORED_JSON_DEPTH:

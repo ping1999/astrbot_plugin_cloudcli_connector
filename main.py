@@ -69,11 +69,13 @@ class CloudCLIConnectorPlugin(Star):
         self.config = config or {}
         self.settings = load_connector_settings(self.config)
         self.authz = AuthorizationPolicy(self.settings)
-        # 审批通知和审批权限使用同一组访问配置，避免把工具输入推送给无权用户。
+        # Detailed approval pushes include tool input, so they stay narrower than
+        # approval command access unless the operator explicitly opts in.
         self.approval_notifications = ApprovalNotificationPolicy(
             approval_allowed_user_keys=self.settings.approval_allowed_user_keys,
             approval_require_admin=self.settings.approval_require_admin,
             approval_access_mode=self.settings.approval_access_mode,
+            push_details_to_authenticated=self.settings.approval_push_details_to_authenticated,
         )
         # 所有本地状态统一写入插件数据目录，便于重启后恢复绑定、待审批和任务历史。
         self.state = PluginState(

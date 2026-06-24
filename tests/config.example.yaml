@@ -24,6 +24,7 @@ stop_provider: "claude"
 
 approval_allowed_user_keys: ""
 approval_access_mode: "admin_or_allowlist"
+approval_push_details_to_authenticated: false
 approval_allow_direct_session_bind: false
 approval_timeout_seconds: 0
 approval_timeout_action: "remind"

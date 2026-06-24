@@ -383,6 +383,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual("http://127.0.0.1:3001", remote.cloudcli.base_url)
         self.assertEqual("http://localhost:3001/cloudcli", local.cloudcli.base_url)
 
+    def test_approval_detail_push_opt_in_is_read_from_config(self) -> None:
+        """The broad detailed push opt-in must be explicit runtime config."""
+        default_settings = load_connector_settings({})
+        enabled_settings = load_connector_settings(
+            {"approval_push_details_to_authenticated": True}
+        )
+
+        self.assertFalse(default_settings.approval_push_details_to_authenticated)
+        self.assertTrue(enabled_settings.approval_push_details_to_authenticated)
+
 
 class ProtocolTests(unittest.TestCase):
     """覆盖 CloudCLI 协议辅助函数和 WebSocket 请求复用器。"""
@@ -819,6 +829,27 @@ class FormattingTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 280)
         self.assertIn("已截断", rendered)
 
+    def test_session_overview_single_lines_untrusted_metadata(self) -> None:
+        """CloudCLI session metadata must not inject fake chat lines."""
+        rendered = format_session_overview(
+            {"sessions": {"codex": [{"id": "sess-1\nfake", "status": "ok\nFAKE"}]}},
+            [
+                {
+                    "id": "sess-2",
+                    "provider": "codex\nFAKE",
+                    "projectName": "repo\n2. fake session",
+                    "summary": "summary\n/cloudcli allow 1",
+                    "lastActivity": "today\nFAKE",
+                }
+            ],
+            text_limit=1000,
+        )
+
+        self.assertNotIn("sess-1\nfake", rendered)
+        self.assertNotIn("ok\nFAKE", rendered)
+        self.assertNotIn("repo\n2. fake session", rendered)
+        self.assertNotIn("summary\n/cloudcli allow 1", rendered)
+
     def test_pending_list_is_clipped_after_all_items_are_rendered(self) -> None:
         """待审批列表先完整渲染再统一裁剪，避免单条输入破坏整体消息结构。"""
         rendered = format_pending(
@@ -1239,6 +1270,39 @@ class StateTests(unittest.TestCase):
         self.assertNotIn("secret-project", rendered)
         self.assertNotIn("C:/secret/repo", rendered)
         self.assertNotIn("secret summary text", rendered)
+
+    def test_session_index_keeps_full_metadata_in_memory_only(self) -> None:
+        """Fresh session metadata stays usable for commands without leaking to disk."""
+        async def scenario() -> tuple[dict[str, str] | None, str]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                state = PluginState(path)
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                await state.remember_user(user)
+                await state.remember_session_index(
+                    user,
+                    [
+                        {
+                            "id": "sess-1",
+                            "provider": "codex",
+                            "projectName": "secret-project",
+                            "projectPath": "C:/secret/repo with spaces",
+                            "summary": "secret summary text",
+                            "lastActivity": "2026-01-01T00:00:00Z",
+                        }
+                    ],
+                )
+                resolved, error = await state.resolve_session_ref(user, "1")
+                assert error is None
+                return resolved, path.read_text(encoding="utf-8")
+
+        resolved, rendered_disk = asyncio.run(scenario())
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual("C:/secret/repo with spaces", resolved["projectPath"])
+        self.assertNotIn("C:/secret/repo", rendered_disk)
+        self.assertNotIn("secret summary text", rendered_disk)
 
     def test_run_event_updates_are_batched_until_flush(self) -> None:
         """频繁的 run event 更新会延迟批量写盘，flush 后再落到状态文件。"""
@@ -1911,6 +1975,27 @@ class ApprovalServiceTests(unittest.TestCase):
         )
 
         self.assertFalse(policy.can_receive_details("test:u1"))
+
+    def test_authenticated_approval_access_does_not_push_details_by_default(self) -> None:
+        """Authenticated approval command access must not imply detailed pushes."""
+        policy = ApprovalNotificationPolicy(
+            approval_allowed_user_keys=frozenset(),
+            approval_require_admin=False,
+            approval_access_mode="authenticated",
+        )
+
+        self.assertFalse(policy.can_receive_details("test:u1"))
+
+    def test_authenticated_approval_detail_push_requires_explicit_opt_in(self) -> None:
+        """Operators can still opt in to broad detailed pushes in trusted chats."""
+        policy = ApprovalNotificationPolicy(
+            approval_allowed_user_keys=frozenset(),
+            approval_require_admin=False,
+            approval_access_mode="authenticated",
+            push_details_to_authenticated=True,
+        )
+
+        self.assertTrue(policy.can_receive_details("test:u1"))
 
     def test_decision_is_blocked_when_pending_refresh_fails(self) -> None:
         """allow/deny 前刷新远端 pending 失败时，不应发送审批决定。"""

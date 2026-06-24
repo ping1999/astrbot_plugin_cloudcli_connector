@@ -31,6 +31,7 @@ class ConnectorSettings:
     approval_allowed_user_keys: frozenset[str]
     approval_require_admin: bool
     approval_access_mode: str
+    approval_push_details_to_authenticated: bool
     approval_allow_direct_session_bind: bool
     approval_timeout_seconds: int
     approval_timeout_action: str
@@ -105,6 +106,10 @@ def load_connector_settings(config: Any) -> ConnectorSettings:
         approval_access_mode=_read_access_mode(
             get("approval_access_mode"),
             legacy_require_admin=approval_require_admin,
+        ),
+        approval_push_details_to_authenticated=_read_bool(
+            get("approval_push_details_to_authenticated"),
+            False,
         ),
         approval_allow_direct_session_bind=_read_bool(get("approval_allow_direct_session_bind"), False),
         approval_timeout_seconds=_read_nonnegative_limited_int(get("approval_timeout_seconds"), 300, 86400),

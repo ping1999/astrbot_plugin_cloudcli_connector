@@ -63,7 +63,7 @@ Each `/cloudcli run` gets a task ID. Use `/cloudcli run list`, `/cloudcli run lo
 - Non-admin users cannot directly type an unbound raw sessionId by default. They should use an index from `/cloudcli session`, or an admin can enable `allow_direct_session_id`.
 - By default, only AstrBot admins or users in `approval_allowed_user_keys` can view, receive, and decide approval requests.
 - Users in `approval_allowed_user_keys` can handle approvals for sessions they have bound. Binding arbitrary raw session IDs for approval-only users is disabled by default; set `approval_allow_direct_session_bind=true` only in trusted chats.
-- To avoid leaking sensitive approval input through stale stored admin state, proactive approval detail pushes only go to the chat origin that bound that session. Detailed proactive pushes are sent only to `approval_allowed_user_keys`, unless `approval_access_mode=authenticated` is explicitly configured; admins can still run `/cloudcli pending` to view and handle requests.
+- To avoid leaking sensitive approval input through stale stored admin state, proactive approval detail pushes only go to the chat origin that bound that session. Detailed proactive pushes are sent only to `approval_allowed_user_keys`, unless both `approval_access_mode=authenticated` and `approval_push_details_to_authenticated=true` are explicitly configured; admins can still run `/cloudcli pending` to view and handle requests.
 - `/cloudcli pending` refreshes the local pending approval cache from CloudCLI and removes approvals that no longer exist upstream.
 - `/cloudcli allow` and `/cloudcli deny` stop when the pending approval refresh fails instead of acting on stale cache.
 - Approval timeout defaults to reminders only. Automatic denial happens only when `approval_timeout_action` is set to `deny`.
@@ -101,6 +101,7 @@ For self-hosted CloudCLI, create or obtain credentials from the CloudCLI UI:
 - `approval_allowed_user_keys`: comma-separated approval allowlist; use `/cloudcli whoami` to get the current user key
 - `approval_access_mode`: approval access mode: `admin_or_allowlist`, `allowlist_only`, or `authenticated`
 - `approval_require_admin`: legacy compatibility flag. Prefer `approval_access_mode`; setting this to `false` without an access mode now means allowlist-only, not all users.
+- `approval_push_details_to_authenticated`: when `approval_access_mode=authenticated`, also push detailed approval input to all verified users bound to the session; default `false`
 - `approval_allow_direct_session_bind`: allow approval users to bind raw known session IDs without session browsing access; default `false`
 - `approval_timeout_seconds`: seconds before timeout handling; `0` disables it
 - `approval_timeout_action`: timeout action, `remind` or `deny`

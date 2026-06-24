@@ -201,19 +201,25 @@
     "description": "Comma-separated AstrBot user keys allowed to approve permissions",
     "type": "string",
     "default": "",
-    "hint": "Users in this list can approve even if they are not AstrBot admins and can receive proactive approval details. They may bind a known sessionId for approval handling without getting session browsing access. Use /cloudcli whoami to get the key."
+    "hint": "Users in this list can approve even if they are not AstrBot admins and can receive proactive approval details. Binding arbitrary raw session IDs still requires approval_allow_direct_session_bind=true, admin privileges, or direct session access. Use /cloudcli whoami to get the key."
   },
   "approval_require_admin": {
     "description": "Require AstrBot admin for approvals",
     "type": "bool",
     "default": true,
-    "hint": "When enabled, only AstrBot admins or approval_allowed_user_keys can view, approve, or deny requests. Proactive approval details are sent only to approval_allowed_user_keys."
+    "hint": "When enabled, only AstrBot admins or approval_allowed_user_keys can view, approve, or deny requests. Proactive approval details are sent only to approval_allowed_user_keys unless authenticated detail pushes are explicitly enabled."
   },
   "approval_access_mode": {
     "description": "Approval command access mode",
     "type": "string",
     "default": "admin_or_allowlist",
-    "hint": "Supported values: admin_or_allowlist, allowlist_only, authenticated. This explicit mode is preferred over approval_require_admin."
+    "hint": "Supported values: admin_or_allowlist, allowlist_only, authenticated. This controls approval commands only; detailed proactive pushes stay limited unless approval_push_details_to_authenticated is enabled."
+  },
+  "approval_push_details_to_authenticated": {
+    "description": "Push detailed approval input to all authenticated bound users",
+    "type": "bool",
+    "default": false,
+    "hint": "Dangerous in mixed chats. When false, proactive approval details that include tool input are only pushed to approval_allowed_user_keys. When true with approval_access_mode=authenticated, every verified user bound to the session can receive details."
   },
   "approval_allow_direct_session_bind": {
     "description": "Allow approval users to bind raw session IDs",

@@ -32,6 +32,7 @@ try:
         MAX_SESSION_INDEX_ITEMS,
         UserStateRepository,
         bindings_for_origin,
+        normalize_session_index_items,
         origin_key,
     )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
@@ -57,6 +58,7 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         MAX_SESSION_INDEX_ITEMS,
         UserStateRepository,
         bindings_for_origin,
+        normalize_session_index_items,
         origin_key,
     )
 
@@ -86,6 +88,7 @@ class PluginState:
         self.exclusive_runtime_lock = exclusive_runtime_lock
         self._runtime_lock: StateProcessLock | None = None
         self._pending_input_cache: dict[str, Any] = {}
+        self._session_index_cache: dict[tuple[str, str], list[dict[str, str]]] = {}
         self._lock = asyncio.Lock()
         self._save_pending = False
         self._scheduled_save_task: asyncio.Task | None = None
@@ -217,6 +220,7 @@ class PluginState:
     ) -> None:
         """保存最近 session 序号缓存；敏感持久化关闭时只保留必要字段。"""
         async with self._lock:
+            self._remember_session_index_cache_locked(user, sessions, max_items)
             self._users_locked().remember_session_index(
                 user,
                 self._session_index_for_storage(sessions),
@@ -229,6 +233,9 @@ class PluginState:
         if not is_valid_session_id(session_id):
             return None
         async with self._lock:
+            cached = self._find_session_index_cache_item_locked(user, session_id)
+            if cached:
+                return cached
             return self._users_locked().find_session_index_item(user, session_id)
         return None
 
@@ -239,6 +246,9 @@ class PluginState:
     ) -> tuple[dict[str, str] | None, str | None]:
         """把用户输入的 session 引用解析为 session 字典。"""
         async with self._lock:
+            cached, error = self._resolve_session_index_cache_ref_locked(user, ref)
+            if cached is not None or error is not None:
+                return cached, error
             return self._users_locked().resolve_session_ref(user, ref)
 
     async def users_bound_to_session(self, session_id: str) -> list[dict[str, Any]]:
@@ -606,6 +616,59 @@ class PluginState:
                 }
             )
         return stored_sessions
+
+    def _remember_session_index_cache_locked(
+        self,
+        user: UserRef,
+        sessions: list[dict[str, Any]],
+        max_items: int,
+    ) -> None:
+        """Keep full recent-session metadata in memory for same-process commands.
+
+        Disk state can stay privacy-preserving while `/cloudcli run --session 1`
+        still has the freshly fetched projectPath available without another REST
+        round-trip.
+        """
+        self._session_index_cache[self._session_index_cache_key(user)] = (
+            normalize_session_index_items(sessions, max_items)
+        )
+
+    def _find_session_index_cache_item_locked(
+        self,
+        user: UserRef,
+        session_id: str,
+    ) -> dict[str, str] | None:
+        for item in self._session_index_cache.get(self._session_index_cache_key(user), []):
+            if item.get("id") == session_id:
+                return dict(item)
+        return None
+
+    def _resolve_session_index_cache_ref_locked(
+        self,
+        user: UserRef,
+        ref: str,
+    ) -> tuple[dict[str, str] | None, str | None]:
+        ref = ref.strip()
+        if not ref:
+            return None, None
+        cached = self._session_index_cache.get(self._session_index_cache_key(user))
+        if not cached:
+            return None, None
+        if ref.lower() in {"last", "latest"}:
+            index = 1
+        elif ref.isdigit():
+            index = int(ref)
+        else:
+            if not is_valid_session_id(ref):
+                return None, None
+            item = self._find_session_index_cache_item_locked(user, ref)
+            return item, None
+        if index < 1 or index > len(cached):
+            return None, f"session 序号无效，请输入 1-{len(cached)}。"
+        return dict(cached[index - 1]), None
+
+    def _session_index_cache_key(self, user: UserRef) -> tuple[str, str]:
+        return (user.user_key, origin_key(user))
 
     def _scrub_sensitive_state_locked(self) -> None:
         """清理内存状态中已经存在的敏感字段，并准备覆盖写回磁盘。"""
