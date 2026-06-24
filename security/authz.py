@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from pathlib import Path
 
 try:
     from ..core.config import ConnectorSettings
     from .identity import missing_identity_message
+    from .project_paths import ProjectPathDecision, ProjectPathPolicy
     from ..persistence.state_models import UserRef
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from core.config import ConnectorSettings
     from persistence.state_models import UserRef
     from security.identity import missing_identity_message
+    from security.project_paths import ProjectPathDecision, ProjectPathPolicy
 
 
 @dataclass(frozen=True)
@@ -24,20 +24,12 @@ class Decision:
     message: str = ""
 
 
-@dataclass(frozen=True)
-class ProjectPathDecision:
-    """本地项目路径授权结果；path 是解析后的绝对路径。"""
-
-    allowed: bool
-    path: str = ""
-    message: str = ""
-
-
 class AuthorizationPolicy:
     """把配置中的访问模式、白名单和管理员身份组合成明确授权判断。"""
 
     def __init__(self, settings: ConnectorSettings) -> None:
         self.settings = settings
+        self.project_paths = ProjectPathPolicy(settings)
 
     def can_access_sessions(self, user: UserRef) -> Decision:
         """判断用户是否能读取 CloudCLI session 列表和聊天记录。"""
@@ -151,30 +143,11 @@ class AuthorizationPolicy:
 
     def authorize_project_path(self, user: UserRef, project_path: str) -> ProjectPathDecision:
         """校验本地项目路径是否在允许根目录内。"""
-        if not project_path:
-            return ProjectPathDecision(True, "")
-
-        resolved_project = _resolve_path(project_path)
-        roots = self.settings.allowed_project_roots
-        if not roots:
-            if user.is_admin or self.settings.allow_unrestricted_project_paths:
-                return ProjectPathDecision(True, resolved_project)
-            return ProjectPathDecision(
-                False,
-                "",
-                "未配置 allowed_project_roots，非管理员不能使用本地 --project。"
-                "请让管理员配置允许的项目根目录，或改用 --github。"
-            )
-
-        normalized_project = _normalize_path(resolved_project)
-        for root in roots:
-            if _is_path_within(normalized_project, _normalize_path(root)):
-                return ProjectPathDecision(True, resolved_project)
-        return ProjectPathDecision(False, "", "projectPath 不在 allowed_project_roots 允许的目录内。")
+        return self.project_paths.authorize(user, project_path)
 
     def validate_project_path(self, user: UserRef, project_path: str) -> str:
         """旧调用方使用的便捷接口；返回空字符串表示通过。"""
-        return self.authorize_project_path(user, project_path).message
+        return self.project_paths.validate(user, project_path)
 
     def _is_allowed(
         self,
@@ -197,26 +170,3 @@ class AuthorizationPolicy:
         if getattr(user, "identity_verified", True):
             return ""
         return missing_identity_message(user)
-
-
-def _resolve_path(value: str) -> str:
-    """展开环境变量和用户目录，并尽量解析成绝对路径。"""
-    expanded = os.path.expandvars(os.path.expanduser(value))
-    try:
-        resolved = Path(expanded).resolve(strict=False)
-    except (OSError, RuntimeError):
-        resolved = Path(os.path.abspath(expanded))
-    return str(resolved)
-
-
-def _normalize_path(value: str) -> str:
-    """按当前操作系统规则归一化路径大小写和分隔符。"""
-    return os.path.normcase(_resolve_path(value))
-
-
-def _is_path_within(path: str, root: str) -> bool:
-    """判断 path 是否位于 root 内；不同盘符会触发 ValueError。"""
-    try:
-        return os.path.commonpath([path, root]) == root
-    except ValueError:
-        return False

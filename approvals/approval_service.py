@@ -281,7 +281,7 @@ class ApprovalService:
         )
         self.timeout_tasks[approval_key] = task
         task.add_done_callback(
-            lambda _task, key=approval_key: self.timeout_tasks.pop(key, None)
+            lambda done_task, key=approval_key: self._forget_timeout_task(key, done_task)
         )
         self.track_task(task)
 
@@ -294,6 +294,11 @@ class ApprovalService:
         task = self.timeout_tasks.pop(approval_key, None)
         if task and not task.done():
             task.cancel()
+
+    def _forget_timeout_task(self, approval_key: str, task: asyncio.Task) -> None:
+        """只清理当前 task 自己的索引，避免旧回调误删新安排的同 key task。"""
+        if self.timeout_tasks.get(approval_key) is task:
+            self.timeout_tasks.pop(approval_key, None)
 
     async def refresh_pending_for_bindings(
         self,

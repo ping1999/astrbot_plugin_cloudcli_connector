@@ -36,10 +36,11 @@ from commands.handlers import CloudCLICommandHandlers
 from core.config import load_connector_settings
 from core.redaction import redact_exception_text
 from persistence.state import PluginState
-from persistence.state_models import PendingApproval, UserRef
+from persistence.state_models import PendingApproval, UserRef, pending_storage_key
 from runs.run_requests import RunRequestBuilder
 from runs.run_service import RunService
 from runs.runtime import RunQuota
+import security.project_paths as project_paths_module
 from security.authz import AuthorizationPolicy
 from security.identity import build_user_ref
 from security.run_validation import is_safe_git_branch_name, is_safe_model_name, looks_like_github_url
@@ -680,6 +681,58 @@ class RunRequestTests(unittest.TestCase):
         parsed, error = asyncio.run(scenario())
         self.assertIsNone(parsed)
         self.assertIn("不能同时使用", error or "")
+
+    def test_project_path_rejects_without_roots_before_resolve(self) -> None:
+        """非管理员未配置 allowed_project_roots 时，应在解析路径前拒绝。"""
+        original_resolve = project_paths_module._resolve_path
+        calls: list[str] = []
+
+        def fail_resolve(value: str) -> str:
+            calls.append(value)
+            raise AssertionError("rejected project path should not be resolved")
+
+        project_paths_module._resolve_path = fail_resolve
+        try:
+            settings = load_connector_settings({"run_access_mode": "authenticated"})
+            decision = AuthorizationPolicy(settings).authorize_project_path(
+                UserRef("test:u1", "User", "origin"),
+                "\\\\server\\share\\repo",
+            )
+        finally:
+            project_paths_module._resolve_path = original_resolve
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual([], calls)
+        self.assertIn("未配置 allowed_project_roots", decision.message)
+
+    def test_unc_project_path_rejects_outside_roots_before_resolve(self) -> None:
+        """未显式允许同一 UNC 根时，UNC projectPath 不能进入 Path.resolve。"""
+        original_resolve = project_paths_module._resolve_path
+        calls: list[str] = []
+
+        def fail_resolve(value: str) -> str:
+            calls.append(value)
+            raise AssertionError("UNC path outside roots should not be resolved")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_paths_module._resolve_path = fail_resolve
+            try:
+                settings = load_connector_settings(
+                    {
+                        "run_access_mode": "authenticated",
+                        "allowed_project_roots": temp_dir,
+                    }
+                )
+                decision = AuthorizationPolicy(settings).authorize_project_path(
+                    UserRef("test:u1", "User", "origin"),
+                    "\\\\server\\share\\repo",
+                )
+            finally:
+                project_paths_module._resolve_path = original_resolve
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual([], calls)
+        self.assertIn("projectPath 不在 allowed_project_roots", decision.message)
 
     def test_run_project_target_sends_authorized_absolute_path(self) -> None:
         """本地项目路径要先经过授权解析，再把绝对路径放进 payload。"""
@@ -2170,6 +2223,50 @@ class ApprovalServiceTests(unittest.TestCase):
         claimed, error = asyncio.run(scenario())
         self.assertTrue(claimed)
         self.assertEqual("", error)
+
+    def test_timeout_done_callback_keeps_replaced_task(self) -> None:
+        """旧 timeout task 的完成回调不能误删后来同 key 新安排的 task。"""
+        async def scenario() -> bool:
+            settings = load_connector_settings({"approval_timeout_seconds": 60})
+            service = ApprovalService(
+                settings=settings,
+                state=object(),  # type: ignore[arg-type]
+                client=object(),  # type: ignore[arg-type]
+                notifications=ApprovalNotificationPolicy(
+                    approval_allowed_user_keys=frozenset(),
+                    approval_require_admin=True,
+                ),
+                send_proactive=lambda _origin, _text: asyncio.sleep(0),
+                track_task=lambda _task: None,
+            )
+            approval = PendingApproval(
+                "request-1",
+                "sess-1",
+                "Tool",
+                {"value": 1},
+                received_at=10**12,
+            )
+            key = pending_storage_key(approval.session_id, approval.request_id)
+
+            service.schedule_timeout(approval)
+            first = service.timeout_tasks[key]
+            service.cancel_timeout(approval)
+            service.schedule_timeout(approval)
+            second = service.timeout_tasks[key]
+            await asyncio.sleep(0)
+            kept = service.timeout_tasks.get(key) is second
+
+            service.cancel_timeout(key)
+            for task in (first, second):
+                if not task.done():
+                    task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            return kept
+
+        self.assertTrue(asyncio.run(scenario()))
 
     def test_timeout_deny_retries_after_temporary_send_failure(self) -> None:
         """自动拒绝遇到临时发送失败时应重试，最终成功后移除 pending。"""

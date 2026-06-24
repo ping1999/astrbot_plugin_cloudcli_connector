@@ -152,8 +152,11 @@ class CloudCLIConnectorPlugin(Star):
                 await task
             except asyncio.CancelledError:
                 pass
-        await self.state.close()
-        await self.client.close()
+        # 先停止 CloudCLI 入站 worker，避免状态文件关闭期间又收到审批回调。
+        try:
+            await self.client.close()
+        finally:
+            await self.state.close()
 
     @filter.command("cloudcli")
     async def cloudcli(self, event: AstrMessageEvent):
