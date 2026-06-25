@@ -8,7 +8,8 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 try:
-    from ..cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from ..cloudcli.cloudcli_errors import CloudCLIError
+    from ..cloudcli.cloudcli_ports import CloudCLIAgentPort
     from ..commands.command_parser import parse_positive_int
     from ..commands.formatting import (
         clip_text,
@@ -21,6 +22,14 @@ try:
         format_run_tasks,
     )
     from ..core.config import ConnectorSettings
+    from ..core.constants import (
+        RUN_STATUS_CANCELLED,
+        RUN_STATUS_CANCELLING,
+        RUN_STATUS_COMPLETED,
+        RUN_STATUS_FAILED,
+        RUN_STATUS_RUNNING,
+        TERMINAL_RUN_STATUSES,
+    )
     from ..core.redaction import redact_exception_text, redact_text
     from ..persistence.state import PluginState
     from ..persistence.state_models import UserRef, is_valid_session_id
@@ -29,7 +38,8 @@ try:
     from .run_requests import RunRequestBuilder
     from .runtime import RunQuota, RunRuntimeRegistry
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from cloudcli.cloudcli_errors import CloudCLIError
+    from cloudcli.cloudcli_ports import CloudCLIAgentPort
     from commands.command_parser import parse_positive_int
     from commands.formatting import (
         clip_text,
@@ -42,6 +52,14 @@ except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
         format_run_tasks,
     )
     from core.config import ConnectorSettings
+    from core.constants import (
+        RUN_STATUS_CANCELLED,
+        RUN_STATUS_CANCELLING,
+        RUN_STATUS_COMPLETED,
+        RUN_STATUS_FAILED,
+        RUN_STATUS_RUNNING,
+        TERMINAL_RUN_STATUSES,
+    )
     from core.redaction import redact_exception_text, redact_text
     from persistence.state import PluginState
     from persistence.state_models import UserRef, is_valid_session_id
@@ -71,7 +89,7 @@ class RunService:
         settings: ConnectorSettings,
         authz: AuthorizationPolicy,
         state: PluginState,
-        client: CloudCLIClient,
+        client: CloudCLIAgentPort,
         request_builder: RunRequestBuilder,
         quota: RunQuota,
         send_proactive: SendProactive,
@@ -172,7 +190,7 @@ class RunService:
             assert task is not None
             run_id = str(task.get("id") or args[1])
             status = str(task.get("status") or "")
-            if status in {"completed", "failed", "cancelled"}:
+            if status in TERMINAL_RUN_STATUSES:
                 return f"任务 #{run_id} 已经是 {status} 状态。"
 
             local_task = self.runtime.get_task(run_id)
@@ -184,7 +202,7 @@ class RunService:
                 self.runtime.request_cancel(run_id)
                 await self.state.update_run_task(
                     run_id,
-                    status="cancelling",
+                    status=RUN_STATUS_CANCELLING,
                     event="用户请求取消，等待 CloudCLI sessionId 后中止远端任务。",
                 )
                 return f"已请求取消 CloudCLI 任务 #{run_id}，正在等待 CloudCLI sessionId。"
@@ -201,7 +219,7 @@ class RunService:
                 )
             await self.state.update_run_task(
                 run_id,
-                status="cancelled",
+                status=RUN_STATUS_CANCELLED,
                 event="用户取消任务。",
                 finished=True,
             )
@@ -235,7 +253,7 @@ class RunService:
             """把任务标记为 cancelled 并推送最终取消消息。"""
             await self.state.update_run_task(
                 run_id,
-                status="cancelled",
+                status=RUN_STATUS_CANCELLED,
                 event=message,
                 finished=True,
             )
@@ -297,7 +315,7 @@ class RunService:
                     last_status_at = now
 
         try:
-            await self.state.update_run_task(run_id, status="running", event="任务已启动。")
+            await self.state.update_run_task(run_id, status=RUN_STATUS_RUNNING, event="任务已启动。")
             if max_duration > 0:
                 await asyncio.wait_for(consume_stream(), timeout=max_duration)
             else:
@@ -316,7 +334,7 @@ class RunService:
             final_text = format_agent_final(summary, text_limit)
             await self.state.update_run_task(
                 run_id,
-                status="failed" if summary.get("errors") else "completed",
+                status=RUN_STATUS_FAILED if summary.get("errors") else RUN_STATUS_COMPLETED,
                 event=final_text,
                 summary=summary,
                 finished=True,
@@ -330,7 +348,7 @@ class RunService:
             message += await self.abort_run_session(summary, payload, run_id=run_id)
             await self.state.update_run_task(
                 run_id,
-                status="failed",
+                status=RUN_STATUS_FAILED,
                 event=message,
                 error=message,
                 finished=True,
@@ -340,7 +358,7 @@ class RunService:
         except CloudCLIError as exc:
             await self.state.update_run_task(
                 run_id,
-                status="failed",
+                status=RUN_STATUS_FAILED,
                 event=f"CloudCLI 任务失败：{exc}",
                 error=str(exc),
                 finished=True,
@@ -352,7 +370,7 @@ class RunService:
             message += await self.abort_run_session(summary, payload, run_id=run_id)
             await self.state.update_run_task(
                 run_id,
-                status="cancelled",
+                status=RUN_STATUS_CANCELLED,
                 event=message,
                 finished=True,
             )
@@ -366,7 +384,7 @@ class RunService:
             )
             await self.state.update_run_task(
                 run_id,
-                status="failed",
+                status=RUN_STATUS_FAILED,
                 event=f"CloudCLI 任务异常：{safe_error}",
                 error=safe_error,
                 finished=True,

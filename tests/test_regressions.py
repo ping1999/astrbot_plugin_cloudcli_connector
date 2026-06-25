@@ -37,6 +37,7 @@ from core.config import load_connector_settings
 from core.redaction import redact_exception_text
 from persistence.state import PluginState
 from persistence.state_models import PendingApproval, UserRef, pending_storage_key
+from persistence.state_storage import StateLockError
 from runs.run_requests import RunRequestBuilder
 from runs.run_service import RunService
 from runs.runtime import RunQuota
@@ -1516,6 +1517,66 @@ class StateTests(unittest.TestCase):
         self.assertEqual(1, task["changed"])
         self.assertEqual("interrupted", task["status"])
         self.assertTrue(task["finished_at"])
+
+    def test_cancelling_runs_are_active_for_restart_and_pruning(self) -> None:
+        """等待 sessionId 才能远端 abort 的 cancelling 任务仍属于活跃任务。"""
+        async def scenario() -> tuple[int, str, list[str]]:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = PluginState(Path(temp_dir) / "state.json")
+                await state.load()
+                user = UserRef("test:u1", "User", "origin")
+                cancelling_id = await state.create_run_task(
+                    user,
+                    {"provider": "codex", "projectPath": "C:/repo-cancel", "message": "cancel"},
+                    "C:/repo-cancel",
+                    1,
+                    1,
+                )
+                await state.update_run_task(cancelling_id, status="cancelling")
+                for index in range(2):
+                    run_id = await state.create_run_task(
+                        user,
+                        {"provider": "codex", "projectPath": f"C:/repo-{index}", "message": "done"},
+                        f"C:/repo-{index}",
+                        1,
+                        1,
+                    )
+                    await state.update_run_task(run_id, status="completed", finished=True)
+                await state.prune_run_history(1, 1)
+                kept_before_restart = [
+                    str(item.get("id"))
+                    for item in await state.list_run_tasks(user, 10)
+                ]
+                changed = await state.mark_interrupted_runs("restart")
+                task, error = await state.get_run_task(user, cancelling_id)
+                self.assertIsNone(error)
+                assert task is not None
+                return changed, str(task.get("status")), kept_before_restart
+
+        changed, status, kept_before_restart = asyncio.run(scenario())
+        self.assertEqual(1, changed)
+        self.assertEqual("interrupted", status)
+        self.assertIn("1", kept_before_restart)
+
+    def test_exclusive_runtime_lock_blocks_same_process_second_instance(self) -> None:
+        """插件实例生命周期锁也要挡住同进程热重载产生的双实例。"""
+        async def scenario() -> bool:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "state.json"
+                first = PluginState(path, exclusive_runtime_lock=True)
+                second = PluginState(path, exclusive_runtime_lock=True)
+                await first.load()
+                try:
+                    try:
+                        await second.load()
+                    except StateLockError:
+                        return True
+                    return False
+                finally:
+                    await first.close()
+                    await second.close()
+
+        self.assertTrue(asyncio.run(scenario()))
 
     def test_run_history_prunes_completed_tasks(self) -> None:
         """已结束任务历史应按每用户和全局上限裁剪。"""

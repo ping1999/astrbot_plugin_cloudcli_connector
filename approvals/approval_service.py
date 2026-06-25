@@ -10,7 +10,8 @@ from typing import Any
 
 try:
     from .approval_notifications import ApprovalNotificationPolicy
-    from ..cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from ..cloudcli.cloudcli_errors import CloudCLIError
+    from ..cloudcli.cloudcli_ports import CloudCLIApprovalPort
     from ..commands.command_parser import parse_optional_request_no, parse_positive_int
     from ..commands.formatting import format_audit, format_pending, format_push_message
     from ..core.config import ConnectorSettings
@@ -20,7 +21,8 @@ try:
     from ..persistence.state_models import PendingApproval, UserRef, pending_storage_key
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from approvals.approval_notifications import ApprovalNotificationPolicy
-    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from cloudcli.cloudcli_errors import CloudCLIError
+    from cloudcli.cloudcli_ports import CloudCLIApprovalPort
     from commands.command_parser import parse_optional_request_no, parse_positive_int
     from commands.formatting import format_audit, format_pending, format_push_message
     from core.config import ConnectorSettings
@@ -55,7 +57,7 @@ class ApprovalService:
         *,
         settings: ConnectorSettings,
         state: PluginState,
-        client: CloudCLIClient,
+        client: CloudCLIApprovalPort,
         notifications: ApprovalNotificationPolicy,
         send_proactive: SendProactive,
         track_task: TrackTask,

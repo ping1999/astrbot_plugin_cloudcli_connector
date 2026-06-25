@@ -8,11 +8,21 @@ from collections.abc import Callable
 from typing import Any
 
 try:
+    from ..core.constants import (
+        ACTIVE_RUN_STATUSES,
+        RUN_STATUS_INTERRUPTED,
+        RUN_STATUS_RUNNING,
+    )
     from ..core.sanitizer import safe_json_value, safe_text
     from .privacy import StoragePrivacyPolicy
     from .state_models import UserRef, is_valid_session_id
     from .user_repository import origin_key
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
+    from core.constants import (
+        ACTIVE_RUN_STATUSES,
+        RUN_STATUS_INTERRUPTED,
+        RUN_STATUS_RUNNING,
+    )
     from core.sanitizer import safe_json_value, safe_text
     from persistence.privacy import StoragePrivacyPolicy
     from persistence.state_models import UserRef, is_valid_session_id
@@ -52,7 +62,7 @@ class RunRepository:
             "user_key": user.user_key,
             "display_name": user.display_name,
             "origin": origin_key(user),
-            "status": "running",
+            "status": RUN_STATUS_RUNNING,
             "provider": safe_text(payload.get("provider"), 60) or "claude",
             "session_id": safe_text(payload.get("sessionId"), 200),
             "project_path": privacy.target_for_storage(payload.get("projectPath")),
@@ -155,7 +165,7 @@ class RunRepository:
         return dict(item), None
 
     def mark_interrupted(self, reason: str) -> int:
-        """插件重启时把还在 running/queued/pending 的本地任务标成 interrupted。"""
+        """插件重启时把仍可能由旧进程拥有的本地任务标成 interrupted。"""
         runs = _read_dict(self.data.get("runs"))
         now = time.time()
         changed = 0
@@ -163,9 +173,9 @@ class RunRepository:
             if not isinstance(item, dict):
                 continue
             status = _read_str(item.get("status"))
-            if status not in {"running", "queued", "pending"}:
+            if status not in ACTIVE_RUN_STATUSES:
                 continue
-            item["status"] = "interrupted"
+            item["status"] = RUN_STATUS_INTERRUPTED
             item["updated_at"] = now
             item["finished_at"] = now
             log = _read_dict_list(item.get("log"))
@@ -209,7 +219,7 @@ class RunRepository:
             (str(run_id), item)
             for run_id, item in runs.items()
             if isinstance(item, dict)
-            and _read_str(item.get("status")) not in {"running", "queued", "pending"}
+            and _read_str(item.get("status")) not in ACTIVE_RUN_STATUSES
         ]
         if max_history_per_user > 0:
             by_user: dict[str, list[tuple[str, dict[str, Any]]]] = {}
@@ -225,7 +235,7 @@ class RunRepository:
                 (str(run_id), item)
                 for run_id, item in runs.items()
                 if isinstance(item, dict)
-                and _read_str(item.get("status")) not in {"running", "queued", "pending"}
+                and _read_str(item.get("status")) not in ACTIVE_RUN_STATUSES
             ]
             remaining.sort(key=lambda pair: float(pair[1].get("started_at") or 0), reverse=True)
             for run_id, _item in remaining[max_history_global:]:

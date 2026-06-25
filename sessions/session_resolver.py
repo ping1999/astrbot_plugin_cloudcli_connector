@@ -5,14 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from ..cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from ..cloudcli.cloudcli_errors import CloudCLIError
+    from ..cloudcli.cloudcli_ports import CloudCLISessionLookupPort
     from ..core.config import ConnectorSettings
     from ..persistence.state import PluginState
     from ..persistence.state_models import UserRef, is_valid_session_id
     from ..security.authz import AuthorizationPolicy
     from ..security.run_validation import is_index_session_ref
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
-    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from cloudcli.cloudcli_errors import CloudCLIError
+    from cloudcli.cloudcli_ports import CloudCLISessionLookupPort
     from core.config import ConnectorSettings
     from persistence.state import PluginState
     from persistence.state_models import UserRef, is_valid_session_id
@@ -29,7 +31,7 @@ class SessionResolver:
         settings: ConnectorSettings,
         authz: AuthorizationPolicy,
         state: PluginState,
-        client: CloudCLIClient,
+        client: CloudCLISessionLookupPort,
     ) -> None:
         self.settings = settings
         self.authz = authz

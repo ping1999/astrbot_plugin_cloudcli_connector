@@ -21,7 +21,7 @@ class StateLockError(RuntimeError):
 
 @dataclass
 class _ProcessLockSlot:
-    """同一进程内的重入锁槽，防止测试或热路径重复打开同一把进程锁。"""
+    """同一进程内已持有的运行期锁槽。"""
 
     handle: Any
     ref_count: int = 1
@@ -55,9 +55,9 @@ class JsonStateStore:
         with _state_file_lock(self.path):
             _atomic_write_json(self.path, data)
 
-    def acquire_process_lock(self) -> "StateProcessLock":
-        """获取运行期独占锁；同一进程可重入，其他进程会失败关闭。"""
-        return acquire_process_lock(self.path)
+    def acquire_process_lock(self, *, allow_reentrant: bool = False) -> "StateProcessLock":
+        """获取运行期独占锁；默认同一进程和其他进程都不能重复持有。"""
+        return acquire_process_lock(self.path, allow_reentrant=allow_reentrant)
 
 
 class StateProcessLock:
@@ -75,12 +75,16 @@ class StateProcessLock:
         release_process_lock(self.path)
 
 
-def acquire_process_lock(path: Path) -> StateProcessLock:
-    """为状态文件获取非阻塞进程锁，防止多进程覆盖彼此的状态快照。"""
+def acquire_process_lock(path: Path, *, allow_reentrant: bool = False) -> StateProcessLock:
+    """为状态文件获取非阻塞运行期锁，防止多个插件实例覆盖同一份状态快照。"""
     normalized = _normalized_lock_path(path)
     with _PROCESS_LOCK_GUARD:
         slot = _PROCESS_LOCKS.get(normalized)
         if slot is not None:
+            if not allow_reentrant:
+                raise StateLockError(
+                    f"CloudCLI connector state is already locked in this process: {path}"
+                )
             slot.ref_count += 1
             return StateProcessLock(normalized)
 

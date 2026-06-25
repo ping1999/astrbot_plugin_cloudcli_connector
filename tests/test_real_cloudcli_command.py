@@ -387,16 +387,28 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_security_regression_approval_push_targeting_and_redaction(self) -> None:
         """离线安全回归：审批详情只推给允许用户，且工具输入中的 secret 会被脱敏。"""
+        async def isolated_plugin(context: FakeContext, **overrides: Any):
+            """为额外插件实例分配独立数据目录，避免触发运行期独占锁。"""
+            data_dir = tempfile.TemporaryDirectory()
+            old_data_path = os.environ.get("ASTRBOT_DATA_PATH")
+            os.environ["ASTRBOT_DATA_PATH"] = data_dir.name
+            try:
+                plugin = CloudCLIConnectorPlugin(context, plugin_config(**overrides))
+            finally:
+                if old_data_path is None:
+                    os.environ.pop("ASTRBOT_DATA_PATH", None)
+                else:
+                    os.environ["ASTRBOT_DATA_PATH"] = old_data_path
+            await plugin.initialize()
+            return plugin, data_dir
+
         strict_context = FakeContext()
-        strict_plugin = CloudCLIConnectorPlugin(
+        strict_plugin, strict_data_dir = await isolated_plugin(
             strict_context,
-            plugin_config(
-                approval_allowed_user_keys="",
-                approval_require_admin=True,
-                approval_timeout_seconds=0,
-            ),
+            approval_allowed_user_keys="",
+            approval_require_admin=True,
+            approval_timeout_seconds=0,
         )
-        await strict_plugin.initialize()
         try:
             # 未进入审批白名单时，即使用户是管理员且绑定了 session，也不应收到详细工具输入。
             strict_user = UserRef(
@@ -427,17 +439,15 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], strict_context.sent_origins)
         finally:
             await strict_plugin.terminate()
+            strict_data_dir.cleanup()
 
         allow_context = FakeContext()
-        allow_plugin = CloudCLIConnectorPlugin(
+        allow_plugin, allow_data_dir = await isolated_plugin(
             allow_context,
-            plugin_config(
-                approval_allowed_user_keys="test:allowlisted",
-                approval_require_admin=True,
-                approval_timeout_seconds=0,
-            ),
+            approval_allowed_user_keys="test:allowlisted",
+            approval_require_admin=True,
+            approval_timeout_seconds=0,
         )
-        await allow_plugin.initialize()
         try:
             # 明确白名单用户可以收到审批详情，但消息内容仍需要通过 redaction。
             allow_user = UserRef(
@@ -470,6 +480,7 @@ class RealCloudCLICommandTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("secret-value", allow_context.outbox[0])
         finally:
             await allow_plugin.terminate()
+            allow_data_dir.cleanup()
 
     async def test_security_regression_project_path_realpath_rejects_symlink_escape(self) -> None:
         """离线安全回归：allowed_project_roots 要按真实路径拒绝符号链接逃逸。"""

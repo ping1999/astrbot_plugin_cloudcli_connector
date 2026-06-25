@@ -7,7 +7,8 @@ from typing import Any
 
 try:
     from ..approvals.approval_service import ApprovalService
-    from ..cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from ..cloudcli.cloudcli_errors import CloudCLIError
+    from ..cloudcli.cloudcli_ports import CloudCLICommandPort
     from ..core.config import ConnectorSettings
     from ..core.constants import SESSION_PROVIDERS
     from ..core.redaction import redact_exception_text, redact_text
@@ -29,7 +30,8 @@ try:
     )
 except ImportError:  # pragma: no cover - AstrBot may load plugin modules flat.
     from approvals.approval_service import ApprovalService
-    from cloudcli.cloudcli_client import CloudCLIClient, CloudCLIError
+    from cloudcli.cloudcli_errors import CloudCLIError
+    from cloudcli.cloudcli_ports import CloudCLICommandPort
     from commands.command_parser import ParsedCommand, parse_positive_int
     from commands.command_router import CommandHandler, CommandRoute, CommandRouter
     from commands.formatting import (
@@ -63,7 +65,7 @@ class CloudCLICommandHandlers:
         settings: ConnectorSettings,
         authz: AuthorizationPolicy,
         state: PluginState,
-        client: CloudCLIClient,
+        client: CloudCLICommandPort,
         session_resolver: SessionResolver,
         run_service: RunService,
         approval_service: ApprovalService,
